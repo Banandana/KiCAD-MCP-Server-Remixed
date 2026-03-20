@@ -390,6 +390,7 @@ class KiCADInterface:
             "list_schematic_wires": self._handle_list_schematic_wires,
             "list_schematic_labels": self._handle_list_schematic_labels,
             "move_schematic_component": self._handle_move_schematic_component,
+            "move_connected": self._handle_move_connected,
             "rotate_schematic_component": self._handle_rotate_schematic_component,
             "annotate_schematic": self._handle_annotate_schematic,
             "delete_schematic_wire": self._handle_delete_schematic_wire,
@@ -3316,9 +3317,10 @@ class KiCADInterface:
                             comp["cx"] + comp["hw"], comp["cy"] + comp["hh"],
                         )
                         if gap < 0:
-                            # Suppress labels near a pin of the overlapping component.
-                            # Standard practice: labels at pin endpoints connected by
-                            # short wire stubs are not real visual conflicts.
+                            # Suppress labels near a pin of the overlapping component,
+                            # BUT only if the flag extends AWAY from the component body.
+                            # Labels whose flags extend toward the component center are
+                            # real visual overlaps even if they connect to a pin.
                             if suppress_pin_labels and comp.get("pin_endpoints"):
                                 lx, ly = lb["x"], lb["y"]
                                 is_pin_label = any(
@@ -3326,7 +3328,19 @@ class KiCADInterface:
                                     for px, py in comp["pin_endpoints"]
                                 )
                                 if is_pin_label:
-                                    continue
+                                    # Check flag direction vs component center.
+                                    # Flag body direction uses negated angle (at = arrow tip).
+                                    angle_rad = math.radians(lb["angle"])
+                                    flag_dx = -math.cos(angle_rad)  # body direction
+                                    flag_dy = -math.sin(angle_rad)
+                                    to_center_dx = comp["cx"] - lx
+                                    to_center_dy = comp["cy"] - ly
+                                    # Dot product > 0 means flag extends toward component center
+                                    dot = flag_dx * to_center_dx + flag_dy * to_center_dy
+                                    if dot <= 0:
+                                        # Flag extends away from component — suppress
+                                        continue
+                                    # Flag extends toward component — real overlap, don't suppress
 
                             overlaps.append({
                                 "type": "label_component",
@@ -4175,6 +4189,236 @@ class KiCADInterface:
             logger.error(f"Error moving schematic component: {e}")
             import traceback
 
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e)}
+
+    def _handle_move_connected(self, params):
+        """Move a component and everything directly connected to its pins.
+
+        Moves the component by (dx, dy), then for each pin:
+        - Moves wire endpoints that touch the OLD pin position to the NEW pin position
+        - Moves labels/junctions at those wire endpoints by the same offset
+        - Leaves the "far end" of wires anchored (stretching them)
+        """
+        logger.info("Moving component with connected items")
+        try:
+            import re
+            import math
+            import os
+            from pathlib import Path
+            from commands.pin_locator import PinLocator
+
+            schematic_path = params.get("schematicPath")
+            reference = params.get("reference")
+            offset = params.get("offset", {})
+            dx = float(offset.get("x", 0) if isinstance(offset, dict) else 0)
+            dy = float(offset.get("y", 0) if isinstance(offset, dict) else 0)
+
+            if not schematic_path:
+                return {"success": False, "message": "schematicPath is required"}
+            if not reference:
+                return {"success": False, "message": "reference is required"}
+            if dx == 0 and dy == 0:
+                return {"success": False, "message": "offset with non-zero x or y is required"}
+
+            sch_file = Path(schematic_path)
+            locator = PinLocator()
+
+            # 1. Get OLD pin positions before moving
+            old_pins = locator.get_all_symbol_pins(sch_file, reference)
+            if not old_pins:
+                return {"success": False, "message": f"No pins found for {reference}"}
+
+            old_pin_positions = set()
+            for pos in old_pins.values():
+                old_pin_positions.add((round(pos[0], 2), round(pos[1], 2)))
+
+            # 2. Read raw file content
+            with open(schematic_path, "r", encoding="utf-8") as f:
+                content = f.read()
+
+            eps = 0.5
+            moved_items = {"component": False, "wire_endpoints": 0, "labels": 0, "junctions": 0}
+
+            # Build list of (old_point, new_point) for pin moves
+            pin_moves = []
+            for pos in old_pins.values():
+                ox, oy = round(pos[0], 2), round(pos[1], 2)
+                pin_moves.append((ox, oy, round(ox + dx, 2), round(oy + dy, 2)))
+
+            # 3. Find all points connected to old pin positions via wires
+            # First pass: collect wire endpoints touching pins
+            wire_pat = re.compile(r'\(wire\b')
+            xy_pat = re.compile(r'\(xy\s+([\d.e+-]+)\s+([\d.e+-]+)\)')
+
+            connected_points = set(old_pin_positions)
+            # Also trace one hop through wires to find labels/junctions
+            all_wires_parsed = []
+            for wm in wire_pat.finditer(content):
+                depth = 0
+                i = wm.start()
+                block_end = i
+                while i < len(content):
+                    if content[i] == '(':
+                        depth += 1
+                    elif content[i] == ')':
+                        depth -= 1
+                        if depth == 0:
+                            block_end = i + 1
+                            break
+                    i += 1
+                block = content[wm.start():block_end]
+                xys = xy_pat.findall(block)
+                if len(xys) >= 2:
+                    p1 = (float(xys[0][0]), float(xys[0][1]))
+                    p2 = (float(xys[-1][0]), float(xys[-1][1]))
+                    all_wires_parsed.append((wm.start(), block_end, p1, p2))
+
+            # Find wire endpoints that touch pin positions (these get moved)
+            # And their far endpoints (these are "connected points" for label search)
+            wire_far_endpoints = set()
+            for ws, we, p1, p2 in all_wires_parsed:
+                p1_at_pin = any(abs(p1[0] - px) < eps and abs(p1[1] - py) < eps for px, py in old_pin_positions)
+                p2_at_pin = any(abs(p2[0] - px) < eps and abs(p2[1] - py) < eps for px, py in old_pin_positions)
+                if p1_at_pin:
+                    wire_far_endpoints.add(p2)
+                if p2_at_pin:
+                    wire_far_endpoints.add(p1)
+
+            # Points to move = pin positions + far endpoints of wires touching pins
+            # (far endpoints have labels/junctions we should also move)
+            label_junction_move_points = wire_far_endpoints - old_pin_positions
+
+            # 4. Collect all edits (position, old_text, new_text)
+            edits = []  # [(start_pos, end_pos, new_text)]
+
+            # 4a. Move the component symbol block — find (symbol (lib_id ...) ... (property "Reference" "U1" ...) ... (at X Y R))
+            # Use kicad-skip via SchematicManager for the component move
+            schematic = SchematicManager.load_schematic(schematic_path)
+            if not schematic:
+                return {"success": False, "message": "Failed to load schematic"}
+
+            for symbol in schematic.symbol:
+                if not hasattr(symbol.property, "Reference"):
+                    continue
+                if symbol.property.Reference.value == reference:
+                    old_pos = list(symbol.at.value)
+                    rotation = float(old_pos[2]) if len(old_pos) > 2 else 0
+                    new_x = float(old_pos[0]) + dx
+                    new_y = float(old_pos[1]) + dy
+                    symbol.at.value = [new_x, new_y, rotation]
+
+                    # Move property fields
+                    for prop_name in ["Reference", "Value", "Footprint", "Datasheet"]:
+                        if hasattr(symbol.property, prop_name):
+                            prop = getattr(symbol.property, prop_name)
+                            if hasattr(prop, "at") and hasattr(prop.at, "value"):
+                                try:
+                                    pp = list(prop.at.value)
+                                    pp[0] = float(pp[0]) + dx
+                                    pp[1] = float(pp[1]) + dy
+                                    prop.at.value = pp
+                                except (TypeError, IndexError):
+                                    pass
+
+                    moved_items["component"] = True
+                    break
+
+            if not moved_items["component"]:
+                return {"success": False, "message": f"Component {reference} not found"}
+
+            # Save the component move via kicad-skip
+            SchematicManager.save_schematic(schematic, schematic_path)
+
+            # Re-read content after component move
+            with open(schematic_path, "r", encoding="utf-8") as f:
+                content = f.read()
+
+            # 4b. Move wire endpoints touching old pin positions
+            # Collect replacements in reverse order
+            replacements = []
+            for wm in wire_pat.finditer(content):
+                depth = 0
+                i = wm.start()
+                block_end = i
+                while i < len(content):
+                    if content[i] == '(':
+                        depth += 1
+                    elif content[i] == ')':
+                        depth -= 1
+                        if depth == 0:
+                            block_end = i + 1
+                            break
+                    i += 1
+                block = content[wm.start():block_end]
+
+                new_block = block
+                modified = False
+                for ox, oy, nx, ny in pin_moves:
+                    # Replace (xy ox oy) with (xy nx ny) if it matches a pin position
+                    for m in xy_pat.finditer(new_block):
+                        mx, my = float(m.group(1)), float(m.group(2))
+                        if abs(mx - ox) < eps and abs(my - oy) < eps:
+                            from commands.sexp_writer import _fmt
+                            old_xy = m.group(0)
+                            new_xy = f"(xy {_fmt(nx)} {_fmt(ny)})"
+                            new_block = new_block[:m.start()] + new_xy + new_block[m.end():]
+                            modified = True
+                            moved_items["wire_endpoints"] += 1
+                            break  # one replacement per pin per wire
+
+                if modified:
+                    replacements.append((wm.start(), block_end, new_block))
+
+            # 4c. Move labels at far endpoints of connected wires
+            for lt in ["label", "global_label", "hierarchical_label"]:
+                lp = re.compile(
+                    rf'\({lt}\s+"([^"]*)"(?:\s+\(shape\s+[^)]*\))?\s+\(at\s+([\d.e+-]+)\s+([\d.e+-]+)'
+                )
+                for m in lp.finditer(content):
+                    lx, ly = float(m.group(2)), float(m.group(3))
+                    if any(abs(lx - fp[0]) < eps and abs(ly - fp[1]) < eps for fp in label_junction_move_points):
+                        from commands.sexp_writer import _fmt
+                        old_at = f"(at {m.group(2)} {m.group(3)}"
+                        new_at = f"(at {_fmt(lx + dx)} {_fmt(ly + dy)}"
+                        at_pos = content.find(old_at, m.start())
+                        if at_pos >= 0:
+                            replacements.append((at_pos, at_pos + len(old_at), new_at))
+                            moved_items["labels"] += 1
+
+            # 4d. Move junctions at far endpoints
+            junc_pat = re.compile(r'\(junction\s+\(at\s+([\d.e+-]+)\s+([\d.e+-]+)\)')
+            for m in junc_pat.finditer(content):
+                jx, jy = float(m.group(1)), float(m.group(2))
+                if any(abs(jx - fp[0]) < eps and abs(jy - fp[1]) < eps for fp in label_junction_move_points):
+                    from commands.sexp_writer import _fmt
+                    old_at = f"(at {m.group(1)} {m.group(2)})"
+                    new_at = f"(at {_fmt(jx + dx)} {_fmt(jy + dy)})"
+                    at_pos = content.find(old_at, m.start())
+                    if at_pos >= 0:
+                        replacements.append((at_pos, at_pos + len(old_at), new_at))
+                        moved_items["junctions"] += 1
+
+            # Apply all replacements in reverse order
+            replacements.sort(key=lambda r: r[0], reverse=True)
+            for start, end, new_text in replacements:
+                content = content[:start] + new_text + content[end:]
+
+            with open(schematic_path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(content)
+                f.flush()
+                os.fsync(f.fileno())
+
+            total = moved_items["wire_endpoints"] + moved_items["labels"] + moved_items["junctions"]
+            return {
+                "success": True,
+                "message": f"Moved {reference} by ({dx}, {dy}) with {total} connected items",
+                "moved": moved_items,
+                "offset": {"x": dx, "y": dy},
+            }
+        except Exception as e:
+            logger.error(f"Error in move_connected: {e}")
+            import traceback
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
 

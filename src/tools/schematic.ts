@@ -322,7 +322,7 @@ Note: operates on .kicad_sch files only. To modify a PCB footprint use edit_comp
   // Add net label
   server.tool(
     "add_schematic_net_label",
-    "Add a net label to the schematic",
+    "Add a net label to the schematic. Labels are placed at the specified angle (default 0). Use angle to control flag direction: 0° = flag left/connection right, 180° = flag right/connection left, 90° = flag up/connection down, 270° = flag down/connection up.",
     {
       schematicPath: z.string().describe("Path to the schematic file"),
       netName: z
@@ -332,6 +332,7 @@ Note: operates on .kicad_sch files only. To modify a PCB footprint use edit_comp
         .array(z.number())
         .length(2)
         .describe("Position [x, y] for the label"),
+      orientation: z.number().optional().describe("Label angle in degrees: 0, 90, 180, 270 (default: 0). Controls flag direction."),
       labelType: z.enum(["label", "global_label", "hierarchical_label"]).optional().describe("Label type (default: label). Use global_label for bordered labels visible across sheets."),
       shape: z.string().optional().describe("For global_label: input, output, bidirectional, passive, tri_state"),
     },
@@ -368,7 +369,7 @@ Note: operates on .kicad_sch files only. To modify a PCB footprint use edit_comp
   // Connect pin to net
   server.tool(
     "connect_to_net",
-    "Connect a component pin to a named net",
+    "Connect a component pin to a named net via a 2.54mm wire stub and label. The label is placed at the default angle for the pin direction. If the flag overlaps the component body, use rotate_schematic_label afterward to flip the flag direction.",
     {
       schematicPath: z.string().describe("Path to the schematic file"),
       componentRef: z.string().describe("Component reference (e.g., U1, R1)"),
@@ -673,7 +674,7 @@ Note: operates on .kicad_sch files only. To modify a PCB footprint use edit_comp
   // Move schematic component
   server.tool(
     "move_schematic_component",
-    "Move a placed symbol to a new position in the schematic.",
+    "Move a placed symbol to a new position. WARNING: Does NOT move connected wires, labels, or power symbols. After moving, you must manually reconnect pins with stub wires. Use move_connected instead to preserve connectivity.",
     {
       schematicPath: z.string().describe("Path to the .kicad_sch file"),
       reference: z.string().describe("Reference designator (e.g., R1, U1)"),
@@ -1039,7 +1040,7 @@ Note: operates on .kicad_sch files only. To modify a PCB footprint use edit_comp
   // Run Electrical Rules Check (ERC)
   server.tool(
     "run_erc",
-    "Runs the KiCAD Electrical Rules Check (ERC) on a schematic and returns all violations. Use after wiring to verify the schematic before generating a netlist.",
+    "Runs the KiCAD Electrical Rules Check (ERC) on a schematic and returns all violations. Use after wiring to verify the schematic before generating a netlist. Note: coordinates in results are auto-scaled to schematic mm, but the heuristic may be wrong for small schematics — if positions look 100x too small, the raw kicad-cli output uses 1/100mm units.",
     {
       schematicPath: z.string().describe("Path to the .kicad_sch schematic file"),
     },
@@ -1210,7 +1211,7 @@ Note: operates on .kicad_sch files only. To modify a PCB footprint use edit_comp
   // Move everything within a rectangular bounding box by an offset
   server.tool(
     "move_region",
-    "Move everything (components, wires, labels) within a rectangular bounding box by an x,y offset. Like KiCad's block-select + move.",
+    "Move everything (components, wires, labels) within a rectangular bounding box by an x,y offset. WARNING: Uses regex-based coordinate replacement which can match items outside the specified region in some cases. Verify results with get_schematic_view after use. Prefer move_connected for individual components.",
     {
       schematicPath: z.string().describe("Path to the schematic file"),
       bbox: z.object({
@@ -1324,7 +1325,7 @@ Note: operates on .kicad_sch files only. To modify a PCB footprint use edit_comp
       schematicPath: z.string().describe("Path to the schematic file"),
       clearance: z.number().optional().describe("Minimum clearance in mm for component-component checks (default: 2.0)"),
       checkTypes: z.array(z.enum(["component_component", "label_component", "wire_label", "label_label"])).optional().describe("Which overlap types to check (default: all four)"),
-      suppressPinLabels: z.boolean().optional().describe("Filter out label-component overlaps where the label's connection point sits at a pin endpoint of the component (default: true). These are standard pin-endpoint labels, not real visual conflicts."),
+      suppressPinLabels: z.boolean().optional().describe("Filter out label-component overlaps where the label connects to a pin of the component AND the flag extends away from the component body (default: true). Labels whose flags extend toward the component center are still reported as real overlaps."),
     },
     async (args) => {
       const result = await callKicadScript("check_schematic_overlaps", args);
@@ -1413,7 +1414,7 @@ Note: operates on .kicad_sch files only. To modify a PCB footprint use edit_comp
   // Rotate a net label
   server.tool(
     "rotate_schematic_label",
-    "Rotate a net label or global label to a new angle.",
+    "Rotate a net label or global label to a new angle. Angle meanings: 0° = connection on right, flag extends left. 180° = connection on left, flag extends right. 90° = connection on bottom, flag extends up. 270° = connection on top, flag extends down.",
     {
       schematicPath: z.string().describe("Path to the schematic file"),
       netName: z.string().describe("Label text/net name"),
@@ -1501,6 +1502,24 @@ Note: operates on .kicad_sch files only. To modify a PCB footprint use edit_comp
     },
     async (args) => {
       const result = await callKicadScript("validate_wire_connections", args);
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    }
+  );
+
+  // Move a component and everything connected to its pins
+  server.tool(
+    "move_connected",
+    "Move a component by an offset and drag all directly connected items (wire endpoints, labels, junctions) with it. Wire far-ends stay anchored, stretching the wires. Use this instead of move_schematic_component when you want to preserve connectivity.",
+    {
+      schematicPath: z.string().describe("Path to the schematic file"),
+      reference: z.string().describe("Component reference (e.g., 'U1', 'R1')"),
+      offset: z.object({
+        x: z.number().describe("Horizontal offset in mm"),
+        y: z.number().describe("Vertical offset in mm"),
+      }).describe("How far to move (dx, dy) in mm"),
+    },
+    async (args) => {
+      const result = await callKicadScript("move_connected", args);
       return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
     }
   );
