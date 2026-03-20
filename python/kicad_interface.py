@@ -2115,8 +2115,8 @@ class KiCADInterface:
                 moved["wires"] += 1
 
             # --- Collect label replacements ---
-            for label_type in ["label", "global_label"]:
-                label_pat = re.compile(rf'\({label_type}\s+"[^"]*"\s+\(at\s+([\d.e+-]+)\s+([\d.e+-]+)')
+            for label_type in ["label", "global_label", "hierarchical_label"]:
+                label_pat = re.compile(rf'\({label_type}\s+"[^"]*"(?:\s+\(shape\s+[^)]*\))?\s+\(at\s+([\d.e+-]+)\s+([\d.e+-]+)')
                 for m in label_pat.finditer(content):
                     lx, ly = float(m.group(1)), float(m.group(2))
                     if not in_bbox(lx, ly):
@@ -2261,8 +2261,8 @@ class KiCADInterface:
                         break
 
             # Find labels touching any pin or wire endpoint
-            for label_type in ["label", "global_label"]:
-                label_pat = re.compile(rf'\({label_type}\s+"([^"]*)"\s+\(at\s+([\d.e+-]+)\s+([\d.e+-]+)')
+            for label_type in ["label", "global_label", "hierarchical_label"]:
+                label_pat = re.compile(rf'\({label_type}\s+"([^"]*)"(?:\s+\(shape\s+[^)]*\))?\s+\(at\s+([\d.e+-]+)\s+([\d.e+-]+)')
                 for m in label_pat.finditer(content):
                     name = m.group(1)
                     lx, ly = float(m.group(2)), float(m.group(3))
@@ -2473,8 +2473,8 @@ class KiCADInterface:
                     wire_endpoints.append((float(xm[0]), float(xm[1])))
 
             # Get label positions
-            for lt in ["label", "global_label"]:
-                lp = re.compile(rf'\({lt}\s+"([^"]*)"\s+\(at\s+([\d.e+-]+)\s+([\d.e+-]+)')
+            for lt in ["label", "global_label", "hierarchical_label"]:
+                lp = re.compile(rf'\({lt}\s+"([^"]*)"(?:\s+\(shape\s+[^)]*\))?\s+\(at\s+([\d.e+-]+)\s+([\d.e+-]+)')
                 for m in lp.finditer(content):
                     label_points.append((float(m.group(2)), float(m.group(3)), m.group(1), lt))
 
@@ -2634,7 +2634,7 @@ class KiCADInterface:
 
             label_boxes = []  # [(name, x, y, hw, hh)]
             for lt in ["global_label", "hierarchical_label"]:
-                lp = re.compile(rf'\({lt}\s+"([^"]*)"\s+\(at\s+([\d.e+-]+)\s+([\d.e+-]+)\s+([\d.e+-]*)')
+                lp = re.compile(rf'\({lt}\s+"([^"]*)"(?:\s+\(shape\s+[^)]*\))?\s+\(at\s+([\d.e+-]+)\s+([\d.e+-]+)\s+([\d.e+-]*)')
                 for m in lp.finditer(content):
                     name = m.group(1)
                     lx, ly = float(m.group(2)), float(m.group(3))
@@ -2792,8 +2792,8 @@ class KiCADInterface:
                     wire_endpoints.append((float(xm[0]), float(xm[1])))
 
             label_map = []
-            for lt in ["label", "global_label"]:
-                lp = re.compile(rf'\({lt}\s+"([^"]*)"\s+\(at\s+([\d.e+-]+)\s+([\d.e+-]+)')
+            for lt in ["label", "global_label", "hierarchical_label"]:
+                lp = re.compile(rf'\({lt}\s+"([^"]*)"(?:\s+\(shape\s+[^)]*\))?\s+\(at\s+([\d.e+-]+)\s+([\d.e+-]+)')
                 for m in lp.finditer(content):
                     label_map.append((float(m.group(2)), float(m.group(3)), m.group(1), lt))
 
