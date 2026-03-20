@@ -3284,6 +3284,7 @@ class KiCADInterface:
                         "x1": x1, "y1": y1, "x2": x2, "y2": y2,
                         "hw": (x2 - x1) / 2, "hh": (y2 - y1) / 2,
                         "mx": (x1 + x2) / 2, "my": (y1 + y2) / 2,
+                        "flag_width": total_w,
                     })
 
             # ── Collect wire segments ──
@@ -3441,20 +3442,24 @@ class KiCADInterface:
                             w["x1"], w["y1"], w["x2"], w["y2"],
                             lb["x1"], lb["y1"], lb["x2"], lb["y2"],
                         ):
-                            # Compute wire length to distinguish standard pin stubs
-                            # from long wires. Standard stubs are ≤5mm (2.54mm typical).
+                            # Compare wire length against label flag width.
+                            # Standard pin stubs (2.54mm) are hidden under the flag
+                            # body — suppress those. Longer wires that visibly exit
+                            # both sides of the flag are real problems to report.
                             wire_len = math.sqrt(
                                 (w["x2"] - w["x1"]) ** 2 + (w["y2"] - w["y1"]) ** 2
                             )
+                            flag_w = lb.get("flag_width", 5.0)
 
-                            if suppress_pin_labels and wire_len <= 5.0:
-                                # Short wire through label — standard pin stub, suppress
+                            if suppress_pin_labels and wire_len <= flag_w * 0.5:
+                                # Wire shorter than half the flag — hidden pin stub, suppress
                                 continue
 
                             overlaps.append({
                                 "type": "wire_label",
                                 "severity": "wire_through_label",
                                 "wire_length_mm": round(wire_len, 1),
+                                "flag_width_mm": round(flag_w, 1),
                                 "label": {
                                     "netName": lb["name"], "labelType": lb["type"],
                                     "at": [lb["x"], lb["y"]], "angle": lb["angle"],
