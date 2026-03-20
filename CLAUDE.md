@@ -26,7 +26,7 @@ KiCAD files (.kicad_pcb, .kicad_sch, .kicad_pro)
 - `prompts/*.ts` — MCP prompt templates
 
 ### Python Layer (`python/`)
-- `kicad_interface.py` — Main entry point. Reads JSON commands from stdin, dispatches to command handlers, returns JSON on stdout. Supports IPC and SWIG backends. **WARNING: This is a 6400-line god file with duplicated pin math in 4+ handlers. When fixing pin calculations, check ALL inline pin calc sites, not just `pin_locator.py`.**
+- `kicad_interface.py` — Main entry point. Reads JSON commands from stdin, dispatches to command handlers, returns JSON on stdout. Supports IPC and SWIG backends. **WARNING: This is a 7000+ line god file with duplicated pin math in 7 handlers. When fixing pin calculations, check ALL inline pin calc sites, not just `pin_locator.py`.** Contains shared geometry parser `_parse_schematic_geometry()` and content-based static helpers `_delete_component_from_content()`, `_edit_component_in_content()`.
 - `commands/` — Command handlers organized by domain:
   - `schematic.py` — `SchematicManager` (create schematic, template-based)
   - `component_schematic.py` — `ComponentManager` (add/edit/delete/move components using kicad-skip + dynamic symbol loading)
@@ -144,7 +144,7 @@ npm run lint                     # eslint + black + mypy + flake8
 - **Parameter format normalization**: Python handlers should accept both `{x, y}` objects and `[x, y]` arrays for coordinates, since TypeScript sends objects but some internal callers use arrays.
 - **Snap component positions to 1.27mm grid**: All component placements must snap to the KiCad schematic grid (1.27mm). Off-grid components = off-grid pins = broken connections. `DynamicSymbolLoader.create_component_instance` does this automatically.
 - **Verify with kicad-cli, not MCP tools**: MCP's own diagnostics (get_pin_connections, etc.) use the same math as the tools that placed the components. Always verify with `kicad-cli sch erc` via Bash as the ground truth.
-- **Batch operations must minimize file I/O**: Batch tools that call single-item handlers in a loop (e.g., `batch_add_junction`, `batch_rotate_labels`) re-read and re-write the entire file per item. For performance-critical paths, read once, apply all edits in memory, write once.
+- **Batch operations must use single read/write cycle**: Use `_to_content` / `_from_content` variants from `sexp_writer.py` (e.g., `add_wire_to_content`, `delete_wire_from_content`) or static `_*_in_content` methods on `KiCADInterface` (e.g., `_edit_component_in_content`, `_delete_component_from_content`). Read the file once, loop over the content variants, write once. All batch handlers except `batch_connect_to_net` now follow this pattern.
 
 ## KiCad S-Expression Gotchas
 
@@ -158,13 +158,14 @@ These are hard-won lessons from debugging. Read before touching any schematic fi
 - Pin angles in definitions point FROM endpoint TOWARD body. For wire stubs going AWAY from body, use `(angle + 180 + symbol_rotation) % 360`. For mirrored symbols, apply mirror to the pin angle before adding symbol rotation.
 
 ### Duplicated pin math (known tech debt)
-Pin position calculation (Y-negate, mirror, rotate) is duplicated in **6 places**:
+Pin position calculation (Y-negate, mirror, rotate) is duplicated in **7 places**:
 1. `pin_locator.py:get_pin_location()` — the canonical implementation
 2. `pin_locator.py:get_all_symbol_pins()` — inline for performance
 3. `kicad_interface.py:_handle_list_schematic_components()` — inline
 4. `kicad_interface.py:_handle_batch_get_schematic_pin_locations()` — inline
 5. `kicad_interface.py:_handle_get_net_connectivity()` and `_handle_validate_wire_connections()` — inline
-6. `kicad_interface.py:_handle_check_schematic_overlaps()` — pin endpoints for `suppressPinLabels`
+6. `kicad_interface.py:_parse_schematic_geometry()` — shared by `check_schematic_overlaps` and `get_schematic_layout`
+7. `kicad_interface.py:_handle_find_orphan_items()` — pin endpoints for dangling wire detection
 
 **When fixing pin math, grep for `pin_rel_y = -` to find ALL sites.** A fix in one place that misses the others will cause tools to disagree about pin positions.
 
@@ -204,14 +205,34 @@ And always iterate `["label", "global_label", "hierarchical_label"]`, not just `
 - Their Reference field should be hidden by default (`(hide yes)` in effects).
 
 ### Label bounding box geometry
-- The label `(at x y angle)` position is the **arrow tip**, NOT the connection endpoint or the center of the label body.
-- The flag body (text + shape) extends **opposite** to the angle direction:
-  - `angle=0` → arrow tip on left, body extends **right** (+x)
-  - `angle=180` → arrow tip on right, body extends **left** (-x)
-  - `angle=90` → arrow tip on top, body extends **down** (+y, KiCad Y-down)
-  - `angle=270` → arrow tip on bottom, body extends **up** (-y)
-- When computing bounding boxes, use `dx = -cos(angle) * width`, `dy = -sin(angle) * width` (note the negation). Using `cos` directly gives the wrong direction and makes overlap detection miss real conflicts.
-- Labels connect to component pins via **short wire stubs** (typically 2.54mm). The label's `(at)` position is NOT at the pin — it's one stub length away. `check_schematic_overlaps` uses `suppressPinLabels` (default: true) with a 5.5mm tolerance to filter out standard pin-endpoint labels that aren't real visual conflicts.
+- The label `(at x y angle)` position is the **arrow tip / top-left of rendered shape**.
+- The flag body (text + shape) **always extends in the positive screen direction** from `(at)`:
+  - `0°/180° (horizontal)`: body extends **RIGHT** (+x) from `(at)`
+  - `90°/270° (vertical)`: body extends **DOWN** (+y) from `(at)`
+- **Do NOT use trig** (`cos`/`sin`) for label bounding boxes. The direction is always the same regardless of angle. Use a simple axis-aligned model:
+  ```python
+  if norm_angle in (0, 180):
+      x1, x2 = lx, lx + total_w        # extends right
+      y1, y2 = ly - total_h/2, ly + total_h/2  # centered vertically
+  else:  # 90, 270
+      x1, x2 = lx - total_h/2, lx + total_h/2  # centered horizontally
+      y1, y2 = ly, ly + total_w         # extends down
+  ```
+- **Connection point** depends on angle — this is NOT always the `(at)` position:
+  - `0°` → right end: `(at.x + width, at.y)`
+  - `180°` → left end: `(at.x, at.y)` (same as `at`)
+  - `90°` → bottom: `(at.x, at.y + width)`
+  - `270°` → top: `(at.x, at.y)` (same as `at`)
+- Labels connect to component pins via **short wire stubs** (typically 2.54mm). The label's `(at)` position is NOT at the pin — it's one stub length away. `check_schematic_overlaps` uses `suppressPinLabels` (default: true) to filter out standard pin-endpoint labels.
+
+### Label justify property
+- Global/hierarchical labels have a `(justify left|right)` in their `(effects ...)` block that controls the visual flag direction.
+- **Both angle AND justify must be set correctly** for the label to render properly:
+  - `0°` / `90°` → `(justify left)`
+  - `180°` / `270°` → `(justify right)`
+- **The Intersheetrefs property** position must also match: it sits at the far end of the flag, which flips when justify changes. For `justify right` (180°): `isr_x = at.x - flag_width`.
+- `rotate_schematic_label` now handles all three (angle, justify, Intersheetrefs position).
+- `sexp_writer.add_label` sets correct justify on creation based on orientation.
 
 ### String replacement in loops
 - **Never modify a string inside a `finditer` loop on that string.** After the first replacement changes string length, all subsequent match positions are wrong. Collect all `(start, end, new_text)` edits first, then apply in reverse order.
@@ -231,8 +252,10 @@ When adding or modifying a schematic tool, verify:
 9. [ ] File writes include `f.flush()` + `os.fsync(f.fileno())`
 10. [ ] No line-start-anchored regex (`^`) — files may be single-line
 11. [ ] No string modification inside `finditer` loops
-12. [ ] `npm run build` run after TypeScript changes
-13. [ ] Commit and push to `remix` remote
+12. [ ] Label rotation tools update justify (0°/90° → left, 180°/270° → right)
+13. [ ] Batch handlers use `_to_content` variants for single read/write cycle
+14. [ ] `npm run build` run after TypeScript changes
+15. [ ] Commit and push to `remix` remote
 
 ## Code Patterns
 
@@ -245,7 +268,7 @@ When adding or modifying a schematic tool, verify:
 The `callKicadScript` command string and the `command_routes` key **must match exactly**.
 
 ### Schematic file manipulation
-- **Text insertion** (`python/commands/sexp_writer.py`): Preferred method for adding wires, labels, junctions, etc. Inserts formatted text before `(sheet_instances`, preserving file formatting. All writes are flushed to disk with `os.fsync()`.
+- **Text insertion** (`python/commands/sexp_writer.py`): Preferred method for adding wires, labels, junctions, etc. Inserts formatted text before `(sheet_instances`, preserving file formatting. All writes are flushed to disk with `os.fsync()`. Each function has a `_to_content` / `_from_content` variant (e.g., `add_wire_to_content`, `delete_wire_from_content`) that operates on a string instead of a file — use these in batch handlers to avoid N read/write cycles.
 - **kicad-skip** (`from skip import Schematic`): Used for reading/querying existing schematic elements (symbols, properties, wires). Good for reads, avoid for writes that go through `sexpdata.dumps()`.
 - **DynamicSymbolLoader** (`python/commands/dynamic_symbol_loader.py`): Text-based symbol injection from KiCad libraries. Handles `(instances)` blocks, rotation-aware field positions. Uses text manipulation, not sexpdata.
 - **PinLocator** (`python/commands/pin_locator.py`): Returns pin **endpoints** (connectable tip), not body positions. Handles rotation AND mirror transforms. `get_all_symbol_pins()` loads the file once and computes all pins inline (no per-pin re-reads). Pin definition cache is per lib_id and safe to keep.
@@ -307,10 +330,13 @@ These are bugs that were actually encountered and fixed. If you see these sympto
 - **move_region moves items outside bbox**: String was modified inside `finditer` loop, corrupting match positions. Must collect edits first, apply in reverse order.
 - **Diagnostic tools report false results**: MCP tools use the same pin math as placement tools. A pin math bug makes both placement AND verification wrong in the same way — everything looks correct to itself. Always verify with `kicad-cli sch erc` as ground truth.
 - **get_schematic_pin_locations timeout on large MCUs**: `get_all_symbol_pins` was re-parsing the file per pin. Fixed — now loads once, computes all pins inline.
-- **Batch operations show stale state**: Each sub-operation re-reads/re-writes the whole file. For N items that's N full file cycles. This is a known performance limitation.
+- **Batch operations show stale state**: Fixed — all batch handlers except `batch_connect_to_net` now use single read/write cycle via `_to_content` / `_from_content` variants.
 - **Schematic changes not visible immediately**: File writes were not flushed to disk. All writes now use `f.flush()` + `os.fsync()`.
 - **check_schematic_overlaps reports 20+ false positives for label-component**: Labels at pin endpoints connected by wire stubs are normal. `suppressPinLabels` (default: true) filters these using a 5.5mm distance tolerance. If suppression isn't working, check that pin endpoints are computed correctly (mirror + rotation).
-- **Label bounding box extends wrong direction**: At 180°, `cos(180°)=-1` makes the bbox extend left, but KiCad renders the body extending right from the `(at)` position. Must negate the direction: `dx = -cos(angle) * width`.
+- **Label bounding box extends wrong direction**: Do NOT use trig for label bboxes. The flag body always extends RIGHT (horizontal) or DOWN (vertical) from `(at)`, regardless of angle. Use simple axis-aligned model, not `cos`/`sin`.
+- **Label rotated but flag direction unchanged**: `rotate_schematic_label` must update `(justify left/right)` in addition to the angle. 0°/90° → left, 180°/270° → right. Also must reposition the Intersheetrefs property.
+- **New global labels missing Intersheetrefs property**: `sexp_writer.add_label` now includes Intersheetrefs for global/hierarchical labels. Without it, KiCad shows no inter-sheet references.
+- **Wire-through-label false positives/negatives**: Suppression uses `wire_len <= flag_width * 0.5` threshold. Standard 2.54mm pin stubs are suppressed; longer wires that visibly exit the flag are reported. The old fixed 5mm threshold missed wide labels.
 
 ## Important Notes
 
@@ -322,9 +348,12 @@ These are bugs that were actually encountered and fixed. If you see these sympto
 
 These are known issues that haven't been fixed yet. Keep them in mind when working on the codebase.
 
-- **`kicad_interface.py` is a 6400-line god file**: 65+ handler methods with duplicated imports (`import re` appears 18 times, `from pathlib import Path` 35 times). Should be decomposed into domain-specific handler modules, but all inline pin math sites must stay in sync until then.
+- **`kicad_interface.py` is a 7000+ line god file**: 70+ handler methods plus static helpers (`_delete_component_from_content`, `_edit_component_in_content`, `_parse_schematic_geometry`). Duplicated imports throughout. Should be decomposed into domain-specific handler modules, but all inline pin math sites (7 places) must stay in sync until then.
 - **No TypeScript tests**: Zero tests for tool registration, request queue, JSON parsing, or Python subprocess communication.
-- **Minimal Python tests**: Only 4 test files. No tests for the vast majority of handlers.
+- **Minimal Python tests**: Only 4 test files. No tests for the vast majority of handlers, sexp_writer content variants, or batch operations.
 - **`_find_insert_position` has no fallback**: If a schematic lacks `(sheet_instances`, all writes via `sexp_writer.py` raise `ValueError`. Should fall back to inserting before the final `)`.
 - **Wire connectivity tracing is O(W × P) per iteration**: `get_net_connectivity` and `validate_wire_connections` use naive flood-fill. Fine for small schematics, slow for large ones.
 - **ERC coordinate auto-detection heuristic is fragile**: Checks if first coord < 5mm to decide scaling. Can false-positive on schematics with violations near origin.
+- **`batch_connect_to_net` still does N read/write cycles**: Each connection needs fresh pin positions after prior wire/label placements shift content offsets. The other 7 batch handlers have been fixed.
+- **Label bounding box dimensions are estimated**: Uses `0.75mm/char` width and `1.8mm` height based on default KiCad font. Different font sizes or non-ASCII characters will have inaccurate bounding boxes.
+- **`get_schematic_layout` shares geometry code with `check_schematic_overlaps`**: Both use `_parse_schematic_geometry()`, but the overlap logic in `get_schematic_layout` is a partial copy. Changes to overlap detection must be applied in both places.
