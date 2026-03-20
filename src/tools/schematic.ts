@@ -1325,7 +1325,7 @@ Note: operates on .kicad_sch files only. To modify a PCB footprint use edit_comp
       schematicPath: z.string().describe("Path to the schematic file"),
       clearance: z.number().optional().describe("Minimum clearance in mm for component-component checks (default: 2.0)"),
       checkTypes: z.array(z.enum(["component_component", "label_component", "wire_label", "label_label"])).optional().describe("Which overlap types to check (default: all four)"),
-      suppressPinLabels: z.boolean().optional().describe("Filter out label-component overlaps where the label connects to a pin of the component AND the flag extends away from the component body (default: true). Labels whose flags extend toward the component center are still reported as real overlaps."),
+      suppressPinLabels: z.boolean().optional().describe("Filter out label-component overlaps where the label's connection point is within 5.5mm of a pin endpoint of the overlapping component (default: true). These are standard pin-endpoint labels — their flags overlap the pin-stub area of the bounding box but that's normal KiCad practice."),
     },
     async (args) => {
       const result = await callKicadScript("check_schematic_overlaps", args);

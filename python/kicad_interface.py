@@ -3317,10 +3317,11 @@ class KiCADInterface:
                             comp["cx"] + comp["hw"], comp["cy"] + comp["hh"],
                         )
                         if gap < 0:
-                            # Suppress labels near a pin of the overlapping component,
-                            # BUT only if the flag extends AWAY from the component body.
-                            # Labels whose flags extend toward the component center are
-                            # real visual overlaps even if they connect to a pin.
+                            # Suppress if the label's connection point is near any pin
+                            # of the overlapping component. These are standard pin-endpoint
+                            # labels — the flag visually overlaps the component's pin-stub
+                            # area but that's normal KiCad practice. The bounding box
+                            # includes pin stubs, so labels at pin tips always "overlap".
                             if suppress_pin_labels and comp.get("pin_endpoints"):
                                 lx, ly = lb["x"], lb["y"]
                                 is_pin_label = any(
@@ -3328,19 +3329,7 @@ class KiCADInterface:
                                     for px, py in comp["pin_endpoints"]
                                 )
                                 if is_pin_label:
-                                    # Check flag direction vs component center.
-                                    # Flag body direction uses negated angle (at = arrow tip).
-                                    angle_rad = math.radians(lb["angle"])
-                                    flag_dx = -math.cos(angle_rad)  # body direction
-                                    flag_dy = -math.sin(angle_rad)
-                                    to_center_dx = comp["cx"] - lx
-                                    to_center_dy = comp["cy"] - ly
-                                    # Dot product > 0 means flag extends toward component center
-                                    dot = flag_dx * to_center_dx + flag_dy * to_center_dy
-                                    if dot <= 0:
-                                        # Flag extends away from component — suppress
-                                        continue
-                                    # Flag extends toward component — real overlap, don't suppress
+                                    continue
 
                             overlaps.append({
                                 "type": "label_component",
