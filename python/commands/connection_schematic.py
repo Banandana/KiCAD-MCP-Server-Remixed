@@ -461,16 +461,44 @@ class ConnectionManager:
                 dy = abs(p1[1] - p2[1])
                 return dx < tolerance and dy < tolerance
 
-            # 1. Find all labels with this net name
-            if not hasattr(schematic, "label"):
-                logger.warning("Schematic has no labels")
-                return connections
-
+            # 1. Find all labels with this net name (local, global, hierarchical, power)
             net_label_positions = []
-            for label in schematic.label:
-                if hasattr(label, "value") and label.value == net_name:
-                    if hasattr(label, "at") and hasattr(label.at, "value"):
-                        pos = label.at.value
+
+            # Local labels
+            if hasattr(schematic, "label"):
+                for label in schematic.label:
+                    if hasattr(label, "value") and label.value == net_name:
+                        if hasattr(label, "at") and hasattr(label.at, "value"):
+                            pos = label.at.value
+                            net_label_positions.append([float(pos[0]), float(pos[1])])
+
+            # Global labels
+            if hasattr(schematic, "global_label"):
+                for label in schematic.global_label:
+                    if hasattr(label, "value") and label.value == net_name:
+                        if hasattr(label, "at") and hasattr(label.at, "value"):
+                            pos = label.at.value
+                            net_label_positions.append([float(pos[0]), float(pos[1])])
+
+            # Hierarchical labels
+            if hasattr(schematic, "hierarchical_label"):
+                for label in schematic.hierarchical_label:
+                    if hasattr(label, "value") and label.value == net_name:
+                        if hasattr(label, "at") and hasattr(label.at, "value"):
+                            pos = label.at.value
+                            net_label_positions.append([float(pos[0]), float(pos[1])])
+
+            # Power symbols (#PWR with matching value)
+            if hasattr(schematic, "symbol"):
+                for symbol in schematic.symbol:
+                    if not hasattr(symbol.property, "Reference"):
+                        continue
+                    ref = symbol.property.Reference.value
+                    if not ref.startswith("#PWR"):
+                        continue
+                    val = symbol.property.Value.value if hasattr(symbol.property, "Value") else ""
+                    if val == net_name:
+                        pos = symbol.at.value if hasattr(symbol, "at") else [0, 0]
                         net_label_positions.append([float(pos[0]), float(pos[1])])
 
             if not net_label_positions:

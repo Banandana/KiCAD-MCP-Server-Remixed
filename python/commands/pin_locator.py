@@ -230,9 +230,27 @@ class PinLocator:
 
             # Pin definition angle points FROM endpoint TOWARD body (in symbol-local Y-up coords).
             # For wire stubs we want the OUTWARD direction (away from body).
-            # The connect_to_net formula uses: y - 2.54*sin(angle) which is Y-up math,
-            # so we return the Y-up outward angle: pin_angle + 180 (reverse direction).
             pin_def_angle = pins[pin_number].get("angle", 0)
+
+            # Apply mirror to angle: mirror_x flips vertically (negate Y),
+            # mirror_y flips horizontally (negate X)
+            mirror_x = False
+            mirror_y = False
+            if hasattr(target_symbol, "mirror"):
+                mirror_val = (
+                    str(target_symbol.mirror.value)
+                    if hasattr(target_symbol.mirror, "value")
+                    else str(target_symbol.mirror)
+                )
+                mirror_x = "x" in mirror_val
+                mirror_y = "y" in mirror_val
+            if mirror_x:
+                # Flipping Y means angles 90↔270
+                pin_def_angle = (360 - pin_def_angle) % 360
+            if mirror_y:
+                # Flipping X means angles 0↔180
+                pin_def_angle = (180 - pin_def_angle) % 360
+
             outward_angle = (pin_def_angle + 180 + symbol_rotation) % 360
             return outward_angle
 
@@ -318,8 +336,24 @@ class PinLocator:
             pin_rel_x = pin_data["x"]
             pin_rel_y = -pin_data["y"]
 
+            # Apply mirror transforms (must happen before rotation)
+            mirror_x = False
+            mirror_y = False
+            if hasattr(target_symbol, "mirror"):
+                mirror_val = (
+                    str(target_symbol.mirror.value)
+                    if hasattr(target_symbol.mirror, "value")
+                    else str(target_symbol.mirror)
+                )
+                mirror_x = "x" in mirror_val
+                mirror_y = "y" in mirror_val
+            if mirror_x:
+                pin_rel_y = -pin_rel_y
+            if mirror_y:
+                pin_rel_x = -pin_rel_x
+
             logger.debug(
-                f"Pin {pin_number} relative position (Y-negated): ({pin_rel_x}, {pin_rel_y})"
+                f"Pin {pin_number} relative position (Y-negated, mirror={mirror_x},{mirror_y}): ({pin_rel_x}, {pin_rel_y})"
             )
 
             # Apply symbol rotation to pin position
@@ -352,7 +386,10 @@ class PinLocator:
         self, schematic_path: Path, symbol_reference: str
     ) -> Dict[str, List[float]]:
         """
-        Get locations of all pins on a symbol instance
+        Get locations of all pins on a symbol instance.
+
+        Loads the schematic ONCE and computes all pin positions inline
+        (no per-pin file re-reads).
 
         Args:
             schematic_path: Path to .kicad_sch file
@@ -362,7 +399,7 @@ class PinLocator:
             Dictionary mapping pin number -> [x, y] coordinates
         """
         try:
-            # Load schematic fresh from disk to avoid stale state
+            # Load schematic ONCE
             sch = Schematic(str(schematic_path))
 
             # Find symbol
@@ -376,7 +413,6 @@ class PinLocator:
                 logger.error(f"Symbol {symbol_reference} not found")
                 return {}
 
-            # Get lib_id
             lib_id = (
                 target_symbol.lib_id.value if hasattr(target_symbol, "lib_id") else None
             )
@@ -384,19 +420,48 @@ class PinLocator:
                 logger.error(f"Symbol {symbol_reference} has no lib_id")
                 return {}
 
-            # Get pin definitions
+            # Get pin definitions (cached per lib_id)
             pins = self.get_symbol_pins(schematic_path, lib_id)
             if not pins:
                 return {}
 
-            # Calculate location for each pin
-            result = {}
-            for pin_num in pins.keys():
-                location = self.get_pin_location(
-                    schematic_path, symbol_reference, pin_num
+            # Get symbol transform (once)
+            symbol_at = target_symbol.at.value
+            symbol_x = float(symbol_at[0])
+            symbol_y = float(symbol_at[1])
+            symbol_rotation = float(symbol_at[2]) if len(symbol_at) > 2 else 0.0
+
+            mirror_x = False
+            mirror_y = False
+            if hasattr(target_symbol, "mirror"):
+                mirror_val = (
+                    str(target_symbol.mirror.value)
+                    if hasattr(target_symbol.mirror, "value")
+                    else str(target_symbol.mirror)
                 )
-                if location:
-                    result[pin_num] = location
+                mirror_x = "x" in mirror_val
+                mirror_y = "y" in mirror_val
+
+            # Compute all pin positions inline (no per-pin file reads)
+            result = {}
+            for pin_num, pin_data in pins.items():
+                pin_rel_x = pin_data["x"]
+                pin_rel_y = -pin_data["y"]  # Y-up to Y-down
+
+                if mirror_x:
+                    pin_rel_y = -pin_rel_y
+                if mirror_y:
+                    pin_rel_x = -pin_rel_x
+
+                if symbol_rotation != 0:
+                    pin_rel_x, pin_rel_y = self.rotate_point(
+                        pin_rel_x, pin_rel_y, symbol_rotation
+                    )
+
+                result[pin_num] = [
+                    round(symbol_x + pin_rel_x, 4),
+                    round(symbol_y + pin_rel_y, 4),
+                ]
 
             logger.info(f"Located {len(result)} pins on {symbol_reference}")
             return result
