@@ -3156,16 +3156,19 @@ class KiCADInterface:
                     total_w = body + text_len
                     total_h = 1.8  # height of label text + padding
 
-                    # Label text extends FROM the connection point.
-                    # angle=0 → text goes RIGHT, angle=180 → text goes LEFT, etc.
+                    # In KiCad, the label (at x y angle) is the ARROW TIP.
+                    # The flag body (text + shape) extends OPPOSITE to the angle.
+                    # angle=0 → arrow tip on left, body extends RIGHT (+x)
+                    # angle=180 → arrow tip on right, body extends LEFT (-x)
+                    # But cos(0)=1 and cos(180)=-1, so using cos directly
+                    # would give the WRONG direction. We negate to get the
+                    # body extension direction.
                     rad = math.radians(angle)
                     cos_a, sin_a = math.cos(rad), math.sin(rad)
 
-                    # Direction the text extends (opposite of angle for KiCad labels)
-                    # In KiCad: angle=0 means connection on left, text to right
-                    # angle=180 means connection on right, text to left
-                    dx_text = cos_a * total_w
-                    dy_text = sin_a * total_w  # KiCad Y-down, sin is correct
+                    # Negate: body extends opposite to angle direction
+                    dx_text = -cos_a * total_w
+                    dy_text = -sin_a * total_w
 
                     # The four corners of the label bbox
                     # Perpendicular offset for height
@@ -3953,10 +3956,11 @@ class KiCADInterface:
                 total_w = body + text_len
                 total_h = 1.8
 
+                # Body extends OPPOSITE to angle direction (at = arrow tip)
                 rad = math.radians(angle)
                 cos_a, sin_a = math.cos(rad), math.sin(rad)
-                dx_text = cos_a * total_w
-                dy_text = sin_a * total_w
+                dx_text = -cos_a * total_w
+                dy_text = -sin_a * total_w
                 perp_dx = -sin_a * (total_h / 2)
                 perp_dy = cos_a * (total_h / 2)
 
