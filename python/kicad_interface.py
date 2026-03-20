@@ -3243,33 +3243,30 @@ class KiCADInterface:
                     total_w = body + text_len
                     total_h = 1.8  # height of label text + padding
 
-                    # In KiCad, the label (at x y angle) is the ARROW TIP.
-                    # The flag body (text + shape) extends OPPOSITE to the angle.
-                    # angle=0 → arrow tip on left, body extends RIGHT (+x)
-                    # angle=180 → arrow tip on right, body extends LEFT (-x)
-                    # But cos(0)=1 and cos(180)=-1, so using cos directly
-                    # would give the WRONG direction. We negate to get the
-                    # body extension direction.
-                    rad = math.radians(angle)
-                    cos_a, sin_a = math.cos(rad), math.sin(rad)
+                    # KiCad label rendering: the (at) position is always
+                    # the top-left of the rendered shape. The flag body
+                    # always extends in the POSITIVE direction:
+                    #   0°/180° (horizontal): body extends RIGHT (+x)
+                    #   90°/270° (vertical): body extends DOWN (+y)
+                    # The angle controls text direction and which end is
+                    # the connection point, but the physical extent is
+                    # always the same screen direction from (at).
+                    norm_angle = int(angle) % 360
+                    if norm_angle in (0, 180):
+                        # Horizontal: extends right from at, centered vertically
+                        x1 = lx
+                        x2 = lx + total_w
+                        y1 = ly - total_h / 2
+                        y2 = ly + total_h / 2
+                    else:
+                        # Vertical (90/270): extends down from at, centered horizontally
+                        x1 = lx - total_h / 2
+                        x2 = lx + total_h / 2
+                        y1 = ly
+                        y2 = ly + total_w
 
-                    # Negate: body extends opposite to angle direction
-                    dx_text = -cos_a * total_w
-                    dy_text = -sin_a * total_w
-
-                    # The four corners of the label bbox
-                    # Perpendicular offset for height
-                    perp_dx = -sin_a * (total_h / 2)
-                    perp_dy = cos_a * (total_h / 2)
-
-                    corners_x = [
-                        lx + perp_dx, lx - perp_dx,
-                        lx + dx_text + perp_dx, lx + dx_text - perp_dx,
-                    ]
-                    corners_y = [
-                        ly + perp_dy, ly - perp_dy,
-                        ly + dy_text + perp_dy, ly + dy_text - perp_dy,
-                    ]
+                    corners_x = [x1, x2]
+                    corners_y = [y1, y2]
 
                     x1, x2 = min(corners_x), max(corners_x)
                     y1, y2 = min(corners_y), max(corners_y)
@@ -4076,22 +4073,22 @@ class KiCADInterface:
                 total_w = body + text_len
                 total_h = 1.8
 
-                # Body extends OPPOSITE to angle direction (at = arrow tip)
-                rad = math.radians(angle)
-                cos_a, sin_a = math.cos(rad), math.sin(rad)
-                dx_text = -cos_a * total_w
-                dy_text = -sin_a * total_w
-                perp_dx = -sin_a * (total_h / 2)
-                perp_dy = cos_a * (total_h / 2)
+                # KiCad renders labels with (at) as top-left of the shape.
+                # Body always extends RIGHT (+x) for horizontal, DOWN (+y) for vertical.
+                norm_angle = int(angle) % 360
+                if norm_angle in (0, 180):
+                    x1 = lx
+                    x2 = lx + total_w
+                    y1 = ly - total_h / 2
+                    y2 = ly + total_h / 2
+                else:
+                    x1 = lx - total_h / 2
+                    x2 = lx + total_h / 2
+                    y1 = ly
+                    y2 = ly + total_w
 
-                corners_x = [
-                    lx + perp_dx, lx - perp_dx,
-                    lx + dx_text + perp_dx, lx + dx_text - perp_dx,
-                ]
-                corners_y = [
-                    ly + perp_dy, ly - perp_dy,
-                    ly + dy_text + perp_dy, ly + dy_text - perp_dy,
-                ]
+                corners_x = [x1, x2]
+                corners_y = [y1, y2]
                 bbox = {
                     "x1": round(min(corners_x), 2),
                     "y1": round(min(corners_y), 2),
