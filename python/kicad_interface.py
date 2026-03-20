@@ -782,12 +782,71 @@ class KiCADInterface:
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
 
+    @staticmethod
+    def _delete_component_from_content(content, reference):
+        """Remove a placed symbol from schematic content string by reference.
+        Returns (modified_content, deleted_count) or (None, 0) if not found."""
+        import re
+
+        def find_matching_paren(s, start):
+            depth = 0
+            i = start
+            while i < len(s):
+                if s[i] == "(":
+                    depth += 1
+                elif s[i] == ")":
+                    depth -= 1
+                    if depth == 0:
+                        return i
+                i += 1
+            return -1
+
+        lib_sym_pos = content.find("(lib_symbols")
+        lib_sym_end = (
+            find_matching_paren(content, lib_sym_pos) if lib_sym_pos >= 0 else -1
+        )
+
+        blocks_to_delete = []
+        search_start = 0
+        pattern = re.compile(r'\(symbol\s+\(lib_id\s+"')
+        while True:
+            m = pattern.search(content, search_start)
+            if not m:
+                break
+            pos = m.start()
+            if lib_sym_pos >= 0 and lib_sym_pos <= pos <= lib_sym_end:
+                search_start = lib_sym_end + 1
+                continue
+            end = find_matching_paren(content, pos)
+            if end < 0:
+                search_start = pos + 1
+                continue
+            block_text = content[pos : end + 1]
+            if re.search(
+                r'\(property\s+"Reference"\s+"' + re.escape(reference) + r'"',
+                block_text,
+            ):
+                blocks_to_delete.append((pos, end))
+            search_start = end + 1
+
+        if not blocks_to_delete:
+            return None, 0
+
+        for b_start, b_end in sorted(blocks_to_delete, reverse=True):
+            trim_start = b_start
+            while trim_start > 0 and content[trim_start - 1] in (" ", "\t"):
+                trim_start -= 1
+            if trim_start > 0 and content[trim_start - 1] == "\n":
+                trim_start -= 1
+            content = content[:trim_start] + content[b_end + 1:]
+
+        return content, len(blocks_to_delete)
+
     def _handle_delete_schematic_component(self, params):
         """Remove a placed symbol from a schematic using text-based manipulation (no skip writes)"""
         logger.info("Deleting schematic component")
         try:
             from pathlib import Path
-            import re
 
             schematic_path = params.get("schematicPath")
             reference = params.get("reference")
@@ -807,76 +866,18 @@ class KiCADInterface:
             with open(sch_file, "r", encoding="utf-8") as f:
                 content = f.read()
 
-            def find_matching_paren(s, start):
-                """Find the closing paren matching the opening paren at start."""
-                depth = 0
-                i = start
-                while i < len(s):
-                    if s[i] == "(":
-                        depth += 1
-                    elif s[i] == ")":
-                        depth -= 1
-                        if depth == 0:
-                            return i
-                    i += 1
-                return -1
-
-            # Skip lib_symbols section
-            lib_sym_pos = content.find("(lib_symbols")
-            lib_sym_end = (
-                find_matching_paren(content, lib_sym_pos) if lib_sym_pos >= 0 else -1
-            )
-
-            # Find ALL placed symbol blocks matching the reference (handles duplicates).
-            # Use content-string search so multi-line KiCAD format is handled correctly:
-            # KiCAD writes (symbol\n\t\t(lib_id "...") across two lines, which a
-            # line-by-line regex would never match.
-            blocks_to_delete = []  # list of (char_start, char_end) into content
-            search_start = 0
-            pattern = re.compile(r'\(symbol\s+\(lib_id\s+"')
-            while True:
-                m = pattern.search(content, search_start)
-                if not m:
-                    break
-                pos = m.start()
-                # Skip blocks inside lib_symbols
-                if lib_sym_pos >= 0 and lib_sym_pos <= pos <= lib_sym_end:
-                    search_start = lib_sym_end + 1
-                    continue
-                end = find_matching_paren(content, pos)
-                if end < 0:
-                    search_start = pos + 1
-                    continue
-                block_text = content[pos : end + 1]
-                if re.search(
-                    r'\(property\s+"Reference"\s+"' + re.escape(reference) + r'"',
-                    block_text,
-                ):
-                    blocks_to_delete.append((pos, end))
-                search_start = end + 1
-
-            if not blocks_to_delete:
+            content, deleted_count = self._delete_component_from_content(content, reference)
+            if content is None:
                 return {
                     "success": False,
                     "message": f"Component '{reference}' not found in schematic (note: this tool removes schematic symbols, use delete_component for PCB footprints)",
                 }
-
-            # Delete from back to front to preserve character offsets
-            for b_start, b_end in sorted(blocks_to_delete, reverse=True):
-                # Include any leading newline/whitespace before the block
-                trim_start = b_start
-                while trim_start > 0 and content[trim_start - 1] in (" ", "\t"):
-                    trim_start -= 1
-                if trim_start > 0 and content[trim_start - 1] == "\n":
-                    trim_start -= 1
-                content = content[:trim_start] + content[b_end + 1:]
 
             with open(sch_file, "w", encoding="utf-8") as f:
                 f.write(content)
                 f.flush()
                 os.fsync(f.fileno())
 
-            deleted_count = len(blocks_to_delete)
             logger.info(
                 f"Deleted {deleted_count} instance(s) of {reference} from {sch_file.name}"
             )
@@ -894,6 +895,127 @@ class KiCADInterface:
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
 
+    @staticmethod
+    def _edit_component_in_content(content, reference, new_footprint=None, new_value=None,
+                                    new_reference=None, field_positions=None, hidden_fields=None):
+        """Edit a component's properties within schematic content string.
+        Returns modified content, or None if component not found."""
+        import re
+
+        def find_matching_paren(s, start):
+            depth = 0
+            i = start
+            while i < len(s):
+                if s[i] == "(":
+                    depth += 1
+                elif s[i] == ")":
+                    depth -= 1
+                    if depth == 0:
+                        return i
+                i += 1
+            return -1
+
+        lib_sym_pos = content.find("(lib_symbols")
+        lib_sym_end = (
+            find_matching_paren(content, lib_sym_pos) if lib_sym_pos >= 0 else -1
+        )
+
+        block_start = block_end = None
+        search_start = 0
+        pattern = re.compile(r'\(symbol\s+\(lib_id\s+"')
+        while True:
+            m = pattern.search(content, search_start)
+            if not m:
+                break
+            pos = m.start()
+            if lib_sym_pos >= 0 and lib_sym_pos <= pos <= lib_sym_end:
+                search_start = lib_sym_end + 1
+                continue
+            end = find_matching_paren(content, pos)
+            if end < 0:
+                search_start = pos + 1
+                continue
+            block_text = content[pos : end + 1]
+            if re.search(
+                r'\(property\s+"Reference"\s+"' + re.escape(reference) + r'"',
+                block_text,
+            ):
+                block_start, block_end = pos, end
+                break
+            search_start = end + 1
+
+        if block_start is None:
+            return None
+
+        block_text = content[block_start : block_end + 1]
+        if new_footprint is not None:
+            block_text = re.sub(
+                r'(\(property\s+"Footprint"\s+)"[^"]*"',
+                rf'\1"{new_footprint}"',
+                block_text,
+            )
+        if new_value is not None:
+            block_text = re.sub(
+                r'(\(property\s+"Value"\s+)"[^"]*"', rf'\1"{new_value}"', block_text
+            )
+        if new_reference is not None:
+            block_text = re.sub(
+                r'(\(property\s+"Reference"\s+)"[^"]*"',
+                rf'\1"{new_reference}"',
+                block_text,
+            )
+        if field_positions is not None:
+            for field_name, pos in field_positions.items():
+                x = pos.get("x", 0)
+                y = pos.get("y", 0)
+                angle = pos.get("angle", 0)
+                block_text = re.sub(
+                    r'(\(property\s+"'
+                    + re.escape(field_name)
+                    + r'"\s+"[^"]*"\s+)\(at\s+[\d\.\-]+\s+[\d\.\-]+\s+[\d\.\-]+\s*\)',
+                    rf"\1(at {x} {y} {angle})",
+                    block_text,
+                )
+
+        if hidden_fields is not None:
+            for field_name, should_hide in hidden_fields.items():
+                prop_start = block_text.find(f'(property "{field_name}"')
+                if prop_start < 0:
+                    continue
+
+                depth = 0
+                pi = prop_start
+                while pi < len(block_text):
+                    if block_text[pi] == "(": depth += 1
+                    elif block_text[pi] == ")":
+                        depth -= 1
+                        if depth == 0:
+                            break
+                    pi += 1
+                prop_block = block_text[prop_start:pi + 1]
+
+                clean = re.sub(r'\s*\(hide\s+yes\)', '', prop_block)
+                clean = re.sub(r'\)\s+hide\b', ')', clean)
+                clean = re.sub(r'  +', ' ', clean)
+
+                if should_hide:
+                    effects_pos = clean.find('(effects')
+                    if effects_pos >= 0:
+                        ed = effects_pos
+                        edepth = 0
+                        while ed < len(clean):
+                            if clean[ed] == "(": edepth += 1
+                            elif clean[ed] == ")":
+                                edepth -= 1
+                                if edepth == 0:
+                                    break
+                            ed += 1
+                        clean = clean[:ed] + " (hide yes)" + clean[ed:]
+
+                block_text = block_text[:prop_start] + clean + block_text[pi + 1:]
+
+        return content[:block_start] + block_text + content[block_end + 1:]
+
     def _handle_edit_schematic_component(self, params):
         """Update properties of a placed symbol in a schematic (footprint, value, reference).
         Uses text-based in-place editing – preserves position, UUID and all other fields.
@@ -901,22 +1023,19 @@ class KiCADInterface:
         logger.info("Editing schematic component")
         try:
             from pathlib import Path
-            import re
 
             schematic_path = params.get("schematicPath")
             reference = params.get("reference")
             new_footprint = params.get("footprint")
             new_value = params.get("value")
             new_reference = params.get("newReference")
-            field_positions = params.get(
-                "fieldPositions"
-            )  # dict: {"Reference": {"x": 1, "y": 2, "angle": 0}}
+            field_positions = params.get("fieldPositions")
+            hidden_fields = params.get("hiddenFields")
 
             if not schematic_path:
                 return {"success": False, "message": "schematicPath is required"}
             if not reference:
                 return {"success": False, "message": "reference is required"}
-            hidden_fields = params.get("hiddenFields")
             if not any(
                 [
                     new_footprint is not None,
@@ -941,144 +1060,18 @@ class KiCADInterface:
             with open(sch_file, "r", encoding="utf-8") as f:
                 content = f.read()
 
-            def find_matching_paren(s, start):
-                """Find the position of the closing paren matching the opening paren at start."""
-                depth = 0
-                i = start
-                while i < len(s):
-                    if s[i] == "(":
-                        depth += 1
-                    elif s[i] == ")":
-                        depth -= 1
-                        if depth == 0:
-                            return i
-                    i += 1
-                return -1
-
-            # Skip lib_symbols section
-            lib_sym_pos = content.find("(lib_symbols")
-            lib_sym_end = (
-                find_matching_paren(content, lib_sym_pos) if lib_sym_pos >= 0 else -1
+            result = self._edit_component_in_content(
+                content, reference, new_footprint, new_value,
+                new_reference, field_positions, hidden_fields,
             )
-
-            # Find placed symbol blocks that match the reference
-            # Search for (symbol (lib_id "...") ... (property "Reference" "<ref>" ...) ...)
-            block_start = block_end = None
-            search_start = 0
-            pattern = re.compile(r'\(symbol\s+\(lib_id\s+"')
-            while True:
-                m = pattern.search(content, search_start)
-                if not m:
-                    break
-                pos = m.start()
-                # Skip if inside lib_symbols section
-                if lib_sym_pos >= 0 and lib_sym_pos <= pos <= lib_sym_end:
-                    search_start = lib_sym_end + 1
-                    continue
-                end = find_matching_paren(content, pos)
-                if end < 0:
-                    search_start = pos + 1
-                    continue
-                block_text = content[pos : end + 1]
-                if re.search(
-                    r'\(property\s+"Reference"\s+"' + re.escape(reference) + r'"',
-                    block_text,
-                ):
-                    block_start, block_end = pos, end
-                    break
-                search_start = end + 1
-
-            if block_start is None:
+            if result is None:
                 return {
                     "success": False,
                     "message": f"Component '{reference}' not found in schematic",
                 }
 
-            # Apply property replacements within the found block
-            block_text = content[block_start : block_end + 1]
-            if new_footprint is not None:
-                block_text = re.sub(
-                    r'(\(property\s+"Footprint"\s+)"[^"]*"',
-                    rf'\1"{new_footprint}"',
-                    block_text,
-                )
-            if new_value is not None:
-                block_text = re.sub(
-                    r'(\(property\s+"Value"\s+)"[^"]*"', rf'\1"{new_value}"', block_text
-                )
-            if new_reference is not None:
-                block_text = re.sub(
-                    r'(\(property\s+"Reference"\s+)"[^"]*"',
-                    rf'\1"{new_reference}"',
-                    block_text,
-                )
-            if field_positions is not None:
-                for field_name, pos in field_positions.items():
-                    x = pos.get("x", 0)
-                    y = pos.get("y", 0)
-                    angle = pos.get("angle", 0)
-                    block_text = re.sub(
-                        r'(\(property\s+"'
-                        + re.escape(field_name)
-                        + r'"\s+"[^"]*"\s+)\(at\s+[\d\.\-]+\s+[\d\.\-]+\s+[\d\.\-]+\s*\)',
-                        rf"\1(at {x} {y} {angle})",
-                        block_text,
-                    )
-
-            # Handle field visibility: {"Reference": true, "Value": false}
-            # true = hidden (hide yes), false = visible (remove hide)
-            if hidden_fields is not None:
-                for field_name, should_hide in hidden_fields.items():
-                    # Find the (property "FieldName" ...) block within block_text
-                    prop_start = block_text.find(f'(property "{field_name}"')
-                    if prop_start < 0:
-                        continue
-
-                    # Find end of this property block (balanced parens)
-                    depth = 0
-                    pi = prop_start
-                    while pi < len(block_text):
-                        if block_text[pi] == "(": depth += 1
-                        elif block_text[pi] == ")":
-                            depth -= 1
-                            if depth == 0:
-                                break
-                        pi += 1
-                    prop_block = block_text[prop_start:pi + 1]
-
-                    # Remove ALL existing hide directives — both at effects level
-                    # and inside (font ...) (from manual hacks or old KiCad format)
-                    # Order matters: remove (hide yes) everywhere first
-                    clean = re.sub(r'\s*\(hide\s+yes\)', '', prop_block)
-                    # Remove bare "hide" keyword (old format: (effects ... hide))
-                    clean = re.sub(r'\)\s+hide\b', ')', clean)
-                    # Fix any double-space artifacts from removal
-                    clean = re.sub(r'  +', ' ', clean)
-
-                    if should_hide:
-                        # Insert (hide yes) right before the closing ) of (effects ...)
-                        # Find the (effects ...) block
-                        effects_pos = clean.find('(effects')
-                        if effects_pos >= 0:
-                            # Find the closing ) of (effects ...)
-                            ed = effects_pos
-                            edepth = 0
-                            while ed < len(clean):
-                                if clean[ed] == "(": edepth += 1
-                                elif clean[ed] == ")":
-                                    edepth -= 1
-                                    if edepth == 0:
-                                        break
-                                ed += 1
-                            # Insert (hide yes) before the closing )
-                            clean = clean[:ed] + " (hide yes)" + clean[ed:]
-
-                    block_text = block_text[:prop_start] + clean + block_text[pi + 1:]
-
-            content = content[:block_start] + block_text + content[block_end + 1 :]
-
             with open(sch_file, "w", encoding="utf-8") as f:
-                f.write(content)
+                f.write(result)
                 f.flush()
                 os.fsync(f.fileno())
 
@@ -1106,12 +1099,14 @@ class KiCADInterface:
             return {"success": False, "message": str(e)}
 
     def _handle_batch_edit_schematic_components(self, params):
-        """Apply the same field edits to multiple components in one call.
+        """Apply the same field edits to multiple components in one call. Single read/write cycle.
 
         Useful for bulk operations like hiding Reference on all power symbols.
         """
         logger.info("Batch editing schematic components")
         try:
+            from pathlib import Path
+
             schematic_path = params.get("schematicPath")
             references = params.get("references", [])
             edits = params.get("edits", {})
@@ -1123,18 +1118,30 @@ class KiCADInterface:
             if not edits:
                 return {"success": False, "message": "edits object is required"}
 
+            sch_file = Path(schematic_path)
+            with open(sch_file, "r", encoding="utf-8") as f:
+                content = f.read()
+
             results = {"edited": [], "failed": []}
             for ref in references:
-                edit_params = {
-                    "schematicPath": schematic_path,
-                    "reference": ref,
-                    **edits,
-                }
-                result = self._handle_edit_schematic_component(edit_params)
-                if result.get("success"):
+                result = self._edit_component_in_content(
+                    content, ref,
+                    new_footprint=edits.get("footprint"),
+                    new_value=edits.get("value"),
+                    new_reference=edits.get("newReference"),
+                    field_positions=edits.get("fieldPositions"),
+                    hidden_fields=edits.get("hiddenFields"),
+                )
+                if result is not None:
+                    content = result
                     results["edited"].append(ref)
                 else:
-                    results["failed"].append(f"{ref}: {result.get('message', 'unknown error')}")
+                    results["failed"].append(f"{ref}: not found")
+
+            with open(sch_file, "w", encoding="utf-8") as f:
+                f.write(content)
+                f.flush()
+                os.fsync(f.fileno())
 
             n_ok = len(results["edited"])
             n_fail = len(results["failed"])
@@ -1205,11 +1212,11 @@ class KiCADInterface:
             return {"success": False, "message": str(e)}
 
     def _handle_batch_add_junction(self, params):
-        """Add multiple junction dots in one call."""
+        """Add multiple junction dots in one call. Single read/write cycle."""
         logger.info("Batch adding junctions")
         try:
+            from commands.sexp_writer import add_junction_to_content, _read_schematic, _write_schematic
             from pathlib import Path
-            from commands.sexp_writer import add_junction
 
             schematic_path = params.get("schematicPath")
             positions = params.get("positions", [])
@@ -1219,22 +1226,21 @@ class KiCADInterface:
             if not positions:
                 return {"success": False, "message": "positions array is required"}
 
-            sch_path = Path(schematic_path)
+            content = _read_schematic(Path(schematic_path))
             added = 0
-            failed = []
             for pos in positions:
                 x = pos.get("x", 0) if isinstance(pos, dict) else pos[0]
                 y = pos.get("y", 0) if isinstance(pos, dict) else pos[1]
-                if add_junction(sch_path, [x, y]):
-                    added += 1
-                else:
-                    failed.append({"x": x, "y": y})
+                content = add_junction_to_content(content, [x, y])
+                added += 1
+
+            _write_schematic(Path(schematic_path), content)
 
             return {
                 "success": True,
                 "message": f"Added {added}/{len(positions)} junctions",
                 "added": added,
-                "failed": failed,
+                "failed": [],
             }
         except Exception as e:
             logger.error(f"Error in batch_add_junction: {e}")
@@ -2044,9 +2050,11 @@ class KiCADInterface:
             return {"success": False, "message": str(e)}
 
     def _handle_batch_delete_schematic_components(self, params):
-        """Delete multiple schematic components in a single call."""
+        """Delete multiple schematic components in a single call. Single read/write cycle."""
         logger.info("Batch deleting schematic components")
         try:
+            from pathlib import Path
+
             schematic_path = params.get("schematicPath")
             references = params.get("references", [])
 
@@ -2055,17 +2063,24 @@ class KiCADInterface:
             if not references:
                 return {"success": False, "message": "references array is required"}
 
+            sch_file = Path(schematic_path)
+            with open(sch_file, "r", encoding="utf-8") as f:
+                content = f.read()
+
             deleted = []
             failed = []
             for ref in references:
-                result = self._handle_delete_schematic_component({
-                    "schematicPath": schematic_path,
-                    "reference": ref,
-                })
-                if result.get("success"):
+                result, count = self._delete_component_from_content(content, ref)
+                if result is not None:
+                    content = result
                     deleted.append(ref)
                 else:
-                    failed.append(f"{ref}: {result.get('message', 'unknown')}")
+                    failed.append(f"{ref}: not found")
+
+            with open(sch_file, "w", encoding="utf-8") as f:
+                f.write(content)
+                f.flush()
+                os.fsync(f.fileno())
 
             return {
                 "success": len(failed) == 0,
@@ -2946,11 +2961,11 @@ class KiCADInterface:
             return {"success": False, "message": str(e)}
 
     def _handle_batch_add_wire(self, params):
-        """Add multiple wires in a single call."""
+        """Add multiple wires in a single call. Single read/write cycle."""
         logger.info("Batch adding wires")
         try:
             from pathlib import Path
-            from commands.wire_manager import WireManager
+            from commands.sexp_writer import add_wire_to_content, _read_schematic, _write_schematic
 
             schematic_path = params.get("schematicPath")
             wires = params.get("wires", [])
@@ -2960,23 +2975,23 @@ class KiCADInterface:
             if not wires:
                 return {"success": False, "message": "wires array is required"}
 
+            content = _read_schematic(Path(schematic_path))
             added = 0
-            failed = 0
             for w in wires:
                 start = w.get("start", {})
                 end = w.get("end", {})
                 sp = [start.get("x", 0), start.get("y", 0)]
                 ep = [end.get("x", 0), end.get("y", 0)]
-                if WireManager.add_wire(Path(schematic_path), sp, ep):
-                    added += 1
-                else:
-                    failed += 1
+                content = add_wire_to_content(content, sp, ep)
+                added += 1
+
+            _write_schematic(Path(schematic_path), content)
 
             return {
-                "success": failed == 0,
-                "message": f"Added {added} wires, {failed} failed",
+                "success": True,
+                "message": f"Added {added} wires, 0 failed",
                 "added": added,
-                "failed": failed,
+                "failed": 0,
             }
         except Exception as e:
             logger.error(f"Error in batch_add_wire: {e}")
@@ -3068,11 +3083,14 @@ class KiCADInterface:
             return {"success": False, "message": str(e)}
 
     def _handle_batch_delete(self, params):
-        """Delete multiple wires and/or labels in a single call."""
+        """Delete multiple wires and/or labels in a single call. Single read/write cycle."""
         logger.info("Batch deleting items")
         try:
             from pathlib import Path
-            from commands.wire_manager import WireManager
+            from commands.sexp_writer import (
+                delete_wire_from_content, delete_label_from_content,
+                _read_schematic, _write_schematic,
+            )
 
             schematic_path = params.get("schematicPath")
             wires = params.get("wires", [])
@@ -3081,6 +3099,7 @@ class KiCADInterface:
             if not schematic_path:
                 return {"success": False, "message": "schematicPath is required"}
 
+            content = _read_schematic(Path(schematic_path))
             deleted_wires = 0
             deleted_labels = 0
             failed = []
@@ -3090,7 +3109,9 @@ class KiCADInterface:
                 end = w.get("end", {})
                 sp = [start.get("x", 0), start.get("y", 0)]
                 ep = [end.get("x", 0), end.get("y", 0)]
-                if WireManager.delete_wire(Path(schematic_path), sp, ep):
+                result = delete_wire_from_content(content, sp, ep)
+                if result is not None:
+                    content = result
                     deleted_wires += 1
                 else:
                     failed.append(f"wire {sp}->{ep}")
@@ -3099,10 +3120,14 @@ class KiCADInterface:
                 net = l.get("netName")
                 pos = l.get("position")
                 pos_list = [pos.get("x", 0), pos.get("y", 0)] if pos else None
-                if WireManager.delete_label(Path(schematic_path), net, pos_list):
+                result = delete_label_from_content(content, net, pos_list)
+                if result is not None:
+                    content = result
                     deleted_labels += 1
                 else:
                     failed.append(f"label '{net}'")
+
+            _write_schematic(Path(schematic_path), content)
 
             return {
                 "success": len(failed) == 0,
@@ -5259,11 +5284,11 @@ class KiCADInterface:
             return {"success": False, "message": str(e)}
 
     def _handle_batch_delete_schematic_wire(self, params):
-        """Delete multiple wires in a single call."""
+        """Delete multiple wires in a single call. Single read/write cycle."""
         logger.info("Batch deleting schematic wires")
         try:
             from pathlib import Path
-            from commands.wire_manager import WireManager
+            from commands.sexp_writer import delete_wire_from_content, _read_schematic, _write_schematic
 
             schematic_path = params.get("schematicPath")
             wires = params.get("wires", [])
@@ -5273,7 +5298,7 @@ class KiCADInterface:
             if not wires:
                 return {"success": False, "message": "wires array is required"}
 
-            sch_path = Path(schematic_path)
+            content = _read_schematic(Path(schematic_path))
             deleted = 0
             failed = []
             for w in wires:
@@ -5281,10 +5306,14 @@ class KiCADInterface:
                 end = w.get("end", {})
                 sp = [start.get("x", 0), start.get("y", 0)]
                 ep = [end.get("x", 0), end.get("y", 0)]
-                if WireManager.delete_wire(sch_path, sp, ep):
+                result = delete_wire_from_content(content, sp, ep)
+                if result is not None:
+                    content = result
                     deleted += 1
                 else:
                     failed.append({"start": start, "end": end})
+
+            _write_schematic(Path(schematic_path), content)
 
             return {
                 "success": True,

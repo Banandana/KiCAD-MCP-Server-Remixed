@@ -53,6 +53,26 @@ def _write_schematic(path: Path, content: str) -> None:
         os.fsync(f.fileno())
 
 
+def add_wire_to_content(
+    content: str,
+    start_point: List[float],
+    end_point: List[float],
+    stroke_width: float = 0,
+    stroke_type: str = "default",
+) -> str:
+    """Add a wire to schematic content string. Returns modified content."""
+    wire_uuid = str(uuid.uuid4())
+    wire_text = (
+        f"  (wire (pts (xy {_fmt(start_point[0])} {_fmt(start_point[1])}) "
+        f"(xy {_fmt(end_point[0])} {_fmt(end_point[1])}))\n"
+        f"    (stroke (width {stroke_width}) (type {stroke_type}))\n"
+        f"    (uuid {wire_uuid})\n"
+        f"  )\n\n"
+    )
+    insert_at = _find_insert_position(content)
+    return content[:insert_at] + wire_text + content[insert_at:]
+
+
 def add_wire(
     schematic_path: Path,
     start_point: List[float],
@@ -63,20 +83,8 @@ def add_wire(
     """Add a wire to the schematic using text insertion."""
     try:
         content = _read_schematic(schematic_path)
-        wire_uuid = str(uuid.uuid4())
-
-        wire_text = (
-            f"  (wire (pts (xy {_fmt(start_point[0])} {_fmt(start_point[1])}) "
-            f"(xy {_fmt(end_point[0])} {_fmt(end_point[1])}))\n"
-            f"    (stroke (width {stroke_width}) (type {stroke_type}))\n"
-            f"    (uuid {wire_uuid})\n"
-            f"  )\n\n"
-        )
-
-        insert_at = _find_insert_position(content)
-        content = content[:insert_at] + wire_text + content[insert_at:]
+        content = add_wire_to_content(content, start_point, end_point, stroke_width, stroke_type)
         _write_schematic(schematic_path, content)
-
         logger.info(f"Added wire from {start_point} to {end_point}")
         return True
     except Exception as e:
@@ -199,6 +207,23 @@ def add_label(
         return False
 
 
+def add_junction_to_content(
+    content: str,
+    position: List[float],
+    diameter: float = 0,
+) -> str:
+    """Add a junction to schematic content string. Returns modified content."""
+    junction_uuid = str(uuid.uuid4())
+    junction_text = (
+        f"  (junction (at {_fmt(position[0])} {_fmt(position[1])}) (diameter {diameter})\n"
+        f"    (color 0 0 0 0)\n"
+        f"    (uuid {junction_uuid})\n"
+        f"  )\n\n"
+    )
+    insert_at = _find_insert_position(content)
+    return content[:insert_at] + junction_text + content[insert_at:]
+
+
 def add_junction(
     schematic_path: Path,
     position: List[float],
@@ -207,19 +232,8 @@ def add_junction(
     """Add a junction (connection dot) to the schematic."""
     try:
         content = _read_schematic(schematic_path)
-        junction_uuid = str(uuid.uuid4())
-
-        junction_text = (
-            f"  (junction (at {_fmt(position[0])} {_fmt(position[1])}) (diameter {diameter})\n"
-            f"    (color 0 0 0 0)\n"
-            f"    (uuid {junction_uuid})\n"
-            f"  )\n\n"
-        )
-
-        insert_at = _find_insert_position(content)
-        content = content[:insert_at] + junction_text + content[insert_at:]
+        content = add_junction_to_content(content, position, diameter)
         _write_schematic(schematic_path, content)
-
         logger.info(f"Added junction at {position}")
         return True
     except Exception as e:
@@ -229,22 +243,24 @@ def add_junction(
         return False
 
 
+def add_no_connect_to_content(content: str, position: List[float]) -> str:
+    """Add a no-connect flag to schematic content string. Returns modified content."""
+    nc_uuid = str(uuid.uuid4())
+    nc_text = (
+        f"  (no_connect (at {_fmt(position[0])} {_fmt(position[1])})\n"
+        f"    (uuid {nc_uuid})\n"
+        f"  )\n\n"
+    )
+    insert_at = _find_insert_position(content)
+    return content[:insert_at] + nc_text + content[insert_at:]
+
+
 def add_no_connect(schematic_path: Path, position: List[float]) -> bool:
     """Add a no-connect flag to the schematic."""
     try:
         content = _read_schematic(schematic_path)
-        nc_uuid = str(uuid.uuid4())
-
-        nc_text = (
-            f"  (no_connect (at {_fmt(position[0])} {_fmt(position[1])})\n"
-            f"    (uuid {nc_uuid})\n"
-            f"  )\n\n"
-        )
-
-        insert_at = _find_insert_position(content)
-        content = content[:insert_at] + nc_text + content[insert_at:]
+        content = add_no_connect_to_content(content, position)
         _write_schematic(schematic_path, content)
-
         logger.info(f"Added no-connect at {position}")
         return True
     except Exception as e:
@@ -252,6 +268,60 @@ def add_no_connect(schematic_path: Path, position: List[float]) -> bool:
         import traceback
         logger.error(traceback.format_exc())
         return False
+
+
+def delete_wire_from_content(
+    content: str,
+    start_point: List[float],
+    end_point: List[float],
+    tolerance: float = 0.5,
+) -> Optional[str]:
+    """Delete a wire from schematic content string. Returns modified content, or None if not found."""
+    import re
+    wire_pattern = re.compile(r'\(wire\b')
+
+    for m in wire_pattern.finditer(content):
+        block_start = m.start()
+        depth = 0
+        i = block_start
+        while i < len(content):
+            if content[i] == '(':
+                depth += 1
+            elif content[i] == ')':
+                depth -= 1
+                if depth == 0:
+                    block_end = i + 1
+                    break
+            i += 1
+        else:
+            continue
+
+        block = content[block_start:block_end]
+        xy_matches = re.findall(r'\(xy\s+([\d.e+-]+)\s+([\d.e+-]+)\)', block)
+        if len(xy_matches) < 2:
+            continue
+
+        x1, y1 = float(xy_matches[0][0]), float(xy_matches[0][1])
+        x2, y2 = float(xy_matches[-1][0]), float(xy_matches[-1][1])
+        sx, sy = start_point
+        ex, ey = end_point
+
+        match_fwd = (
+            abs(x1 - sx) < tolerance and abs(y1 - sy) < tolerance
+            and abs(x2 - ex) < tolerance and abs(y2 - ey) < tolerance
+        )
+        match_rev = (
+            abs(x1 - ex) < tolerance and abs(y1 - ey) < tolerance
+            and abs(x2 - sx) < tolerance and abs(y2 - sy) < tolerance
+        )
+
+        if match_fwd or match_rev:
+            end_with_nl = block_end
+            while end_with_nl < len(content) and content[end_with_nl] in '\n':
+                end_with_nl += 1
+            return content[:block_start] + content[end_with_nl:]
+
+    return None
 
 
 def delete_wire(
@@ -263,60 +333,11 @@ def delete_wire(
     """Delete a wire matching given start/end coordinates using text parsing."""
     try:
         content = _read_schematic(schematic_path)
-
-        import re
-        # Find all wire blocks — match anywhere (handles both multi-line
-        # and single-line .kicad_sch files)
-        wire_pattern = re.compile(r'\(wire\b')
-
-        for m in wire_pattern.finditer(content):
-            block_start = m.start()
-            # Find matching closing paren
-            depth = 0
-            i = block_start
-            while i < len(content):
-                if content[i] == '(':
-                    depth += 1
-                elif content[i] == ')':
-                    depth -= 1
-                    if depth == 0:
-                        block_end = i + 1
-                        break
-                i += 1
-            else:
-                continue
-
-            block = content[block_start:block_end]
-
-            # Extract xy coordinates from the block
-            xy_matches = re.findall(r'\(xy\s+([\d.e+-]+)\s+([\d.e+-]+)\)', block)
-            if len(xy_matches) < 2:
-                continue
-
-            x1, y1 = float(xy_matches[0][0]), float(xy_matches[0][1])
-            x2, y2 = float(xy_matches[-1][0]), float(xy_matches[-1][1])
-            sx, sy = start_point
-            ex, ey = end_point
-
-            match_fwd = (
-                abs(x1 - sx) < tolerance and abs(y1 - sy) < tolerance
-                and abs(x2 - ex) < tolerance and abs(y2 - ey) < tolerance
-            )
-            match_rev = (
-                abs(x1 - ex) < tolerance and abs(y1 - ey) < tolerance
-                and abs(x2 - sx) < tolerance and abs(y2 - sy) < tolerance
-            )
-
-            if match_fwd or match_rev:
-                # Remove the block and any trailing newlines
-                end_with_nl = block_end
-                while end_with_nl < len(content) and content[end_with_nl] in '\n':
-                    end_with_nl += 1
-                content = content[:block_start] + content[end_with_nl:]
-                _write_schematic(schematic_path, content)
-                logger.info(f"Deleted wire from {start_point} to {end_point}")
-                return True
-
+        result = delete_wire_from_content(content, start_point, end_point, tolerance)
+        if result is not None:
+            _write_schematic(schematic_path, result)
+            logger.info(f"Deleted wire from {start_point} to {end_point}")
+            return True
         logger.warning(f"No matching wire found for {start_point} to {end_point}")
         return False
     except Exception as e:
@@ -324,6 +345,52 @@ def delete_wire(
         import traceback
         logger.error(traceback.format_exc())
         return False
+
+
+def delete_label_from_content(
+    content: str,
+    net_name: str,
+    position: Optional[List[float]] = None,
+    tolerance: float = 0.5,
+) -> Optional[str]:
+    """Delete a label from schematic content string. Returns modified content, or None if not found."""
+    import re
+    escaped_name = re.escape(net_name)
+    label_pattern = re.compile(
+        rf'\((?:label|global_label|hierarchical_label)\s+"{escaped_name}"\s'
+    )
+
+    for m in label_pattern.finditer(content):
+        block_start = m.start()
+        depth = 0
+        i = block_start
+        while i < len(content):
+            if content[i] == '(':
+                depth += 1
+            elif content[i] == ')':
+                depth -= 1
+                if depth == 0:
+                    block_end = i + 1
+                    break
+            i += 1
+        else:
+            continue
+
+        block = content[block_start:block_end]
+
+        if position is not None:
+            at_match = re.search(r'\(at\s+([\d.e+-]+)\s+([\d.e+-]+)', block)
+            if at_match:
+                lx, ly = float(at_match.group(1)), float(at_match.group(2))
+                if abs(lx - position[0]) >= tolerance or abs(ly - position[1]) >= tolerance:
+                    continue
+
+        end_with_nl = block_end
+        while end_with_nl < len(content) and content[end_with_nl] in '\n':
+            end_with_nl += 1
+        return content[:block_start] + content[end_with_nl:]
+
+    return None
 
 
 def delete_label(
@@ -335,49 +402,11 @@ def delete_label(
     """Delete a net label by name (and optionally position) using text parsing."""
     try:
         content = _read_schematic(schematic_path)
-
-        import re
-        # Find label or global_label blocks matching the net name — match anywhere
-        # (handles both multi-line and single-line .kicad_sch files)
-        escaped_name = re.escape(net_name)
-        label_pattern = re.compile(
-            rf'\((?:label|global_label|hierarchical_label)\s+"{escaped_name}"\s'
-        )
-
-        for m in label_pattern.finditer(content):
-            block_start = m.start()
-            depth = 0
-            i = block_start
-            while i < len(content):
-                if content[i] == '(':
-                    depth += 1
-                elif content[i] == ')':
-                    depth -= 1
-                    if depth == 0:
-                        block_end = i + 1
-                        break
-                i += 1
-            else:
-                continue
-
-            block = content[block_start:block_end]
-
-            if position is not None:
-                at_match = re.search(r'\(at\s+([\d.e+-]+)\s+([\d.e+-]+)', block)
-                if at_match:
-                    lx, ly = float(at_match.group(1)), float(at_match.group(2))
-                    if abs(lx - position[0]) >= tolerance or abs(ly - position[1]) >= tolerance:
-                        continue
-
-            # Remove block and trailing newlines
-            end_with_nl = block_end
-            while end_with_nl < len(content) and content[end_with_nl] in '\n':
-                end_with_nl += 1
-            content = content[:block_start] + content[end_with_nl:]
-            _write_schematic(schematic_path, content)
+        result = delete_label_from_content(content, net_name, position, tolerance)
+        if result is not None:
+            _write_schematic(schematic_path, result)
             logger.info(f"Deleted label '{net_name}'")
             return True
-
         logger.warning(f"No matching label found for '{net_name}'")
         return False
     except Exception as e:
