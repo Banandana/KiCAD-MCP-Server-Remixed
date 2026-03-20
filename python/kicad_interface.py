@@ -3430,10 +3430,10 @@ class KiCADInterface:
                     for w in wires:
                         # Skip wires that touch the label's electrical CONNECTION
                         # point (not the "at" position, which is the arrow tip).
-                        cx, cy = lb["conn_x"], lb["conn_y"]
+                        lc_x, lc_y = lb["conn_x"], lb["conn_y"]
                         eps = 0.5
-                        touches_start = abs(w["x1"] - cx) < eps and abs(w["y1"] - cy) < eps
-                        touches_end = abs(w["x2"] - cx) < eps and abs(w["y2"] - cy) < eps
+                        touches_start = abs(w["x1"] - lc_x) < eps and abs(w["y1"] - lc_y) < eps
+                        touches_end = abs(w["x2"] - lc_x) < eps and abs(w["y2"] - lc_y) < eps
                         if touches_start or touches_end:
                             continue
 
@@ -3441,9 +3441,20 @@ class KiCADInterface:
                             w["x1"], w["y1"], w["x2"], w["y2"],
                             lb["x1"], lb["y1"], lb["x2"], lb["y2"],
                         ):
+                            # Compute wire length to distinguish standard pin stubs
+                            # from long wires. Standard stubs are ≤5mm (2.54mm typical).
+                            wire_len = math.sqrt(
+                                (w["x2"] - w["x1"]) ** 2 + (w["y2"] - w["y1"]) ** 2
+                            )
+
+                            if suppress_pin_labels and wire_len <= 5.0:
+                                # Short wire through label — standard pin stub, suppress
+                                continue
+
                             overlaps.append({
                                 "type": "wire_label",
                                 "severity": "wire_through_label",
+                                "wire_length_mm": round(wire_len, 1),
                                 "label": {
                                     "netName": lb["name"], "labelType": lb["type"],
                                     "at": [lb["x"], lb["y"]], "angle": lb["angle"],
