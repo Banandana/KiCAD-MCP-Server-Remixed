@@ -2645,14 +2645,16 @@ class KiCADInterface:
                 content = f.read()
 
             label_boxes = []  # [(name, x, y, hw, hh)]
-            for lt in ["global_label", "hierarchical_label"]:
-                lp = re.compile(rf'\({lt}\s+"([^"]*)"(?:\s+\(shape\s+[^)]*\))?\s+\(at\s+([\d.e+-]+)\s+([\d.e+-]+)\s+([\d.e+-]*)')
+            for lt in ["label", "global_label", "hierarchical_label"]:
+                lp = re.compile(rf'\({lt}\s+"([^"]*)"(?:\s+\(shape\s+[^)]*\))?\s+\(at\s+([\d.e+-]+)\s+([\d.e+-]+)\s*([\d.e+-]*)')
                 for m in lp.finditer(content):
                     name = m.group(1)
                     lx, ly = float(m.group(2)), float(m.group(3))
                     angle = float(m.group(4)) if m.group(4) else 0
-                    # Approximate label bbox: shape body ~3mm + text ~0.7mm/char
-                    text_w = 3.0 + len(name) * 0.7
+                    # Approximate label bbox: shape body + text
+                    # Global/hierarchical labels have a shape body (~3mm); local labels are just text (~1mm)
+                    body = 3.0 if lt != "label" else 1.0
+                    text_w = body + len(name) * 0.7
                     text_h = 1.5
                     # Rotate bbox for vertical labels
                     if angle in (90, 270):
@@ -3345,11 +3347,13 @@ class KiCADInterface:
                         else ref
                     )
                     pos = symbol.at.value if hasattr(symbol, "at") else [0, 0, 0]
+                    angle = float(pos[2]) if len(pos) > 2 else 0
                     labels.append(
                         {
                             "name": value,
                             "type": "power",
                             "position": {"x": float(pos[0]), "y": float(pos[1])},
+                            "angle": angle,
                         }
                     )
 
