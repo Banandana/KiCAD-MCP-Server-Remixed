@@ -3302,7 +3302,10 @@ class KiCADInterface:
 
             # ── 2. Label vs component ──
             if "label_component" in check_types:
-                pin_eps = 1.0  # tolerance for pin-endpoint matching
+                # Labels connect to pins via short wire stubs (typically 2.54mm).
+                # Suppress if the label's connection point is within one stub
+                # length of any pin on the overlapping component.
+                pin_suppress_dist = 5.5  # mm — covers 2×2.54mm stub + tolerance
                 for lb in label_boxes:
                     for comp in components:
                         if comp["ref"].startswith("#PWR"):
@@ -3313,13 +3316,13 @@ class KiCADInterface:
                             comp["cx"] + comp["hw"], comp["cy"] + comp["hh"],
                         )
                         if gap < 0:
-                            # Suppress labels whose connection point sits at a pin
-                            # endpoint of the overlapping component — these are standard
-                            # pin-endpoint labels, not real visual conflicts.
+                            # Suppress labels near a pin of the overlapping component.
+                            # Standard practice: labels at pin endpoints connected by
+                            # short wire stubs are not real visual conflicts.
                             if suppress_pin_labels and comp.get("pin_endpoints"):
                                 lx, ly = lb["x"], lb["y"]
                                 is_pin_label = any(
-                                    abs(lx - px) < pin_eps and abs(ly - py) < pin_eps
+                                    abs(lx - px) <= pin_suppress_dist and abs(ly - py) <= pin_suppress_dist
                                     for px, py in comp["pin_endpoints"]
                                 )
                                 if is_pin_label:
