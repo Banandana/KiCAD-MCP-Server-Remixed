@@ -158,12 +158,13 @@ These are hard-won lessons from debugging. Read before touching any schematic fi
 - Pin angles in definitions point FROM endpoint TOWARD body. For wire stubs going AWAY from body, use `(angle + 180 + symbol_rotation) % 360`. For mirrored symbols, apply mirror to the pin angle before adding symbol rotation.
 
 ### Duplicated pin math (known tech debt)
-Pin position calculation (Y-negate, mirror, rotate) is duplicated in **5 places**:
+Pin position calculation (Y-negate, mirror, rotate) is duplicated in **6 places**:
 1. `pin_locator.py:get_pin_location()` — the canonical implementation
 2. `pin_locator.py:get_all_symbol_pins()` — inline for performance
 3. `kicad_interface.py:_handle_list_schematic_components()` — inline
 4. `kicad_interface.py:_handle_batch_get_schematic_pin_locations()` — inline
 5. `kicad_interface.py:_handle_get_net_connectivity()` and `_handle_validate_wire_connections()` — inline
+6. `kicad_interface.py:_handle_check_schematic_overlaps()` — pin endpoints for `suppressPinLabels`
 
 **When fixing pin math, grep for `pin_rel_y = -` to find ALL sites.** A fix in one place that misses the others will cause tools to disagree about pin positions.
 
@@ -201,6 +202,16 @@ And always iterate `["label", "global_label", "hierarchical_label"]`, not just `
 - `get_pin_connections` must detect power symbol pins at wire endpoints.
 - Power symbol references must be auto-numbered (#PWR068, not #PWR?) to avoid collisions.
 - Their Reference field should be hidden by default (`(hide yes)` in effects).
+
+### Label bounding box geometry
+- The label `(at x y angle)` position is the **arrow tip**, NOT the connection endpoint or the center of the label body.
+- The flag body (text + shape) extends **opposite** to the angle direction:
+  - `angle=0` → arrow tip on left, body extends **right** (+x)
+  - `angle=180` → arrow tip on right, body extends **left** (-x)
+  - `angle=90` → arrow tip on top, body extends **down** (+y, KiCad Y-down)
+  - `angle=270` → arrow tip on bottom, body extends **up** (-y)
+- When computing bounding boxes, use `dx = -cos(angle) * width`, `dy = -sin(angle) * width` (note the negation). Using `cos` directly gives the wrong direction and makes overlap detection miss real conflicts.
+- Labels connect to component pins via **short wire stubs** (typically 2.54mm). The label's `(at)` position is NOT at the pin — it's one stub length away. `check_schematic_overlaps` uses `suppressPinLabels` (default: true) with a 5.5mm tolerance to filter out standard pin-endpoint labels that aren't real visual conflicts.
 
 ### String replacement in loops
 - **Never modify a string inside a `finditer` loop on that string.** After the first replacement changes string length, all subsequent match positions are wrong. Collect all `(start, end, new_text)` edits first, then apply in reverse order.
@@ -298,6 +309,8 @@ These are bugs that were actually encountered and fixed. If you see these sympto
 - **get_schematic_pin_locations timeout on large MCUs**: `get_all_symbol_pins` was re-parsing the file per pin. Fixed — now loads once, computes all pins inline.
 - **Batch operations show stale state**: Each sub-operation re-reads/re-writes the whole file. For N items that's N full file cycles. This is a known performance limitation.
 - **Schematic changes not visible immediately**: File writes were not flushed to disk. All writes now use `f.flush()` + `os.fsync()`.
+- **check_schematic_overlaps reports 20+ false positives for label-component**: Labels at pin endpoints connected by wire stubs are normal. `suppressPinLabels` (default: true) filters these using a 5.5mm distance tolerance. If suppression isn't working, check that pin endpoints are computed correctly (mirror + rotation).
+- **Label bounding box extends wrong direction**: At 180°, `cos(180°)=-1` makes the bbox extend left, but KiCad renders the body extending right from the `(at)` position. Must negate the direction: `dx = -cos(angle) * width`.
 
 ## Important Notes
 
