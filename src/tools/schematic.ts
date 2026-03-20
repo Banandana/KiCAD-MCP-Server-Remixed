@@ -837,6 +837,23 @@ Note: operates on .kicad_sch files only. To modify a PCB footprint use edit_comp
     },
   );
 
+  // Batch delete wires
+  server.tool(
+    "batch_delete_schematic_wire",
+    "Delete multiple wires in a single call. Each wire is identified by start and end coordinates.",
+    {
+      schematicPath: z.string().describe("Path to the .kicad_sch file"),
+      wires: z.array(z.object({
+        start: z.object({ x: z.number(), y: z.number() }).describe("Wire start position"),
+        end: z.object({ x: z.number(), y: z.number() }).describe("Wire end position"),
+      })).describe("Array of wires to delete"),
+    },
+    async (args) => {
+      const result = await callKicadScript("batch_delete_schematic_wire", args);
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    }
+  );
+
   // Delete net label from schematic
   server.tool(
     "delete_schematic_net_label",
@@ -1307,6 +1324,7 @@ Note: operates on .kicad_sch files only. To modify a PCB footprint use edit_comp
       schematicPath: z.string().describe("Path to the schematic file"),
       clearance: z.number().optional().describe("Minimum clearance in mm for component-component checks (default: 2.0)"),
       checkTypes: z.array(z.enum(["component_component", "label_component", "wire_label", "label_label"])).optional().describe("Which overlap types to check (default: all four)"),
+      suppressPinLabels: z.boolean().optional().describe("Filter out label-component overlaps where the label's connection point sits at a pin endpoint of the component (default: true). These are standard pin-endpoint labels, not real visual conflicts."),
     },
     async (args) => {
       const result = await callKicadScript("check_schematic_overlaps", args);

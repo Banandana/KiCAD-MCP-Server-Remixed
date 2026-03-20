@@ -393,6 +393,7 @@ class KiCADInterface:
             "rotate_schematic_component": self._handle_rotate_schematic_component,
             "annotate_schematic": self._handle_annotate_schematic,
             "delete_schematic_wire": self._handle_delete_schematic_wire,
+            "batch_delete_schematic_wire": self._handle_batch_delete_schematic_wire,
             "delete_schematic_net_label": self._handle_delete_schematic_net_label,
             "export_schematic_pdf": self._handle_export_schematic_pdf,
             "export_schematic_svg": self._handle_export_schematic_svg,
@@ -3085,6 +3086,7 @@ class KiCADInterface:
             check_types = params.get("checkTypes") or [
                 "component_component", "label_component", "wire_label", "label_label"
             ]
+            suppress_pin_labels = params.get("suppressPinLabels", True)
 
             if not schematic_path:
                 return {"success": False, "message": "schematicPath is required"}
@@ -3117,6 +3119,7 @@ class KiCADInterface:
                 sym_rot = float(position[2]) if len(position) > 2 else 0.0
 
                 pins_def = locator.get_symbol_pins(sch_file, lib_id) if lib_id else {}
+                pin_endpoints = []  # absolute pin positions for this component
                 if pins_def:
                     xs = [pd["x"] for pd in pins_def.values()]
                     ys = [pd["y"] for pd in pins_def.values()]
@@ -3124,12 +3127,34 @@ class KiCADInterface:
                     hh = max(abs(max(ys, default=0)), abs(min(ys, default=0)), 2.54)
                     if sym_rot in (90, 270):
                         hw, hh = hh, hw
+
+                    # Compute absolute pin positions for pin-label suppression
+                    if suppress_pin_labels:
+                        mirror_x = False
+                        mirror_y = False
+                        if hasattr(symbol, "mirror"):
+                            mv = str(symbol.mirror.value) if hasattr(symbol.mirror, "value") else str(symbol.mirror)
+                            mirror_x = "x" in mv
+                            mirror_y = "y" in mv
+                        for pd in pins_def.values():
+                            prx = pd["x"]
+                            pry = -pd["y"]
+                            if mirror_x:
+                                pry = -pry
+                            if mirror_y:
+                                prx = -prx
+                            if sym_rot != 0:
+                                rad = math.radians(sym_rot)
+                                cr, sr = math.cos(rad), math.sin(rad)
+                                prx, pry = prx * cr - pry * sr, prx * sr + pry * cr
+                            pin_endpoints.append((round(cx + prx, 2), round(cy + pry, 2)))
                 else:
                     hw, hh = 2.54, 2.54
 
                 components.append({
                     "ref": ref, "cx": cx, "cy": cy,
                     "hw": hw, "hh": hh, "lib_id": lib_id,
+                    "pin_endpoints": pin_endpoints,
                 })
 
             # ── Build label bounding boxes ──
@@ -3277,6 +3302,7 @@ class KiCADInterface:
 
             # ── 2. Label vs component ──
             if "label_component" in check_types:
+                pin_eps = 1.0  # tolerance for pin-endpoint matching
                 for lb in label_boxes:
                     for comp in components:
                         if comp["ref"].startswith("#PWR"):
@@ -3287,6 +3313,18 @@ class KiCADInterface:
                             comp["cx"] + comp["hw"], comp["cy"] + comp["hh"],
                         )
                         if gap < 0:
+                            # Suppress labels whose connection point sits at a pin
+                            # endpoint of the overlapping component — these are standard
+                            # pin-endpoint labels, not real visual conflicts.
+                            if suppress_pin_labels and comp.get("pin_endpoints"):
+                                lx, ly = lb["x"], lb["y"]
+                                is_pin_label = any(
+                                    abs(lx - px) < pin_eps and abs(ly - py) < pin_eps
+                                    for px, py in comp["pin_endpoints"]
+                                )
+                                if is_pin_label:
+                                    continue
+
                             overlaps.append({
                                 "type": "label_component",
                                 "severity": "overlap",
@@ -4353,6 +4391,46 @@ class KiCADInterface:
             logger.error(f"Error deleting schematic wire: {e}")
             import traceback
 
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e)}
+
+    def _handle_batch_delete_schematic_wire(self, params):
+        """Delete multiple wires in a single call."""
+        logger.info("Batch deleting schematic wires")
+        try:
+            from pathlib import Path
+            from commands.wire_manager import WireManager
+
+            schematic_path = params.get("schematicPath")
+            wires = params.get("wires", [])
+
+            if not schematic_path:
+                return {"success": False, "message": "schematicPath is required"}
+            if not wires:
+                return {"success": False, "message": "wires array is required"}
+
+            sch_path = Path(schematic_path)
+            deleted = 0
+            failed = []
+            for w in wires:
+                start = w.get("start", {})
+                end = w.get("end", {})
+                sp = [start.get("x", 0), start.get("y", 0)]
+                ep = [end.get("x", 0), end.get("y", 0)]
+                if WireManager.delete_wire(sch_path, sp, ep):
+                    deleted += 1
+                else:
+                    failed.append({"start": start, "end": end})
+
+            return {
+                "success": True,
+                "message": f"Deleted {deleted}/{len(wires)} wires",
+                "deleted": deleted,
+                "failed": failed,
+            }
+        except Exception as e:
+            logger.error(f"Error in batch_delete_schematic_wire: {e}")
+            import traceback
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
 
