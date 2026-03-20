@@ -3364,27 +3364,38 @@ class KiCADInterface:
 
             # ── 2. Label vs component ──
             if "label_component" in check_types:
+                pin_suppress_dist = 5.5
                 for lb in label_boxes:
                     for comp in components:
                         if comp["ref"].startswith("#PWR"):
                             continue
 
-                        # Use BODY rectangle (artwork outline) for label overlap,
-                        # not the full pin-extent bbox. Labels in the pin-stub area
-                        # outside the body are normal KiCad practice.
+                        # Step 1: Check label vs FULL bbox (pins + body).
+                        # If no overlap with full bbox, skip entirely.
+                        full_gap = aabb_overlap(
+                            lb["x1"], lb["y1"], lb["x2"], lb["y2"],
+                            comp["cx"] - comp["hw"], comp["cy"] - comp["hh"],
+                            comp["cx"] + comp["hw"], comp["cy"] + comp["hh"],
+                        )
+                        if full_gap >= 0:
+                            continue
+
+                        # Step 2: Check label vs BODY rectangle (artwork outline).
                         bhw = comp["body_hw"]
                         bhh = comp["body_hh"]
-                        gap = aabb_overlap(
+                        body_gap = aabb_overlap(
                             lb["x1"], lb["y1"], lb["x2"], lb["y2"],
                             comp["cx"] - bhw, comp["cy"] - bhh,
                             comp["cx"] + bhw, comp["cy"] + bhh,
                         )
-                        if gap < 0:
-                            # With body rect, suppress is simpler: only suppress
-                            # labels whose connection point is near a pin AND the
-                            # overlap is marginal (label barely touches body edge).
+
+                        # Step 3: Decide suppress vs report.
+                        # - Overlaps body rect → real overlap, always report
+                        # - Overlaps only pin-stub area (outside body) → suppress
+                        #   if near a pin endpoint (standard pin-endpoint label)
+                        if body_gap >= 0:
+                            # Label overlaps full bbox but NOT body — pin-stub area only
                             if suppress_pin_labels and comp.get("pin_endpoints"):
-                                pin_suppress_dist = 5.5
                                 lx, ly = lb["x"], lb["y"]
                                 is_pin_label = any(
                                     abs(lx - px) <= pin_suppress_dist and abs(ly - py) <= pin_suppress_dist
@@ -3393,9 +3404,12 @@ class KiCADInterface:
                                 if is_pin_label:
                                     continue
 
-                            overlaps.append({
+                        # Report: either overlaps body, or pin-stub overlap that
+                        # wasn't suppressed
+                        gap = body_gap if body_gap < 0 else full_gap
+                        overlaps.append({
                                 "type": "label_component",
-                                "severity": "overlap",
+                                "severity": "overlap" if body_gap < 0 else "pin_stub_overlap",
                                 "gap_mm": round(gap, 1),
                                 "label": {
                                     "netName": lb["name"], "labelType": lb["type"],
