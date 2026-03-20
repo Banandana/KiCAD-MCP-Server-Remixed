@@ -419,6 +419,7 @@ class KiCADInterface:
             "batch_rotate_labels": self._handle_batch_rotate_labels,
             "find_orphan_items": self._handle_find_orphan_items,
             "check_schematic_overlaps": self._handle_check_schematic_overlaps,
+            "get_schematic_layout": self._handle_get_schematic_layout,
             "get_pin_connections": self._handle_get_pin_connections,
             "get_net_connectivity": self._handle_get_net_connectivity,
             "validate_wire_connections": self._handle_validate_wire_connections,
@@ -3077,6 +3078,230 @@ class KiCADInterface:
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
 
+    def _parse_schematic_geometry(self, schematic_path, compute_pin_endpoints=True):
+        """Parse schematic file and return all geometry as structured data.
+
+        Returns dict with keys: components, labels, wires, junctions, no_connects, content.
+        Each component includes pin_endpoints (if compute_pin_endpoints=True) and body rect.
+        Each label includes bounding box, connection point, and flag_width.
+        """
+        from pathlib import Path
+        from commands.pin_locator import PinLocator
+        import re
+        import math
+
+        schematic = SchematicManager.load_schematic(schematic_path)
+        if not schematic:
+            return None
+
+        locator = PinLocator()
+        sch_file = Path(schematic_path)
+
+        with open(schematic_path, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        # ── Helper: extract body rectangle from lib_symbol ──
+        def _get_body_rect(content_str, lib_id_str):
+            """Find the body rectangle (fill background) for a lib_symbol.
+            Returns (half_width, half_height) in symbol-local coords, or None."""
+            escaped = re.escape(lib_id_str)
+            sym_match = re.search(rf'\(symbol\s+"{escaped}"\s', content_str)
+            if not sym_match:
+                return None
+            depth = 0
+            i = sym_match.start()
+            block_end = i
+            while i < len(content_str):
+                if content_str[i] == '(':
+                    depth += 1
+                elif content_str[i] == ')':
+                    depth -= 1
+                    if depth == 0:
+                        block_end = i + 1
+                        break
+                i += 1
+            block = content_str[sym_match.start():block_end]
+
+            rect_pat = re.compile(
+                r'\(rectangle\s+\(start\s+([\d.e+-]+)\s+([\d.e+-]+)\)\s+\(end\s+([\d.e+-]+)\s+([\d.e+-]+)\)'
+                r'[^)]*\(fill\s+\(type\s+background\)\)'
+            )
+            best = None
+            best_area = 0
+            for rm in rect_pat.finditer(block):
+                x1, y1 = float(rm.group(1)), float(rm.group(2))
+                x2, y2 = float(rm.group(3)), float(rm.group(4))
+                area = abs(x2 - x1) * abs(y2 - y1)
+                if area > best_area:
+                    best_area = area
+                    best = (x1, y1, x2, y2)
+            if best:
+                x1, y1, x2, y2 = best
+                hw = max(abs(x1), abs(x2))
+                hh = max(abs(y1), abs(y2))
+                return (hw, hh)
+            return None
+
+        # ── Build component bounding boxes ──
+        components = []
+
+        for symbol in schematic.symbol:
+            if not hasattr(symbol.property, "Reference"):
+                continue
+            ref = symbol.property.Reference.value
+            if ref.startswith("_TEMPLATE"):
+                continue
+
+            lib_id = symbol.lib_id.value if hasattr(symbol, "lib_id") else ""
+            position = symbol.at.value if hasattr(symbol, "at") else [0, 0, 0]
+            cx, cy = float(position[0]), float(position[1])
+            sym_rot = float(position[2]) if len(position) > 2 else 0.0
+
+            pins_def = locator.get_symbol_pins(sch_file, lib_id) if lib_id else {}
+            pin_endpoints = []
+            if pins_def:
+                xs = [pd["x"] for pd in pins_def.values()]
+                ys = [pd["y"] for pd in pins_def.values()]
+                hw = max(abs(max(xs, default=0)), abs(min(xs, default=0)), 2.54)
+                hh = max(abs(max(ys, default=0)), abs(min(ys, default=0)), 2.54)
+                if sym_rot in (90, 270):
+                    hw, hh = hh, hw
+
+                if compute_pin_endpoints:
+                    mirror_x = False
+                    mirror_y = False
+                    if hasattr(symbol, "mirror"):
+                        mv = str(symbol.mirror.value) if hasattr(symbol.mirror, "value") else str(symbol.mirror)
+                        mirror_x = "x" in mv
+                        mirror_y = "y" in mv
+                    for pd in pins_def.values():
+                        prx = pd["x"]
+                        pry = -pd["y"]
+                        if mirror_x:
+                            pry = -pry
+                        if mirror_y:
+                            prx = -prx
+                        if sym_rot != 0:
+                            rad = math.radians(sym_rot)
+                            cr, sr = math.cos(rad), math.sin(rad)
+                            prx, pry = prx * cr - pry * sr, prx * sr + pry * cr
+                        pin_endpoints.append((round(cx + prx, 2), round(cy + pry, 2)))
+            else:
+                hw, hh = 2.54, 2.54
+
+            body_hw, body_hh = hw, hh
+            body_rect = _get_body_rect(content, lib_id) if lib_id else None
+            if body_rect:
+                body_hw, body_hh = body_rect
+                if sym_rot in (90, 270):
+                    body_hw, body_hh = body_hh, body_hw
+
+            components.append({
+                "ref": ref, "cx": cx, "cy": cy,
+                "hw": hw, "hh": hh,
+                "body_hw": body_hw, "body_hh": body_hh,
+                "lib_id": lib_id,
+                "pin_endpoints": pin_endpoints,
+            })
+
+        # ── Build label bounding boxes ──
+        label_boxes = []
+        for lt in ["label", "global_label", "hierarchical_label"]:
+            lp = re.compile(
+                rf'\({lt}\s+"([^"]*)"(?:\s+\(shape\s+[^)]*\))?\s+\(at\s+([\d.e+-]+)\s+([\d.e+-]+)\s*([\d.e+-]*)'
+            )
+            for m in lp.finditer(content):
+                name = m.group(1)
+                lx, ly = float(m.group(2)), float(m.group(3))
+                angle = float(m.group(4)) if m.group(4) else 0
+
+                char_w = 0.75
+                text_len = len(name) * char_w
+                body = 3.0 if lt != "label" else 0.5
+                total_w = body + text_len
+                total_h = 1.8
+
+                norm_angle = int(angle) % 360
+                if norm_angle in (0, 180):
+                    x1 = lx
+                    x2 = lx + total_w
+                    y1 = ly - total_h / 2
+                    y2 = ly + total_h / 2
+                else:
+                    x1 = lx - total_h / 2
+                    x2 = lx + total_h / 2
+                    y1 = ly
+                    y2 = ly + total_w
+
+                if norm_angle == 0:
+                    conn_x, conn_y = lx + total_w, ly
+                elif norm_angle == 180:
+                    conn_x, conn_y = lx, ly
+                elif norm_angle == 90:
+                    conn_x, conn_y = lx, ly + total_w
+                else:
+                    conn_x, conn_y = lx, ly
+
+                label_boxes.append({
+                    "name": name, "type": lt,
+                    "x": lx, "y": ly, "angle": angle,
+                    "conn_x": conn_x, "conn_y": conn_y,
+                    "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+                    "hw": (x2 - x1) / 2, "hh": (y2 - y1) / 2,
+                    "mx": (x1 + x2) / 2, "my": (y1 + y2) / 2,
+                    "flag_width": total_w,
+                })
+
+        # ── Collect wire segments ──
+        wires = []
+        wire_pat = re.compile(r'\(wire\b')
+        xy_pat = re.compile(r'\(xy\s+([\d.e+-]+)\s+([\d.e+-]+)\)')
+        for wm in wire_pat.finditer(content):
+            depth = 0
+            i = wm.start()
+            block_end = i
+            while i < len(content):
+                if content[i] == '(':
+                    depth += 1
+                elif content[i] == ')':
+                    depth -= 1
+                    if depth == 0:
+                        block_end = i + 1
+                        break
+                i += 1
+            block = content[wm.start():block_end]
+            xys = xy_pat.findall(block)
+            if len(xys) >= 2:
+                wires.append({
+                    "x1": float(xys[0][0]), "y1": float(xys[0][1]),
+                    "x2": float(xys[-1][0]), "y2": float(xys[-1][1]),
+                })
+
+        # ── Collect junctions ──
+        junctions = []
+        junc_pat = re.compile(r'\(junction\s+\(at\s+([\d.e+-]+)\s+([\d.e+-]+)\)')
+        for jm in junc_pat.finditer(content):
+            junctions.append({
+                "x": float(jm.group(1)), "y": float(jm.group(2)),
+            })
+
+        # ── Collect no_connects ──
+        no_connects = []
+        nc_pat = re.compile(r'\(no_connect\s+\(at\s+([\d.e+-]+)\s+([\d.e+-]+)\)')
+        for nm in nc_pat.finditer(content):
+            no_connects.append({
+                "x": float(nm.group(1)), "y": float(nm.group(2)),
+            })
+
+        return {
+            "components": components,
+            "labels": label_boxes,
+            "wires": wires,
+            "junctions": junctions,
+            "no_connects": no_connects,
+            "content": content,
+        }
+
     def _handle_check_schematic_overlaps(self, params):
         """Check for visual overlaps: component-component, label-component,
         wire-label, and label-label. Returns structured results grouped by type."""
@@ -3092,226 +3317,15 @@ class KiCADInterface:
             if not schematic_path:
                 return {"success": False, "message": "schematicPath is required"}
 
-            schematic = SchematicManager.load_schematic(schematic_path)
-            if not schematic:
-                return {"success": False, "message": "Failed to load schematic"}
-
-            from pathlib import Path
-            from commands.pin_locator import PinLocator
-            import re
             import math
 
-            locator = PinLocator()
-            sch_file = Path(schematic_path)
+            geo = self._parse_schematic_geometry(schematic_path, compute_pin_endpoints=suppress_pin_labels)
+            if geo is None:
+                return {"success": False, "message": "Failed to load schematic"}
 
-            # Read file content once (used by body rect extraction and label parsing)
-            with open(schematic_path, "r", encoding="utf-8") as f:
-                content = f.read()
-
-            # ── Helper: extract body rectangle from lib_symbol ──
-            # The body outline is the (rectangle ... (fill (type background)))
-            # element in the symbol definition. This is smaller than the
-            # pin-extent bbox because pins extend outward from the body.
-            def _get_body_rect(content_str, lib_id_str):
-                """Find the body rectangle (fill background) for a lib_symbol.
-                Returns (half_width, half_height) in symbol-local coords, or None."""
-                # Find the lib_symbol block
-                escaped = re.escape(lib_id_str)
-                sym_match = re.search(rf'\(symbol\s+"{escaped}"\s', content_str)
-                if not sym_match:
-                    return None
-                # Find matching close paren
-                depth = 0
-                i = sym_match.start()
-                block_end = i
-                while i < len(content_str):
-                    if content_str[i] == '(':
-                        depth += 1
-                    elif content_str[i] == ')':
-                        depth -= 1
-                        if depth == 0:
-                            block_end = i + 1
-                            break
-                    i += 1
-                block = content_str[sym_match.start():block_end]
-
-                # Find all (rectangle (start X Y) (end X Y) ... (fill (type background)))
-                rect_pat = re.compile(
-                    r'\(rectangle\s+\(start\s+([\d.e+-]+)\s+([\d.e+-]+)\)\s+\(end\s+([\d.e+-]+)\s+([\d.e+-]+)\)'
-                    r'[^)]*\(fill\s+\(type\s+background\)\)'
-                )
-                best = None
-                best_area = 0
-                for rm in rect_pat.finditer(block):
-                    x1, y1 = float(rm.group(1)), float(rm.group(2))
-                    x2, y2 = float(rm.group(3)), float(rm.group(4))
-                    area = abs(x2 - x1) * abs(y2 - y1)
-                    if area > best_area:
-                        best_area = area
-                        best = (x1, y1, x2, y2)
-                if best:
-                    x1, y1, x2, y2 = best
-                    hw = max(abs(x1), abs(x2))
-                    hh = max(abs(y1), abs(y2))
-                    return (hw, hh)
-                return None
-
-            # ── Build component bounding boxes ──
-            components = []  # [{ref, cx, cy, hw, hh, body_hw, body_hh, lib_id, pin_endpoints}]
-
-            for symbol in schematic.symbol:
-                if not hasattr(symbol.property, "Reference"):
-                    continue
-                ref = symbol.property.Reference.value
-                if ref.startswith("_TEMPLATE"):
-                    continue
-
-                lib_id = symbol.lib_id.value if hasattr(symbol, "lib_id") else ""
-                position = symbol.at.value if hasattr(symbol, "at") else [0, 0, 0]
-                cx, cy = float(position[0]), float(position[1])
-                sym_rot = float(position[2]) if len(position) > 2 else 0.0
-
-                pins_def = locator.get_symbol_pins(sch_file, lib_id) if lib_id else {}
-                pin_endpoints = []  # absolute pin positions for this component
-                if pins_def:
-                    xs = [pd["x"] for pd in pins_def.values()]
-                    ys = [pd["y"] for pd in pins_def.values()]
-                    hw = max(abs(max(xs, default=0)), abs(min(xs, default=0)), 2.54)
-                    hh = max(abs(max(ys, default=0)), abs(min(ys, default=0)), 2.54)
-                    if sym_rot in (90, 270):
-                        hw, hh = hh, hw
-
-                    # Compute absolute pin positions for pin-label suppression
-                    if suppress_pin_labels:
-                        mirror_x = False
-                        mirror_y = False
-                        if hasattr(symbol, "mirror"):
-                            mv = str(symbol.mirror.value) if hasattr(symbol.mirror, "value") else str(symbol.mirror)
-                            mirror_x = "x" in mv
-                            mirror_y = "y" in mv
-                        for pd in pins_def.values():
-                            prx = pd["x"]
-                            pry = -pd["y"]
-                            if mirror_x:
-                                pry = -pry
-                            if mirror_y:
-                                prx = -prx
-                            if sym_rot != 0:
-                                rad = math.radians(sym_rot)
-                                cr, sr = math.cos(rad), math.sin(rad)
-                                prx, pry = prx * cr - pry * sr, prx * sr + pry * cr
-                            pin_endpoints.append((round(cx + prx, 2), round(cy + pry, 2)))
-                else:
-                    hw, hh = 2.54, 2.54
-
-                # Extract body rectangle (artwork outline, smaller than pin bbox)
-                body_hw, body_hh = hw, hh
-                body_rect = _get_body_rect(content, lib_id) if lib_id else None
-                if body_rect:
-                    body_hw, body_hh = body_rect
-                    if sym_rot in (90, 270):
-                        body_hw, body_hh = body_hh, body_hw
-
-                components.append({
-                    "ref": ref, "cx": cx, "cy": cy,
-                    "hw": hw, "hh": hh,
-                    "body_hw": body_hw, "body_hh": body_hh,
-                    "lib_id": lib_id,
-                    "pin_endpoints": pin_endpoints,
-                })
-
-            # ── Build label bounding boxes ──
-            # (content already read above)
-
-            # label_box: {name, type, x, y, angle, x1, y1, x2, y2}
-            label_boxes = []
-            for lt in ["label", "global_label", "hierarchical_label"]:
-                lp = re.compile(
-                    rf'\({lt}\s+"([^"]*)"(?:\s+\(shape\s+[^)]*\))?\s+\(at\s+([\d.e+-]+)\s+([\d.e+-]+)\s*([\d.e+-]*)'
-                )
-                for m in lp.finditer(content):
-                    name = m.group(1)
-                    lx, ly = float(m.group(2)), float(m.group(3))
-                    angle = float(m.group(4)) if m.group(4) else 0
-
-                    # Compute oriented bounding box in schematic coords.
-                    # KiCad default font: ~1.27mm char width, ~1.6mm height.
-                    # Global/hierarchical labels have a shape body (~3mm flag).
-                    char_w = 0.75  # mm per char (conservative for default 1.27mm font)
-                    text_len = len(name) * char_w
-                    body = 3.0 if lt != "label" else 0.5
-                    total_w = body + text_len
-                    total_h = 1.8  # height of label text + padding
-
-                    # KiCad label rendering: the (at) position is always
-                    # the top-left of the rendered shape. The flag body
-                    # always extends in the POSITIVE direction:
-                    #   0°/180° (horizontal): body extends RIGHT (+x)
-                    #   90°/270° (vertical): body extends DOWN (+y)
-                    # The angle controls text direction and which end is
-                    # the connection point, but the physical extent is
-                    # always the same screen direction from (at).
-                    norm_angle = int(angle) % 360
-                    if norm_angle in (0, 180):
-                        # Horizontal: extends right from at, centered vertically
-                        x1 = lx
-                        x2 = lx + total_w
-                        y1 = ly - total_h / 2
-                        y2 = ly + total_h / 2
-                    else:
-                        # Vertical (90/270): extends down from at, centered horizontally
-                        x1 = lx - total_h / 2
-                        x2 = lx + total_h / 2
-                        y1 = ly
-                        y2 = ly + total_w
-
-                    # Connection point: the electrical end where wires attach.
-                    # At 0°: right end (at.x + width). At 180°: left end (at.x).
-                    # At 90°: bottom (at.y + width). At 270°: top (at.y).
-                    if norm_angle == 0:
-                        conn_x, conn_y = lx + total_w, ly
-                    elif norm_angle == 180:
-                        conn_x, conn_y = lx, ly
-                    elif norm_angle == 90:
-                        conn_x, conn_y = lx, ly + total_w
-                    else:  # 270
-                        conn_x, conn_y = lx, ly
-
-                    label_boxes.append({
-                        "name": name, "type": lt,
-                        "x": lx, "y": ly, "angle": angle,
-                        "conn_x": conn_x, "conn_y": conn_y,
-                        "x1": x1, "y1": y1, "x2": x2, "y2": y2,
-                        "hw": (x2 - x1) / 2, "hh": (y2 - y1) / 2,
-                        "mx": (x1 + x2) / 2, "my": (y1 + y2) / 2,
-                        "flag_width": total_w,
-                    })
-
-            # ── Collect wire segments ──
-            wires = []  # [{x1, y1, x2, y2}]
-            wire_pat = re.compile(r'\(wire\b')
-            xy_pat = re.compile(r'\(xy\s+([\d.e+-]+)\s+([\d.e+-]+)\)')
-            for wm in wire_pat.finditer(content):
-                # Find matching closing paren
-                depth = 0
-                i = wm.start()
-                block_end = i
-                while i < len(content):
-                    if content[i] == '(':
-                        depth += 1
-                    elif content[i] == ')':
-                        depth -= 1
-                        if depth == 0:
-                            block_end = i + 1
-                            break
-                    i += 1
-                block = content[wm.start():block_end]
-                xys = xy_pat.findall(block)
-                if len(xys) >= 2:
-                    wires.append({
-                        "x1": float(xys[0][0]), "y1": float(xys[0][1]),
-                        "x2": float(xys[-1][0]), "y2": float(xys[-1][1]),
-                    })
+            components = geo["components"]
+            label_boxes = geo["labels"]
+            wires = geo["wires"]
 
             # ── Helper: AABB overlap test ──
             def aabb_overlap(ax1, ay1, ax2, ay2, bx1, by1, bx2, by2):
@@ -3323,21 +3337,17 @@ class KiCADInterface:
             # ── Helper: does a wire segment intersect an AABB? ──
             def wire_intersects_aabb(wx1, wy1, wx2, wy2, bx1, by1, bx2, by2):
                 """Test if wire segment intersects axis-aligned bounding box."""
-                # Quick check: if wire bbox doesn't overlap label bbox, no intersection
                 wire_x1, wire_x2 = min(wx1, wx2), max(wx1, wx2)
                 wire_y1, wire_y2 = min(wy1, wy2), max(wy1, wy2)
                 if wire_x2 < bx1 or wire_x1 > bx2 or wire_y2 < by1 or wire_y1 > by2:
                     return False
 
-                # Horizontal wire
                 if abs(wy1 - wy2) < 0.01:
                     return by1 <= wy1 <= by2 and wire_x1 <= bx2 and wire_x2 >= bx1
-                # Vertical wire
                 if abs(wx1 - wx2) < 0.01:
                     return bx1 <= wx1 <= bx2 and wire_y1 <= by2 and wire_y2 >= by1
 
-                # General case (shouldn't happen for KiCad wires, but handle it)
-                return True  # bbox overlap already confirmed above
+                return True
 
             overlaps = []
 
@@ -3526,6 +3536,233 @@ class KiCADInterface:
 
         except Exception as e:
             logger.error(f"Error checking overlaps: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e)}
+
+    def _handle_get_schematic_layout(self, params):
+        """Return structured geometry for a region of the schematic: components
+        (with body rects and pin endpoints), labels (with bounding boxes and
+        connection points), wires, junctions, no-connects, and pre-computed
+        overlaps within the region."""
+        logger.info("Getting schematic layout")
+        try:
+            import math
+
+            schematic_path = params.get("schematicPath")
+            if not schematic_path:
+                return {"success": False, "message": "schematicPath is required"}
+
+            region = params.get("region")  # {x, y, width, height} or None for full
+            suppress_pin_labels = params.get("suppressPinLabels", True)
+
+            geo = self._parse_schematic_geometry(schematic_path, compute_pin_endpoints=True)
+            if geo is None:
+                return {"success": False, "message": "Failed to load schematic"}
+
+            # Region filter
+            if region:
+                rx = float(region.get("x", 0))
+                ry = float(region.get("y", 0))
+                rw = float(region.get("width", 100))
+                rh = float(region.get("height", 100))
+                rx2, ry2 = rx + rw, ry + rh
+            else:
+                rx, ry, rx2, ry2 = -1e9, -1e9, 1e9, 1e9
+
+            def in_region_pt(x, y):
+                return rx <= x <= rx2 and ry <= y <= ry2
+
+            def aabb_intersects_region(x1, y1, x2, y2):
+                return x1 <= rx2 and x2 >= rx and y1 <= ry2 and y2 >= ry
+
+            # Filter components
+            out_components = []
+            for c in geo["components"]:
+                cx, cy, hw, hh = c["cx"], c["cy"], c["hw"], c["hh"]
+                if not aabb_intersects_region(cx - hw, cy - hh, cx + hw, cy + hh):
+                    continue
+                bhw, bhh = c["body_hw"], c["body_hh"]
+                out_components.append({
+                    "ref": c["ref"],
+                    "at": [round(cx, 2), round(cy, 2)],
+                    "lib_id": c["lib_id"],
+                    "boundingBox": {
+                        "x1": round(cx - hw, 2), "y1": round(cy - hh, 2),
+                        "x2": round(cx + hw, 2), "y2": round(cy + hh, 2),
+                    },
+                    "bodyRect": {
+                        "x1": round(cx - bhw, 2), "y1": round(cy - bhh, 2),
+                        "x2": round(cx + bhw, 2), "y2": round(cy + bhh, 2),
+                    },
+                    "pinEndpoints": [
+                        {"x": round(px, 2), "y": round(py, 2)}
+                        for px, py in c["pin_endpoints"]
+                    ],
+                })
+
+            # Filter labels
+            out_labels = []
+            for lb in geo["labels"]:
+                if not aabb_intersects_region(lb["x1"], lb["y1"], lb["x2"], lb["y2"]):
+                    continue
+                out_labels.append({
+                    "netName": lb["name"],
+                    "labelType": lb["type"],
+                    "at": [round(lb["x"], 2), round(lb["y"], 2)],
+                    "angle": lb["angle"],
+                    "connectionPoint": {
+                        "x": round(lb["conn_x"], 2), "y": round(lb["conn_y"], 2),
+                    },
+                    "boundingBox": {
+                        "x1": round(lb["x1"], 2), "y1": round(lb["y1"], 2),
+                        "x2": round(lb["x2"], 2), "y2": round(lb["y2"], 2),
+                    },
+                    "flagWidth": round(lb["flag_width"], 2),
+                })
+
+            # Filter wires
+            out_wires = []
+            for w in geo["wires"]:
+                wx1, wy1, wx2, wy2 = w["x1"], w["y1"], w["x2"], w["y2"]
+                wmx1, wmx2 = min(wx1, wx2), max(wx1, wx2)
+                wmy1, wmy2 = min(wy1, wy2), max(wy1, wy2)
+                if not aabb_intersects_region(wmx1, wmy1, wmx2, wmy2):
+                    continue
+                wire_len = math.sqrt((wx2 - wx1) ** 2 + (wy2 - wy1) ** 2)
+                out_wires.append({
+                    "start": [round(wx1, 2), round(wy1, 2)],
+                    "end": [round(wx2, 2), round(wy2, 2)],
+                    "length_mm": round(wire_len, 2),
+                })
+
+            # Filter junctions
+            out_junctions = [
+                {"x": round(j["x"], 2), "y": round(j["y"], 2)}
+                for j in geo["junctions"]
+                if in_region_pt(j["x"], j["y"])
+            ]
+
+            # Filter no_connects
+            out_no_connects = [
+                {"x": round(nc["x"], 2), "y": round(nc["y"], 2)}
+                for nc in geo["no_connects"]
+                if in_region_pt(nc["x"], nc["y"])
+            ]
+
+            # ── Compute overlaps within region ──
+            # Reuse the same overlap logic from check_schematic_overlaps
+            # but only for items within the region.
+            def aabb_overlap(ax1, ay1, ax2, ay2, bx1, by1, bx2, by2):
+                gap_x = max(ax1, bx1) - min(ax2, bx2)
+                gap_y = max(ay1, by1) - min(ay2, by2)
+                return max(gap_x, gap_y)
+
+            def wire_intersects_aabb(wx1, wy1, wx2, wy2, bx1, by1, bx2, by2):
+                wmx1, wmx2 = min(wx1, wx2), max(wx1, wx2)
+                wmy1, wmy2 = min(wy1, wy2), max(wy1, wy2)
+                if wmx2 < bx1 or wmx1 > bx2 or wmy2 < by1 or wmy1 > by2:
+                    return False
+                if abs(wy1 - wy2) < 0.01:
+                    return by1 <= wy1 <= by2 and wmx1 <= bx2 and wmx2 >= bx1
+                if abs(wx1 - wx2) < 0.01:
+                    return bx1 <= wx1 <= bx2 and wmy1 <= by2 and wmy2 >= by1
+                return True
+
+            overlaps = []
+
+            # Filter geo data to region for overlap checks
+            r_comps = [c for c in geo["components"]
+                       if aabb_intersects_region(c["cx"] - c["hw"], c["cy"] - c["hh"],
+                                                 c["cx"] + c["hw"], c["cy"] + c["hh"])]
+            r_labels = [lb for lb in geo["labels"]
+                        if aabb_intersects_region(lb["x1"], lb["y1"], lb["x2"], lb["y2"])]
+            r_wires = geo["wires"]  # check all wires — they may cross into region
+
+            # Wire vs label overlaps
+            for lb in r_labels:
+                for w in r_wires:
+                    lc_x, lc_y = lb["conn_x"], lb["conn_y"]
+                    eps = 0.5
+                    if (abs(w["x1"] - lc_x) < eps and abs(w["y1"] - lc_y) < eps) or \
+                       (abs(w["x2"] - lc_x) < eps and abs(w["y2"] - lc_y) < eps):
+                        continue
+
+                    if wire_intersects_aabb(
+                        w["x1"], w["y1"], w["x2"], w["y2"],
+                        lb["x1"], lb["y1"], lb["x2"], lb["y2"],
+                    ):
+                        wire_len = math.sqrt(
+                            (w["x2"] - w["x1"]) ** 2 + (w["y2"] - w["y1"]) ** 2
+                        )
+                        flag_w = lb.get("flag_width", 5.0)
+
+                        if suppress_pin_labels and wire_len <= flag_w * 0.5:
+                            continue
+
+                        overlaps.append({
+                            "type": "wire_through_label",
+                            "wire_length_mm": round(wire_len, 1),
+                            "flag_width_mm": round(flag_w, 1),
+                            "label": lb["name"],
+                            "wire": {
+                                "start": [w["x1"], w["y1"]],
+                                "end": [w["x2"], w["y2"]],
+                            },
+                        })
+
+            # Label vs component overlaps
+            pin_suppress_dist = 5.5
+            for lb in r_labels:
+                for comp in r_comps:
+                    if comp["ref"].startswith("#PWR"):
+                        continue
+                    full_gap = aabb_overlap(
+                        lb["x1"], lb["y1"], lb["x2"], lb["y2"],
+                        comp["cx"] - comp["hw"], comp["cy"] - comp["hh"],
+                        comp["cx"] + comp["hw"], comp["cy"] + comp["hh"],
+                    )
+                    if full_gap >= 0:
+                        continue
+                    bhw, bhh = comp["body_hw"], comp["body_hh"]
+                    body_gap = aabb_overlap(
+                        lb["x1"], lb["y1"], lb["x2"], lb["y2"],
+                        comp["cx"] - bhw, comp["cy"] - bhh,
+                        comp["cx"] + bhw, comp["cy"] + bhh,
+                    )
+                    if body_gap >= 0 and suppress_pin_labels and comp.get("pin_endpoints"):
+                        lx, ly = lb["x"], lb["y"]
+                        if any(abs(lx - px) <= pin_suppress_dist and abs(ly - py) <= pin_suppress_dist
+                               for px, py in comp["pin_endpoints"]):
+                            continue
+                    overlaps.append({
+                        "type": "label_component_overlap",
+                        "label": lb["name"],
+                        "component": comp["ref"],
+                        "overlaps_body": body_gap < 0,
+                    })
+
+            return {
+                "success": True,
+                "region": {"x": rx, "y": ry, "x2": rx2, "y2": ry2} if region else "full",
+                "components": out_components,
+                "labels": out_labels,
+                "wires": out_wires,
+                "junctions": out_junctions,
+                "no_connects": out_no_connects,
+                "overlaps": overlaps,
+                "counts": {
+                    "components": len(out_components),
+                    "labels": len(out_labels),
+                    "wires": len(out_wires),
+                    "junctions": len(out_junctions),
+                    "no_connects": len(out_no_connects),
+                    "overlaps": len(overlaps),
+                },
+            }
+
+        except Exception as e:
+            logger.error(f"Error getting schematic layout: {e}")
             import traceback
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}

@@ -1333,6 +1333,26 @@ Note: operates on .kicad_sch files only. To modify a PCB footprint use edit_comp
     }
   );
 
+  // Get structured layout data for a schematic region
+  server.tool(
+    "get_schematic_layout",
+    "Return structured geometry for a region of the schematic. Returns components (with body rects, pin endpoints), labels (with bounding boxes, connection points, flag widths), wires (with lengths), junctions, no-connects, and pre-computed overlaps. Far more useful than get_schematic_view for programmatic analysis — gives exact coordinates instead of an image.",
+    {
+      schematicPath: z.string().describe("Path to the schematic file"),
+      region: z.object({
+        x: z.number().describe("Left edge X coordinate (mm)"),
+        y: z.number().describe("Top edge Y coordinate (mm)"),
+        width: z.number().describe("Region width (mm)"),
+        height: z.number().describe("Region height (mm)"),
+      }).optional().describe("Region to query. Omit for full schematic."),
+      suppressPinLabels: z.boolean().optional().describe("Suppress standard pin-stub overlaps in the overlaps array (default: true)"),
+    },
+    async (args) => {
+      const result = await callKicadScript("get_schematic_layout", args);
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    }
+  );
+
   // Get per-pin connection status for a component
   server.tool(
     "get_pin_connections",
