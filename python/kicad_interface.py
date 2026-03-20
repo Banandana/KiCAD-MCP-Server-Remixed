@@ -2593,12 +2593,15 @@ class KiCADInterface:
             return {"success": False, "message": str(e)}
 
     def _handle_check_schematic_overlaps(self, params):
-        """Check for overlapping components and text. Opinionated: filters noise,
-        groups by severity, returns only actionable results (max 50)."""
+        """Check for visual overlaps: component-component, label-component,
+        wire-label, and label-label. Returns structured results grouped by type."""
         logger.info("Checking schematic overlaps")
         try:
             schematic_path = params.get("schematicPath")
             clearance = float(params.get("clearance", 2.0))  # mm
+            check_types = params.get("checkTypes") or [
+                "component_component", "label_component", "wire_label", "label_label"
+            ]
 
             if not schematic_path:
                 return {"success": False, "message": "schematicPath is required"}
@@ -2609,10 +2612,14 @@ class KiCADInterface:
 
             from pathlib import Path
             from commands.pin_locator import PinLocator
+            import re
+            import math
+
             locator = PinLocator()
             sch_file = Path(schematic_path)
 
-            components = []  # [(ref, cx, cy, hw, hh, lib_id)]
+            # ── Build component bounding boxes ──
+            components = []  # [{ref, cx, cy, hw, hh, lib_id}]
 
             for symbol in schematic.symbol:
                 if not hasattr(symbol.property, "Reference"):
@@ -2637,104 +2644,257 @@ class KiCADInterface:
                 else:
                     hw, hh = 2.54, 2.54
 
-                components.append((ref, cx, cy, hw, hh, lib_id))
+                components.append({
+                    "ref": ref, "cx": cx, "cy": cy,
+                    "hw": hw, "hh": hh, "lib_id": lib_id,
+                })
 
-            # Collect global/hierarchical labels as bounding boxes
-            import re
+            # ── Build label bounding boxes ──
             with open(schematic_path, "r", encoding="utf-8") as f:
                 content = f.read()
 
-            label_boxes = []  # [(name, x, y, hw, hh)]
+            # label_box: {name, type, x, y, angle, x1, y1, x2, y2}
+            label_boxes = []
             for lt in ["label", "global_label", "hierarchical_label"]:
-                lp = re.compile(rf'\({lt}\s+"([^"]*)"(?:\s+\(shape\s+[^)]*\))?\s+\(at\s+([\d.e+-]+)\s+([\d.e+-]+)\s*([\d.e+-]*)')
+                lp = re.compile(
+                    rf'\({lt}\s+"([^"]*)"(?:\s+\(shape\s+[^)]*\))?\s+\(at\s+([\d.e+-]+)\s+([\d.e+-]+)\s*([\d.e+-]*)'
+                )
                 for m in lp.finditer(content):
                     name = m.group(1)
                     lx, ly = float(m.group(2)), float(m.group(3))
                     angle = float(m.group(4)) if m.group(4) else 0
-                    # Approximate label bbox: shape body + text
-                    # Global/hierarchical labels have a shape body (~3mm); local labels are just text (~1mm)
-                    body = 3.0 if lt != "label" else 1.0
-                    text_w = body + len(name) * 0.7
-                    text_h = 1.5
-                    # Rotate bbox for vertical labels
-                    if angle in (90, 270):
-                        text_w, text_h = text_h, text_w
-                    label_boxes.append((name, lx, ly, text_w / 2, text_h / 2))
 
-            # Check overlaps
-            critical = []   # component-body overlaps
-            warning = []    # label-component overlaps or close components
-            info_count = 0  # suppressed low-priority
+                    # Compute oriented bounding box in schematic coords.
+                    # KiCad default font: ~1.27mm char width, ~1.6mm height.
+                    # Global/hierarchical labels have a shape body (~3mm flag).
+                    char_w = 0.75  # mm per char (conservative for default 1.27mm font)
+                    text_len = len(name) * char_w
+                    body = 3.0 if lt != "label" else 0.5
+                    total_w = body + text_len
+                    total_h = 1.8  # height of label text + padding
 
-            # Component vs component
-            for i in range(len(components)):
-                for j in range(i + 1, len(components)):
-                    r1, x1, y1, hw1, hh1, lid1 = components[i]
-                    r2, x2, y2, hw2, hh2, lid2 = components[j]
+                    # Label text extends FROM the connection point.
+                    # angle=0 → text goes RIGHT, angle=180 → text goes LEFT, etc.
+                    rad = math.radians(angle)
+                    cos_a, sin_a = math.cos(rad), math.sin(rad)
 
-                    if r1.startswith("#PWR") or r2.startswith("#PWR"):
-                        continue
-                    if abs(x1 - x2) < 0.01 and abs(y1 - y2) < 0.01:
-                        continue
+                    # Direction the text extends (opposite of angle for KiCad labels)
+                    # In KiCad: angle=0 means connection on left, text to right
+                    # angle=180 means connection on right, text to left
+                    dx_text = cos_a * total_w
+                    dy_text = sin_a * total_w  # KiCad Y-down, sin is correct
 
-                    dx = abs(x1 - x2)
-                    dy = abs(y1 - y2)
-                    gap = max(dx - (hw1 + hw2), dy - (hh1 + hh2))
+                    # The four corners of the label bbox
+                    # Perpendicular offset for height
+                    perp_dx = -sin_a * (total_h / 2)
+                    perp_dy = cos_a * (total_h / 2)
 
-                    if gap < 0:
-                        critical.append({
-                            "pair": f"{r1} <-> {r2}",
-                            "gap": f"{gap:.1f}mm (overlapping)",
-                            "positions": f"({x1:.1f},{y1:.1f}) ({x2:.1f},{y2:.1f})",
-                            "severity": "critical",
-                        })
-                    elif gap < clearance:
-                        warning.append({
-                            "pair": f"{r1} <-> {r2}",
-                            "gap": f"{gap:.1f}mm",
-                            "positions": f"({x1:.1f},{y1:.1f}) ({x2:.1f},{y2:.1f})",
-                            "severity": "warning",
-                        })
+                    corners_x = [
+                        lx + perp_dx, lx - perp_dx,
+                        lx + dx_text + perp_dx, lx + dx_text - perp_dx,
+                    ]
+                    corners_y = [
+                        ly + perp_dy, ly - perp_dy,
+                        ly + dy_text + perp_dy, ly + dy_text - perp_dy,
+                    ]
 
-            # Label vs component (global labels have visible bodies)
-            for lname, lx, ly, lhw, lhh in label_boxes:
-                for ref, cx, cy, chw, chh, lid in components:
-                    if ref.startswith("#PWR"):
-                        continue
-                    dx = abs(lx - cx)
-                    dy = abs(ly - cy)
-                    gap = max(dx - (lhw + chw), dy - (lhh + chh))
+                    x1, x2 = min(corners_x), max(corners_x)
+                    y1, y2 = min(corners_y), max(corners_y)
 
-                    if gap < 0:
-                        warning.append({
-                            "pair": f"label:{lname} <-> {ref}",
-                            "gap": f"{gap:.1f}mm (overlapping)",
-                            "positions": f"({lx:.1f},{ly:.1f}) ({cx:.1f},{cy:.1f})",
-                            "severity": "warning",
-                        })
+                    label_boxes.append({
+                        "name": name, "type": lt,
+                        "x": lx, "y": ly, "angle": angle,
+                        "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+                        "hw": (x2 - x1) / 2, "hh": (y2 - y1) / 2,
+                        "mx": (x1 + x2) / 2, "my": (y1 + y2) / 2,
+                    })
 
-            # Sort by gap
-            critical.sort(key=lambda x: float(x["gap"].split("mm")[0]))
-            warning.sort(key=lambda x: float(x["gap"].split("mm")[0]))
+            # ── Collect wire segments ──
+            wires = []  # [{x1, y1, x2, y2}]
+            wire_pat = re.compile(r'\(wire\b')
+            xy_pat = re.compile(r'\(xy\s+([\d.e+-]+)\s+([\d.e+-]+)\)')
+            for wm in wire_pat.finditer(content):
+                # Find matching closing paren
+                depth = 0
+                i = wm.start()
+                block_end = i
+                while i < len(content):
+                    if content[i] == '(':
+                        depth += 1
+                    elif content[i] == ')':
+                        depth -= 1
+                        if depth == 0:
+                            block_end = i + 1
+                            break
+                    i += 1
+                block = content[wm.start():block_end]
+                xys = xy_pat.findall(block)
+                if len(xys) >= 2:
+                    wires.append({
+                        "x1": float(xys[0][0]), "y1": float(xys[0][1]),
+                        "x2": float(xys[-1][0]), "y2": float(xys[-1][1]),
+                    })
 
-            # Cap output
+            # ── Helper: AABB overlap test ──
+            def aabb_overlap(ax1, ay1, ax2, ay2, bx1, by1, bx2, by2):
+                """Returns overlap amount (negative = overlapping, positive = gap)."""
+                gap_x = max(ax1, bx1) - min(ax2, bx2)
+                gap_y = max(ay1, by1) - min(ay2, by2)
+                return max(gap_x, gap_y)
+
+            # ── Helper: does a wire segment intersect an AABB? ──
+            def wire_intersects_aabb(wx1, wy1, wx2, wy2, bx1, by1, bx2, by2):
+                """Test if wire segment intersects axis-aligned bounding box."""
+                # Quick check: if wire bbox doesn't overlap label bbox, no intersection
+                wire_x1, wire_x2 = min(wx1, wx2), max(wx1, wx2)
+                wire_y1, wire_y2 = min(wy1, wy2), max(wy1, wy2)
+                if wire_x2 < bx1 or wire_x1 > bx2 or wire_y2 < by1 or wire_y1 > by2:
+                    return False
+
+                # Horizontal wire
+                if abs(wy1 - wy2) < 0.01:
+                    return by1 <= wy1 <= by2 and wire_x1 <= bx2 and wire_x2 >= bx1
+                # Vertical wire
+                if abs(wx1 - wx2) < 0.01:
+                    return bx1 <= wx1 <= bx2 and wire_y1 <= by2 and wire_y2 >= by1
+
+                # General case (shouldn't happen for KiCad wires, but handle it)
+                return True  # bbox overlap already confirmed above
+
+            overlaps = []
+
+            # ── 1. Component vs component ──
+            if "component_component" in check_types:
+                for i in range(len(components)):
+                    for j in range(i + 1, len(components)):
+                        c1, c2 = components[i], components[j]
+                        if c1["ref"].startswith("#PWR") or c2["ref"].startswith("#PWR"):
+                            continue
+                        if abs(c1["cx"] - c2["cx"]) < 0.01 and abs(c1["cy"] - c2["cy"]) < 0.01:
+                            continue
+
+                        gap = aabb_overlap(
+                            c1["cx"] - c1["hw"], c1["cy"] - c1["hh"],
+                            c1["cx"] + c1["hw"], c1["cy"] + c1["hh"],
+                            c2["cx"] - c2["hw"], c2["cy"] - c2["hh"],
+                            c2["cx"] + c2["hw"], c2["cy"] + c2["hh"],
+                        )
+
+                        if gap < clearance:
+                            overlaps.append({
+                                "type": "component_component",
+                                "severity": "critical" if gap < 0 else "warning",
+                                "gap_mm": round(gap, 1),
+                                "component_a": {"ref": c1["ref"], "at": [c1["cx"], c1["cy"]]},
+                                "component_b": {"ref": c2["ref"], "at": [c2["cx"], c2["cy"]]},
+                            })
+
+            # ── 2. Label vs component ──
+            if "label_component" in check_types:
+                for lb in label_boxes:
+                    for comp in components:
+                        if comp["ref"].startswith("#PWR"):
+                            continue
+                        gap = aabb_overlap(
+                            lb["x1"], lb["y1"], lb["x2"], lb["y2"],
+                            comp["cx"] - comp["hw"], comp["cy"] - comp["hh"],
+                            comp["cx"] + comp["hw"], comp["cy"] + comp["hh"],
+                        )
+                        if gap < 0:
+                            overlaps.append({
+                                "type": "label_component",
+                                "severity": "overlap",
+                                "gap_mm": round(gap, 1),
+                                "label": {
+                                    "netName": lb["name"], "labelType": lb["type"],
+                                    "at": [lb["x"], lb["y"]], "angle": lb["angle"],
+                                    "boundingBox": {"x1": round(lb["x1"], 2), "y1": round(lb["y1"], 2),
+                                                    "x2": round(lb["x2"], 2), "y2": round(lb["y2"], 2)},
+                                },
+                                "component": {"ref": comp["ref"], "at": [comp["cx"], comp["cy"]]},
+                            })
+
+            # ── 3. Wire vs label ──
+            if "wire_label" in check_types:
+                for lb in label_boxes:
+                    for w in wires:
+                        # Skip wires that connect to the label's connection point
+                        conn_x, conn_y = lb["x"], lb["y"]
+                        eps = 0.1
+                        touches_start = abs(w["x1"] - conn_x) < eps and abs(w["y1"] - conn_y) < eps
+                        touches_end = abs(w["x2"] - conn_x) < eps and abs(w["y2"] - conn_y) < eps
+                        if touches_start or touches_end:
+                            continue
+
+                        if wire_intersects_aabb(
+                            w["x1"], w["y1"], w["x2"], w["y2"],
+                            lb["x1"], lb["y1"], lb["x2"], lb["y2"],
+                        ):
+                            overlaps.append({
+                                "type": "wire_label",
+                                "severity": "wire_through_label",
+                                "label": {
+                                    "netName": lb["name"], "labelType": lb["type"],
+                                    "at": [lb["x"], lb["y"]], "angle": lb["angle"],
+                                },
+                                "wire": {
+                                    "start": [w["x1"], w["y1"]],
+                                    "end": [w["x2"], w["y2"]],
+                                },
+                            })
+
+            # ── 4. Label vs label ──
+            if "label_label" in check_types:
+                for i in range(len(label_boxes)):
+                    for j in range(i + 1, len(label_boxes)):
+                        la, lb2 = label_boxes[i], label_boxes[j]
+                        gap = aabb_overlap(
+                            la["x1"], la["y1"], la["x2"], la["y2"],
+                            lb2["x1"], lb2["y1"], lb2["x2"], lb2["y2"],
+                        )
+                        if gap < 0:
+                            overlaps.append({
+                                "type": "label_label",
+                                "severity": "overlap",
+                                "gap_mm": round(gap, 1),
+                                "label_a": {
+                                    "netName": la["name"], "labelType": la["type"],
+                                    "at": [la["x"], la["y"]], "angle": la["angle"],
+                                },
+                                "label_b": {
+                                    "netName": lb2["name"], "labelType": lb2["type"],
+                                    "at": [lb2["x"], lb2["y"]], "angle": lb2["angle"],
+                                },
+                            })
+
+            # ── Sort and cap output ──
+            # Sort: critical first, then by gap
+            severity_order = {"critical": 0, "overlap": 1, "wire_through_label": 2, "warning": 3}
+            overlaps.sort(key=lambda x: (severity_order.get(x["severity"], 9), x.get("gap_mm", 0)))
+
             max_results = 50
-            total = len(critical) + len(warning)
+            total = len(overlaps)
             suppressed = max(0, total - max_results)
-            critical = critical[:max_results]
-            remaining = max_results - len(critical)
-            warning = warning[:remaining] if remaining > 0 else []
+            overlaps = overlaps[:max_results]
 
-            summary = f"{len(critical)} critical, {len(warning)} warning"
+            # Count by type
+            counts = {}
+            for o in overlaps:
+                t = o["type"]
+                counts[t] = counts.get(t, 0) + 1
+
+            summary_parts = [f"{v} {k.replace('_', '-')}" for k, v in counts.items()]
+            summary = ", ".join(summary_parts) if summary_parts else "no overlaps"
             if suppressed > 0:
-                summary += f", {suppressed} suppressed"
+                summary += f" (+{suppressed} suppressed)"
 
             return {
                 "success": True,
                 "summary": summary,
-                "critical": critical,
-                "warning": warning,
-                "counts": {"critical": len(critical), "warning": len(warning), "suppressed": suppressed},
+                "overlaps": overlaps,
+                "counts": counts,
+                "total": total,
+                "suppressed": suppressed,
             }
 
         except Exception as e:

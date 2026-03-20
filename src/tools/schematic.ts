@@ -1302,10 +1302,11 @@ Note: operates on .kicad_sch files only. To modify a PCB footprint use edit_comp
   // Check for overlapping components and text
   server.tool(
     "check_schematic_overlaps",
-    "Scan all placed symbols and return pairs whose bounding boxes overlap or are within a clearance threshold. Flags component-on-component, text-on-wire, and text-on-text overlaps.",
+    "Detect visual overlaps in the schematic: component-on-component, label-on-component, wire-through-label, and label-on-label. Returns structured results with bounding boxes and severity.",
     {
       schematicPath: z.string().describe("Path to the schematic file"),
-      clearance: z.number().optional().describe("Minimum clearance in mm (default: 2.0)"),
+      clearance: z.number().optional().describe("Minimum clearance in mm for component-component checks (default: 2.0)"),
+      checkTypes: z.array(z.enum(["component_component", "label_component", "wire_label", "label_label"])).optional().describe("Which overlap types to check (default: all four)"),
     },
     async (args) => {
       const result = await callKicadScript("check_schematic_overlaps", args);
