@@ -2365,9 +2365,9 @@ class KiCADInterface:
 
                 # Find this label in content
                 escaped = re.escape(net_name)
-                for label_type in ["label", "global_label"]:
+                for label_type in ["label", "global_label", "hierarchical_label"]:
                     pat = re.compile(
-                        rf'\({label_type}\s+"{escaped}"\s+\(at\s+([\d.e+-]+)\s+([\d.e+-]+)'
+                        rf'\({label_type}\s+"{escaped}"(?:\s+\(shape\s+[^)]*\))?\s+\(at\s+([\d.e+-]+)\s+([\d.e+-]+)'
                     )
                     for m in pat.finditer(content):
                         lx, ly = float(m.group(1)), float(m.group(2))
