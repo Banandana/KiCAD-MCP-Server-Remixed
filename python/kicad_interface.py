@@ -647,6 +647,8 @@ class KiCADInterface:
                     )
                     with open(file_path, "w", encoding="utf-8", newline="\n") as f:
                         f.write(content)
+                        f.flush()
+                        os.fsync(f.fileno())
                     logger.info(f"Set paper size to {paper_size}")
                 except Exception as paper_err:
                     logger.warning(f"Failed to set paper size: {paper_err}")
@@ -863,6 +865,8 @@ class KiCADInterface:
 
             with open(sch_file, "w", encoding="utf-8") as f:
                 f.write(content)
+                f.flush()
+                os.fsync(f.fileno())
 
             deleted_count = len(blocks_to_delete)
             logger.info(
@@ -1067,6 +1071,8 @@ class KiCADInterface:
 
             with open(sch_file, "w", encoding="utf-8") as f:
                 f.write(content)
+                f.flush()
+                os.fsync(f.fileno())
 
             changes = {
                 k: v
@@ -1253,6 +1259,8 @@ class KiCADInterface:
 
             with open(schematic_path, "w", encoding="utf-8", newline="\n") as f:
                 f.write(content)
+                f.flush()
+                os.fsync(f.fileno())
 
             return {"success": True, "message": f"Rotated label '{net_name}' to {angle} degrees"}
         except Exception as e:
@@ -2147,6 +2155,8 @@ class KiCADInterface:
 
             with open(schematic_path, "w", encoding="utf-8", newline="\n") as f:
                 f.write(content)
+                f.flush()
+                os.fsync(f.fileno())
 
             total = moved["components"] + moved["wires"] + moved["labels"]
             return {
@@ -2387,6 +2397,8 @@ class KiCADInterface:
 
             with open(schematic_path, "w", encoding="utf-8", newline="\n") as f:
                 f.write(content)
+                f.flush()
+                os.fsync(f.fileno())
 
             return {
                 "success": True,
@@ -4176,6 +4188,8 @@ class KiCADInterface:
                 content = content[:m.start()] + m.group(1) + " (hide yes)" + m.group(2) + content[m.end():]
                 with open(schematic_file, "w", encoding="utf-8", newline="\n") as f:
                     f.write(content)
+                    f.flush()
+                    os.fsync(f.fileno())
 
             return {
                 "success": True,

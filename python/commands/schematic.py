@@ -42,6 +42,8 @@ class SchematicManager:
                 )
                 with open(output_path, 'w', encoding='utf-8', newline='\n') as f:
                     f.write(content)
+                    f.flush()
+                    os.fsync(f.fileno())
 
                 logger.info(f"Created schematic from template: {output_path}")
             else:
@@ -61,6 +63,8 @@ class SchematicManager:
                     f.write("  (lib_symbols\n  )\n\n")
                     f.write('  (sheet_instances\n    (path "/" (page "1"))\n  )\n')
                     f.write(")\n")
+                    f.flush()
+                    os.fsync(f.fileno())
 
             # Load the schematic
             sch = Schematic(output_path)

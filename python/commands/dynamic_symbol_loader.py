@@ -435,6 +435,8 @@ class DynamicSymbolLoader:
 
         with open(schematic_path, "w", encoding="utf-8") as f:
             f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
 
         # Handle both Path objects and strings
         sch_name = (
@@ -547,6 +549,8 @@ class DynamicSymbolLoader:
 
         with open(schematic_path, "w", encoding="utf-8") as f:
             f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
 
         logger.info(
             f"Added component instance {reference} ({full_lib_id}) at ({x}, {y})"

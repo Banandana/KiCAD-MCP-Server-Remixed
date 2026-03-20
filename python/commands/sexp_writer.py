@@ -9,6 +9,7 @@ All functions insert properly-indented S-expression text at the correct location
 in the file, without parsing/re-serializing the entire document.
 """
 
+import os
 import uuid
 import logging
 from pathlib import Path
@@ -48,6 +49,8 @@ def _read_schematic(path: Path) -> str:
 def _write_schematic(path: Path, content: str) -> None:
     with open(path, "w", encoding="utf-8", newline="\n") as f:
         f.write(content)
+        f.flush()
+        os.fsync(f.fileno())
 
 
 def add_wire(

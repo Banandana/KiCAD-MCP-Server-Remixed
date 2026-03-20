@@ -90,6 +90,8 @@ class ProjectCommands:
                 )
                 with open(schematic_path, "w", encoding="utf-8", newline="\n") as f:
                     f.write(content)
+                    f.flush()
+                    os.fsync(f.fileno())
 
                 logger.info(f"Created schematic from template: {schematic_path}")
             else:
@@ -109,6 +111,8 @@ class ProjectCommands:
                     f.write("  (lib_symbols\n  )\n\n")
                     f.write('  (sheet_instances\n    (path "/" (page "1"))\n  )\n')
                     f.write(")\n")
+                    f.flush()
+                    os.fsync(f.fileno())
 
             # Create project file with schematic reference
             with open(project_path, "w") as f:
@@ -120,6 +124,8 @@ class ProjectCommands:
                 f.write(f'    ["root", "{os.path.basename(schematic_path)}"]\n')
                 f.write("  ]\n")
                 f.write("}\n")
+                f.flush()
+                os.fsync(f.fileno())
 
             self.board = board
 
