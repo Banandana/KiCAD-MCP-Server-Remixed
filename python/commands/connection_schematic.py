@@ -223,18 +223,38 @@ class ConnectionManager:
             logger.error(f"Error adding net label: {e}")
             return None
 
+    # Power net patterns — these should use power symbols instead of labels
+    POWER_NET_PATTERNS = {
+        "GND", "GNDREF", "GNDA", "GNDD", "EARTH",
+        "VCC", "VDD", "VSS", "VEE",
+        "+5V", "+3V3", "+3.3V", "+12V", "+24V", "+9V", "+1V8", "+2V5",
+        "-5V", "-12V", "-24V",
+        "+5VA", "+3.3VA",
+    }
+
+    @staticmethod
+    def _is_power_net(net_name: str) -> bool:
+        """Check if a net name is a standard power net."""
+        return net_name.upper() in {p.upper() for p in ConnectionManager.POWER_NET_PATTERNS}
+
     @staticmethod
     def connect_to_net(
-        schematic_path: Path, component_ref: str, pin_name: str, net_name: str
+        schematic_path: Path, component_ref: str, pin_name: str, net_name: str,
+        label_type: str = None, shape: str = None,
     ):
         """
-        Connect a component pin to a named net using a wire stub and label
+        Connect a component pin to a named net using a wire stub and label.
+
+        For power nets (GND, +3V3, +5V, VCC, etc.), automatically places a power
+        symbol from the power library instead of a plain net label.
 
         Args:
             schematic_path: Path to .kicad_sch file
             component_ref: Reference designator (e.g., "U1", "U1_")
             pin_name: Pin name/number
             net_name: Name of the net to connect to (e.g., "VCC", "GND", "SIGNAL_1")
+            label_type: Override label type: None (auto), "label", "global_label"
+            shape: For global_label: "input", "output", "bidirectional", "passive"
 
         Returns:
             True if successful, False otherwise
@@ -244,50 +264,100 @@ class ConnectionManager:
                 logger.error("WireManager/PinLocator not available")
                 return False
 
-            locator = ConnectionManager.get_pin_locator()
-            if not locator:
-                logger.error("Pin locator unavailable")
-                return False
+            # Create a fresh PinLocator each time to avoid stale cache
+            locator = PinLocator()
 
-            # Get pin location using PinLocator
+            # Get pin location using PinLocator (now returns endpoint)
             pin_loc = locator.get_pin_location(schematic_path, component_ref, pin_name)
             if not pin_loc:
                 logger.error(f"Could not locate pin {component_ref}/{pin_name}")
                 return False
 
-            # Add a small wire stub from the pin (2.54mm = 0.1 inch, standard grid spacing)
-            # Stub direction follows the pin's outward angle from the PinLocator
-            pin_angle_deg = getattr(locator, '_last_pin_angle', 0)
+            # Add a small wire stub from the pin endpoint
+            # (2.54mm = 0.1 inch, standard grid spacing)
+            pin_angle_deg = 0
             try:
                 pin_angle_deg = locator.get_pin_angle(schematic_path, component_ref, pin_name) or 0
             except Exception:
                 pin_angle_deg = 0
             import math as _math
-            angle_rad = _math.radians(pin_angle_deg)
-            stub_end = [round(pin_loc[0] + 2.54 * _math.cos(angle_rad), 4),
-                        round(pin_loc[1] - 2.54 * _math.sin(angle_rad), 4)]
 
-            # Create wire stub using WireManager
+            def _snap_to_grid(v, grid=1.27):
+                """Snap a coordinate to the nearest KiCad grid point."""
+                return round(round(v / grid) * grid, 4)
+
+            angle_rad = _math.radians(pin_angle_deg)
+            raw_x = pin_loc[0] + 2.54 * _math.cos(angle_rad)
+            raw_y = pin_loc[1] - 2.54 * _math.sin(angle_rad)
+
+            # Only snap along the stub direction to avoid diagonal wires.
+            # Vertical pins (90°/270°): snap y, keep x = pin x
+            # Horizontal pins (0°/180°): snap x, keep y = pin y
+            norm_angle = pin_angle_deg % 360
+            if norm_angle in (90, 270):
+                stub_end = [pin_loc[0], _snap_to_grid(raw_y)]
+            elif norm_angle in (0, 180):
+                stub_end = [_snap_to_grid(raw_x), pin_loc[1]]
+            else:
+                # Non-cardinal angle: snap both (rare)
+                stub_end = [_snap_to_grid(raw_x), _snap_to_grid(raw_y)]
+
+            # Create wire stub
             wire_success = WireManager.add_wire(schematic_path, pin_loc, stub_end)
             if not wire_success:
-                logger.error(f"Failed to create wire stub for net connection")
+                logger.error("Failed to create wire stub for net connection")
                 return False
 
-            # Add label at the end of the stub using WireManager
+            # Determine what to place at the stub end
+            is_power = ConnectionManager._is_power_net(net_name)
+
+            if is_power and label_type is None:
+                # Place a power symbol instead of a label
+                try:
+                    import re as _re
+                    from commands.dynamic_symbol_loader import DynamicSymbolLoader
+
+                    # Auto-number #PWR reference
+                    with open(schematic_path, "r", encoding="utf-8") as _f:
+                        _content = _f.read()
+                    existing_pwr = _re.findall(r'#PWR(\d+)', _content)
+                    next_pwr = max((int(n) for n in existing_pwr), default=0) + 1
+                    pwr_ref = f"#PWR{next_pwr:03d}"
+
+                    loader = DynamicSymbolLoader(project_path=schematic_path.parent)
+                    loader.add_component(
+                        schematic_path,
+                        "power",
+                        net_name,
+                        reference=pwr_ref,
+                        value=net_name,
+                        footprint="",
+                        x=stub_end[0],
+                        y=stub_end[1],
+                        project_path=schematic_path.parent,
+                    )
+                    logger.info(f"Placed power symbol {net_name} for {component_ref}/{pin_name}")
+                    return True
+                except Exception as power_err:
+                    logger.warning(f"Power symbol placement failed ({power_err}), falling back to label")
+
+            # Place label (regular or global)
+            effective_label_type = label_type or "label"
             label_success = WireManager.add_label(
-                schematic_path, net_name, stub_end, label_type="label"
+                schematic_path, net_name, stub_end,
+                label_type=effective_label_type,
+                shape=shape,
             )
             if not label_success:
                 logger.error(f"Failed to add net label '{net_name}'")
                 return False
 
-            logger.info(f"Connected {component_ref}/{pin_name} to net '{net_name}'")
+            logger.info(f"Connected {component_ref}/{pin_name} to net '{net_name}' ({effective_label_type})")
             return True
 
         except Exception as e:
             logger.error(f"Error connecting to net: {e}")
             import traceback
-
             logger.error(traceback.format_exc())
             return False
 

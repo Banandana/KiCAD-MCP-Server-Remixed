@@ -16,8 +16,9 @@ export function registerSchematicTools(
     {
       name: z.string().describe("Schematic name"),
       path: z.string().optional().describe("Optional path"),
+      paperSize: z.string().optional().describe("Paper size: A4, A3, A2, A1, A0, letter, legal, or custom dimensions"),
     },
-    async (args: { name: string; path?: string }) => {
+    async (args: { name: string; path?: string; paperSize?: string }) => {
       const result = await callKicadScript("create_schematic", args);
       return {
         content: [
@@ -51,6 +52,10 @@ export function registerSchematicTools(
         })
         .optional()
         .describe("Position on schematic"),
+      rotation: z
+        .number()
+        .optional()
+        .describe("Rotation in degrees (0, 90, 180, 270)"),
     },
     async (args: {
       schematicPath: string;
@@ -59,6 +64,7 @@ export function registerSchematicTools(
       value?: string;
       footprint?: string;
       position?: { x: number; y: number };
+      rotation?: number;
     }) => {
       // Transform to what Python backend expects
       const [library, symbolName] = args.symbol.includes(":")
@@ -76,6 +82,7 @@ export function registerSchematicTools(
           // Python expects flat x, y not nested position
           x: args.position?.x ?? 0,
           y: args.position?.y ?? 0,
+          rotation: args.rotation ?? 0,
         },
       };
 
@@ -165,6 +172,7 @@ Note: operates on .kicad_sch files only. To modify a PCB footprint use edit_comp
         y: z.number(),
         angle: z.number().optional().default(0),
       })).optional().describe("Reposition field labels: map of field name to {x, y, angle} (e.g. {\"Reference\": {\"x\": 12.5, \"y\": 17.0}})"),
+      hiddenFields: z.record(z.boolean()).optional().describe("Set field visibility: map of field name to hidden boolean (e.g. {\"Reference\": true} hides Reference)"),
     },
     async (args: {
       schematicPath: string;
@@ -173,6 +181,7 @@ Note: operates on .kicad_sch files only. To modify a PCB footprint use edit_comp
       value?: string;
       newReference?: string;
       fieldPositions?: Record<string, { x: number; y: number; angle?: number }>;
+      hiddenFields?: Record<string, boolean>;
     }) => {
       const result = await callKicadScript("edit_schematic_component", args);
       if (result.success) {
@@ -238,6 +247,7 @@ Note: operates on .kicad_sch files only. To modify a PCB footprint use edit_comp
     "add_wire",
     "Add a wire connection in the schematic",
     {
+      schematicPath: z.string().describe("Path to the schematic file"),
       start: z
         .object({
           x: z.number(),
@@ -252,7 +262,7 @@ Note: operates on .kicad_sch files only. To modify a PCB footprint use edit_comp
         .describe("End position"),
     },
     async (args: any) => {
-      const result = await callKicadScript("add_wire", args);
+      const result = await callKicadScript("add_schematic_wire", args);
       return {
         content: [
           {
@@ -322,11 +332,15 @@ Note: operates on .kicad_sch files only. To modify a PCB footprint use edit_comp
         .array(z.number())
         .length(2)
         .describe("Position [x, y] for the label"),
+      labelType: z.enum(["label", "global_label", "hierarchical_label"]).optional().describe("Label type (default: label). Use global_label for bordered labels visible across sheets."),
+      shape: z.string().optional().describe("For global_label: input, output, bidirectional, passive, tri_state"),
     },
     async (args: {
       schematicPath: string;
       netName: string;
       position: number[];
+      labelType?: string;
+      shape?: string;
     }) => {
       const result = await callKicadScript("add_schematic_net_label", args);
       if (result.success) {
@@ -360,12 +374,16 @@ Note: operates on .kicad_sch files only. To modify a PCB footprint use edit_comp
       componentRef: z.string().describe("Component reference (e.g., U1, R1)"),
       pinName: z.string().describe("Pin name/number to connect"),
       netName: z.string().describe("Name of the net to connect to"),
+      labelType: z.enum(["label", "global_label"]).optional().describe("Label type (default: auto-detects power nets)"),
+      shape: z.string().optional().describe("For global_label: input, output, bidirectional, passive"),
     },
     async (args: {
       schematicPath: string;
       componentRef: string;
       pinName: string;
       netName: string;
+      labelType?: "label" | "global_label";
+      shape?: string;
     }) => {
       const result = await callKicadScript("connect_to_net", args);
       if (result.success) {
@@ -951,12 +969,19 @@ Note: operates on .kicad_sch files only. To modify a PCB footprint use edit_comp
         .describe("Output format (default: png)"),
       width: z.number().optional().describe("Image width in pixels (default: 1200)"),
       height: z.number().optional().describe("Image height in pixels (default: 900)"),
+      region: z.object({
+        x: z.number().describe("Left edge in schematic mm"),
+        y: z.number().describe("Top edge in schematic mm"),
+        width: z.number().describe("Region width in mm"),
+        height: z.number().describe("Region height in mm"),
+      }).optional().describe("Crop to a specific region of the schematic for high-zoom inspection"),
     },
     async (args: {
       schematicPath: string;
       format?: "png" | "svg";
       width?: number;
       height?: number;
+      region?: { x: number; y: number; width: number; height: number };
     }) => {
       const result = await callKicadScript("get_schematic_view", args);
       if (result.success) {
@@ -1091,5 +1116,294 @@ Note: operates on .kicad_sch files only. To modify a PCB footprint use edit_comp
         content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
       };
     },
+  );
+
+  // Place a power port symbol (GND, +3V3, +5V, VCC, etc.)
+  server.tool(
+    "add_power_symbol",
+    "Place a power port symbol (GND, +3V3, +5V, VCC, etc.) from the KiCad power library",
+    {
+      schematicPath: z.string().describe("Path to the schematic file"),
+      symbol: z.string().describe("Power symbol name (e.g., 'GND', '+3V3', '+5V', 'VCC', 'VDD')"),
+      position: z.object({ x: z.number(), y: z.number() }).optional().describe("Position on schematic"),
+      orientation: z.number().optional().describe("Rotation angle (0, 90, 180, 270)"),
+    },
+    async (args) => {
+      const result = await callKicadScript("add_power_symbol", {
+        schematicPath: args.schematicPath,
+        symbol: args.symbol,
+        position: args.position,
+        orientation: args.orientation ?? 0,
+      });
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    }
+  );
+
+  // Batch connect multiple pins to named nets
+  server.tool(
+    "batch_connect_to_net",
+    "Connect multiple component pins to named nets in a single call. Much more efficient than calling connect_to_net repeatedly.",
+    {
+      schematicPath: z.string().describe("Path to the schematic file"),
+      connections: z.array(z.object({
+        componentRef: z.string().describe("Component reference (e.g., 'R1', 'U1')"),
+        pinName: z.string().describe("Pin name/number"),
+        netName: z.string().describe("Net name to connect to"),
+        labelType: z.enum(["label", "global_label"]).optional().describe("Label type (default: label)"),
+        shape: z.string().optional().describe("For global_label: input, output, bidirectional, passive"),
+      })).describe("Array of connections to make"),
+    },
+    async (args) => {
+      const result = await callKicadScript("batch_connect_to_net", args);
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    }
+  );
+
+  // Bulk move multiple schematic components
+  server.tool(
+    "bulk_move_schematic_components",
+    "Move multiple schematic components to new positions in a single call. Moves fields (Reference, Value) along with each component.",
+    {
+      schematicPath: z.string().describe("Path to the schematic file"),
+      moves: z.record(z.string(), z.object({
+        x: z.number(),
+        y: z.number(),
+      })).describe("Map of reference designator to new position, e.g., {'R1': {x: 100, y: 50}}"),
+    },
+    async (args) => {
+      const result = await callKicadScript("bulk_move_schematic_components", args);
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    }
+  );
+
+  // Batch get pin locations for multiple components
+  server.tool(
+    "batch_get_schematic_pin_locations",
+    "Get pin endpoint coordinates for multiple components in one call. Much faster than calling get_schematic_pin_locations repeatedly — reads the schematic once.",
+    {
+      schematicPath: z.string().describe("Path to the schematic file"),
+      references: z.array(z.string()).describe("Array of component references (e.g., ['R1', 'U1', 'C1'])"),
+    },
+    async (args) => {
+      const result = await callKicadScript("batch_get_schematic_pin_locations", args);
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    }
+  );
+
+  // Move everything within a rectangular bounding box by an offset
+  server.tool(
+    "move_region",
+    "Move everything (components, wires, labels) within a rectangular bounding box by an x,y offset. Like KiCad's block-select + move.",
+    {
+      schematicPath: z.string().describe("Path to the schematic file"),
+      bbox: z.object({
+        x1: z.number().describe("Left x coordinate"),
+        y1: z.number().describe("Top y coordinate"),
+        x2: z.number().describe("Right x coordinate"),
+        y2: z.number().describe("Bottom y coordinate"),
+      }).describe("Bounding box defining the region to move"),
+      offset: z.object({
+        dx: z.number().describe("X offset to move by"),
+        dy: z.number().describe("Y offset to move by"),
+      }).describe("How far to move the region"),
+    },
+    async (args) => {
+      const result = await callKicadScript("move_region", args);
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    }
+  );
+
+  // Add multiple wires in a single call
+  server.tool(
+    "batch_add_wire",
+    "Add multiple wires in a single call. Each wire is defined by start and end points.",
+    {
+      schematicPath: z.string().describe("Path to the schematic file"),
+      wires: z.array(z.object({
+        start: z.object({ x: z.number(), y: z.number() }),
+        end: z.object({ x: z.number(), y: z.number() }),
+      })).describe("Array of wires to add"),
+    },
+    async (args) => {
+      const result = await callKicadScript("batch_add_wire", args);
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    }
+  );
+
+  // Get all items connected to a component's pins
+  server.tool(
+    "get_connected_items",
+    "Given a component reference, return all wires and labels connected to its pins. Essential for understanding what moves together.",
+    {
+      schematicPath: z.string().describe("Path to the schematic file"),
+      reference: z.string().describe("Component reference (e.g., 'U1', 'R1')"),
+    },
+    async (args) => {
+      const result = await callKicadScript("get_connected_items", args);
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    }
+  );
+
+  // Delete multiple wires and/or labels in a single call
+  server.tool(
+    "batch_delete",
+    "Delete multiple wires and/or labels in a single call.",
+    {
+      schematicPath: z.string().describe("Path to the schematic file"),
+      wires: z.array(z.object({
+        start: z.object({ x: z.number(), y: z.number() }),
+        end: z.object({ x: z.number(), y: z.number() }),
+      })).optional().describe("Array of wires to delete (matched by start/end coordinates)"),
+      labels: z.array(z.object({
+        netName: z.string(),
+        position: z.object({ x: z.number(), y: z.number() }).optional(),
+      })).optional().describe("Array of labels to delete (matched by name and optionally position)"),
+    },
+    async (args) => {
+      const result = await callKicadScript("batch_delete", args);
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    }
+  );
+
+  // Move a set of labels by an offset
+  server.tool(
+    "move_labels_by_offset",
+    "Move a set of labels by an x,y offset. Useful after moving components to keep labels aligned.",
+    {
+      schematicPath: z.string().describe("Path to the schematic file"),
+      labels: z.array(z.object({
+        netName: z.string().describe("Label text/net name"),
+        position: z.object({ x: z.number(), y: z.number() }).describe("Current position of the label"),
+      })).describe("Labels to move (identified by name + current position)"),
+      offset: z.object({
+        dx: z.number(),
+        dy: z.number(),
+      }).describe("How far to move each label"),
+    },
+    async (args) => {
+      const result = await callKicadScript("move_labels_by_offset", args);
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    }
+  );
+
+  // Find orphan/dangling items in schematic
+  server.tool(
+    "find_orphan_items",
+    "Find dangling wires (endpoint not on pin/label/junction), orphan labels (not on wire/pin), and unconnected component pins. The #1 diagnostic tool.",
+    {
+      schematicPath: z.string().describe("Path to the schematic file"),
+    },
+    async (args) => {
+      const result = await callKicadScript("find_orphan_items", args);
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    }
+  );
+
+  // Check for overlapping components and text
+  server.tool(
+    "check_schematic_overlaps",
+    "Scan all placed symbols and return pairs whose bounding boxes overlap or are within a clearance threshold. Flags component-on-component, text-on-wire, and text-on-text overlaps.",
+    {
+      schematicPath: z.string().describe("Path to the schematic file"),
+      clearance: z.number().optional().describe("Minimum clearance in mm (default: 2.0)"),
+    },
+    async (args) => {
+      const result = await callKicadScript("check_schematic_overlaps", args);
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    }
+  );
+
+  // Get per-pin connection status for a component
+  server.tool(
+    "get_pin_connections",
+    "For a given component, show each pin and what it's connected to (net name, wire, or unconnected). Essential for verifying wiring.",
+    {
+      schematicPath: z.string().describe("Path to the schematic file"),
+      reference: z.string().describe("Component reference (e.g., 'U1', 'R1')"),
+    },
+    async (args) => {
+      const result = await callKicadScript("get_pin_connections", args);
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    }
+  );
+
+  // Batch edit multiple components with the same changes
+  server.tool(
+    "batch_edit_schematic_components",
+    "Apply the same property edits to multiple components. Useful for bulk operations like hiding Reference on all power symbols.",
+    {
+      schematicPath: z.string().describe("Path to the schematic file"),
+      references: z.array(z.string()).describe("Array of component references to edit"),
+      edits: z.object({
+        footprint: z.string().optional(),
+        value: z.string().optional(),
+        hiddenFields: z.record(z.boolean()).optional().describe("Field visibility: {\"Reference\": true} hides Reference"),
+      }).describe("Edits to apply to all listed components"),
+    },
+    async (args) => {
+      const result = await callKicadScript("batch_edit_schematic_components", args);
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    }
+  );
+
+  // Batch delete multiple components
+  server.tool(
+    "batch_delete_schematic_components",
+    "Delete multiple schematic components in a single call.",
+    {
+      schematicPath: z.string().describe("Path to the schematic file"),
+      references: z.array(z.string()).describe("Array of component references to delete"),
+    },
+    async (args) => {
+      const result = await callKicadScript("batch_delete_schematic_components", args);
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    }
+  );
+
+  // Add no-connect flag (X) on unused pins
+  server.tool(
+    "add_no_connect",
+    "Add a no-connect (X) flag at a position, typically on an unused pin endpoint to suppress ERC warnings.",
+    {
+      schematicPath: z.string().describe("Path to the schematic file"),
+      position: z.object({ x: z.number(), y: z.number() }).describe("Position for the no-connect flag (should be at a pin endpoint)"),
+    },
+    async (args) => {
+      const result = await callKicadScript("add_no_connect", args);
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    }
+  );
+
+  // Add text annotation to schematic
+  server.tool(
+    "add_schematic_text",
+    "Add a text annotation to the schematic for section labels, notes, or documentation.",
+    {
+      schematicPath: z.string().describe("Path to the schematic file"),
+      text: z.string().describe("Text content"),
+      position: z.object({ x: z.number(), y: z.number() }).describe("Position for the text"),
+      size: z.number().optional().describe("Font size in mm (default: 2.54)"),
+      angle: z.number().optional().describe("Rotation angle (default: 0)"),
+    },
+    async (args) => {
+      const result = await callKicadScript("add_schematic_text", args);
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    }
+  );
+
+  // Rotate a net label
+  server.tool(
+    "rotate_schematic_label",
+    "Rotate a net label or global label to a new angle.",
+    {
+      schematicPath: z.string().describe("Path to the schematic file"),
+      netName: z.string().describe("Label text/net name"),
+      angle: z.number().describe("New rotation angle (0, 90, 180, 270)"),
+      position: z.object({ x: z.number(), y: z.number() }).optional().describe("Label position to disambiguate if multiple labels share the same name"),
+    },
+    async (args) => {
+      const result = await callKicadScript("rotate_schematic_label", args);
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    }
   );
 }

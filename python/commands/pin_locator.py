@@ -23,7 +23,6 @@ class PinLocator:
     def __init__(self):
         """Initialize pin locator with empty cache"""
         self.pin_definition_cache = {}  # Cache: "lib_id:symbol_name" -> pin_data
-        self._schematic_cache: Dict[str, object] = {}  # Cache: path -> loaded Schematic
 
     @staticmethod
     def parse_symbol_definition(symbol_def: list) -> Dict[str, Dict]:
@@ -182,10 +181,7 @@ class PinLocator:
     def _get_lib_id(self, schematic_path: Path, symbol_reference: str) -> Optional[str]:
         """Helper: return the lib_id string for a placed symbol"""
         try:
-            sch_key = str(schematic_path)
-            if sch_key not in self._schematic_cache:
-                self._schematic_cache[sch_key] = Schematic(sch_key)
-            sch = self._schematic_cache[sch_key]
+            sch = Schematic(str(schematic_path))
             for symbol in sch.symbol:
                 if symbol.property.Reference.value == symbol_reference:
                     return symbol.lib_id.value if hasattr(symbol, "lib_id") else None
@@ -203,10 +199,7 @@ class PinLocator:
         Returns angle in degrees, or None if pin not found.
         """
         try:
-            sch_key = str(schematic_path)
-            if sch_key not in self._schematic_cache:
-                self._schematic_cache[sch_key] = Schematic(sch_key)
-            sch = self._schematic_cache[sch_key]
+            sch = Schematic(str(schematic_path))
 
             target_symbol = None
             for symbol in sch.symbol:
@@ -235,10 +228,13 @@ class PinLocator:
                 else:
                     return None
 
-            # Pin definition angle + symbol rotation = absolute outward direction
+            # Pin definition angle points FROM endpoint TOWARD body (in symbol-local Y-up coords).
+            # For wire stubs we want the OUTWARD direction (away from body).
+            # The connect_to_net formula uses: y - 2.54*sin(angle) which is Y-up math,
+            # so we return the Y-up outward angle: pin_angle + 180 (reverse direction).
             pin_def_angle = pins[pin_number].get("angle", 0)
-            absolute_angle = (pin_def_angle + symbol_rotation) % 360
-            return absolute_angle
+            outward_angle = (pin_def_angle + 180 + symbol_rotation) % 360
+            return outward_angle
 
         except Exception:
             return None
@@ -258,12 +254,8 @@ class PinLocator:
             [x, y] absolute coordinates of the pin, or None if not found
         """
         try:
-            # Load schematic with kicad-skip to get symbol instance
-            # Use cache to avoid reloading the file for every pin lookup
-            sch_key = str(schematic_path)
-            if sch_key not in self._schematic_cache:
-                self._schematic_cache[sch_key] = Schematic(sch_key)
-            sch = self._schematic_cache[sch_key]
+            # Load schematic fresh from disk to avoid stale state
+            sch = Schematic(str(schematic_path))
 
             # Find the symbol instance
             target_symbol = None
@@ -321,11 +313,13 @@ class PinLocator:
             pin_data = pins[pin_number]
 
             # Get pin position relative to symbol origin
+            # Symbol-local coordinates use Y-up; schematic uses Y-down.
+            # Negate Y to convert from symbol-local to schematic coords.
             pin_rel_x = pin_data["x"]
-            pin_rel_y = pin_data["y"]
+            pin_rel_y = -pin_data["y"]
 
             logger.debug(
-                f"Pin {pin_number} relative position: ({pin_rel_x}, {pin_rel_y})"
+                f"Pin {pin_number} relative position (Y-negated): ({pin_rel_x}, {pin_rel_y})"
             )
 
             # Apply symbol rotation to pin position
@@ -337,14 +331,15 @@ class PinLocator:
                     f"After rotation {symbol_rotation}°: ({pin_rel_x}, {pin_rel_y})"
                 )
 
-            # Calculate absolute position
-            abs_x = symbol_x + pin_rel_x
-            abs_y = symbol_y + pin_rel_y
+            # In KiCad pin definitions, (at x y angle) IS the connectable endpoint.
+            # After Y-negation and rotation, add to symbol position.
+            endpoint_x = round(symbol_x + pin_rel_x, 4)
+            endpoint_y = round(symbol_y + pin_rel_y, 4)
 
             logger.info(
-                f"Pin {symbol_reference}/{pin_number} located at ({abs_x}, {abs_y})"
+                f"Pin {symbol_reference}/{pin_number} endpoint at ({endpoint_x}, {endpoint_y})"
             )
-            return [abs_x, abs_y]
+            return [endpoint_x, endpoint_y]
 
         except Exception as e:
             logger.error(f"Error getting pin location: {e}")
@@ -367,11 +362,8 @@ class PinLocator:
             Dictionary mapping pin number -> [x, y] coordinates
         """
         try:
-            # Load schematic (use cache)
-            sch_key = str(schematic_path)
-            if sch_key not in self._schematic_cache:
-                self._schematic_cache[sch_key] = Schematic(sch_key)
-            sch = self._schematic_cache[sch_key]
+            # Load schematic fresh from disk to avoid stale state
+            sch = Schematic(str(schematic_path))
 
             # Find symbol
             target_symbol = None

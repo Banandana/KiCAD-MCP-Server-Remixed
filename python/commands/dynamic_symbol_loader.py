@@ -50,12 +50,33 @@ class DynamicSymbolLoader:
 
         return [p for p in possible_paths if p.exists() and p.is_dir()]
 
+    def _find_global_sym_lib_tables(self) -> List[Path]:
+        """Find global KiCad sym-lib-table files across platforms."""
+        import sys
+        candidates = []
+
+        if sys.platform == "win32":
+            appdata = os.environ.get("APPDATA", "")
+            if appdata:
+                candidates.append(Path(appdata) / "kicad" / "9.0" / "sym-lib-table")
+                candidates.append(Path(appdata) / "kicad" / "8.0" / "sym-lib-table")
+        elif sys.platform == "darwin":
+            candidates.append(Path.home() / "Library" / "Preferences" / "kicad" / "9.0" / "sym-lib-table")
+            candidates.append(Path.home() / "Library" / "Preferences" / "kicad" / "8.0" / "sym-lib-table")
+        else:  # Linux
+            xdg_config = os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))
+            candidates.append(Path(xdg_config) / "kicad" / "9.0" / "sym-lib-table")
+            candidates.append(Path(xdg_config) / "kicad" / "8.0" / "sym-lib-table")
+
+        return [p for p in candidates if p.exists()]
+
     def find_library_file(self, library_name: str) -> Optional[Path]:
         """Find the .kicad_sym file for a given library name.
 
         Search order:
         1. Project-specific sym-lib-table (if project_path is set)
-        2. Global KiCad symbol library directories
+        2. Global KiCad sym-lib-table (auto-detected per platform)
+        3. Known KiCad symbol library directories (fallback)
         """
         # 1. Check project-specific sym-lib-table
         if self.project_path:
@@ -66,7 +87,14 @@ class DynamicSymbolLoader:
                     logger.info(f"Found '{library_name}' in project sym-lib-table: {resolved}")
                     return resolved
 
-        # 2. Fall back to global KiCad symbol directories
+        # 2. Check global KiCad sym-lib-table files
+        for global_table in self._find_global_sym_lib_tables():
+            resolved = self._resolve_library_from_table(global_table, library_name)
+            if resolved:
+                logger.info(f"Found '{library_name}' in global sym-lib-table ({global_table}): {resolved}")
+                return resolved
+
+        # 3. Fall back to known KiCad symbol directories
         for lib_dir in self.find_kicad_symbol_libraries():
             lib_file = lib_dir / f"{library_name}.kicad_sym"
             if lib_file.exists():
@@ -96,27 +124,44 @@ class DynamicSymbolLoader:
 
     def _resolve_sym_uri(self, uri: str) -> Optional[str]:
         """Resolve environment variables in a sym-lib-table URI."""
+        import sys
         env_map = {
             "KICAD9_SYMBOL_DIR": [
-                "C:/Program Files/KiCad/9.0/share/kicad/symbols",
                 "/usr/share/kicad/symbols",
+                "/usr/local/share/kicad/symbols",
+                "C:/Program Files/KiCad/9.0/share/kicad/symbols",
                 "/Applications/KiCad/KiCad.app/Contents/SharedSupport/symbols",
             ],
             "KICAD8_SYMBOL_DIR": [
                 "C:/Program Files/KiCad/8.0/share/kicad/symbols",
+            ],
+            "KICAD7_SYMBOL_DIR": [
+                "C:/Program Files/KiCad/7.0/share/kicad/symbols",
+            ],
+            "KICAD_SYMBOL_DIR": [
+                "/usr/share/kicad/symbols",
+                "/usr/local/share/kicad/symbols",
+                "C:/Program Files/KiCad/9.0/share/kicad/symbols",
+            ],
+            "KICAD9_3RDPARTY_DIR": [
+                str(Path.home() / "Documents" / "KiCad" / "9.0" / "3rdparty"),
+                str(Path.home() / ".local" / "share" / "kicad" / "9.0" / "3rdparty"),
             ],
             "KIPRJMOD": [str(self.project_path)] if self.project_path else [],
         }
         result = uri
         for var, candidates in env_map.items():
             if f"${{{var}}}" in result:
+                # Try OS environment variable first
+                if var in os.environ:
+                    resolved = result.replace(f"${{{var}}}", os.environ[var])
+                    if Path(resolved).exists():
+                        return resolved
+                # Try known fallback paths
                 for candidate in candidates:
                     candidate_path = result.replace(f"${{{var}}}", candidate)
                     if Path(candidate_path).exists():
                         return candidate_path
-                # Fallback: try OS env
-                if var in os.environ:
-                    return result.replace(f"${{{var}}}", os.environ[var])
         return result
 
     def _extract_symbol_block(self, text: str, symbol_name: str) -> Optional[str]:
@@ -400,6 +445,19 @@ class DynamicSymbolLoader:
         logger.info(f"Injected symbol {full_name} into {sch_name}")
         return True
 
+    def _get_project_name(self, schematic_path: Path) -> str:
+        """Get the project name from a .kicad_pro file in the schematic directory."""
+        for pro_file in schematic_path.parent.glob("*.kicad_pro"):
+            return pro_file.stem
+        return schematic_path.stem
+
+    def _get_root_uuid(self, schematic_content: str) -> str:
+        """Extract the root sheet UUID (the first uuid in the schematic file)."""
+        match = re.search(r'\(uuid\s+"?([^"\)\s]+)"?\)', schematic_content)
+        if match:
+            return match.group(1)
+        return str(uuid.uuid4())
+
     def create_component_instance(
         self,
         schematic_path: Path,
@@ -410,33 +468,73 @@ class DynamicSymbolLoader:
         footprint: str = "",
         x: float = 0,
         y: float = 0,
+        rotation: float = 0,
     ) -> bool:
         """
         Add a component instance to the schematic.
         This creates the (symbol ...) block with lib_id reference.
+        Coordinates are snapped to the 1.27mm KiCad schematic grid.
         """
+        # Snap to 1.27mm grid so pins land on-grid and connect cleanly
+        def _grid(v, g=1.27):
+            return round(round(v / g) * g, 4)
+        x = _grid(x)
+        y = _grid(y)
+
         full_lib_id = f"{library_name}:{symbol_name}"
         new_uuid = str(uuid.uuid4())
 
-        instance_block = f"""  (symbol (lib_id "{full_lib_id}") (at {x} {y} 0) (unit 1)
-    (in_bom yes) (on_board yes) (dnp no)
-    (uuid "{new_uuid}")
-    (property "Reference" "{reference}" (at {x} {y - 2.54} 0)
-      (effects (font (size 1.27 1.27)))
-    )
-    (property "Value" "{value or symbol_name}" (at {x} {y + 2.54} 0)
-      (effects (font (size 1.27 1.27)))
-    )
-    (property "Footprint" "{footprint}" (at {x} {y} 0)
-      (effects (font (size 1.27 1.27)) (hide yes))
-    )
-    (property "Datasheet" "~" (at {x} {y} 0)
-      (effects (font (size 1.27 1.27)) (hide yes))
-    )
-  )"""
+        # Compute rotation-aware field positions
+        rot = rotation % 360
+        if rot == 0:
+            ref_x, ref_y = x, y - 2.54
+            val_x, val_y = x, y + 2.54
+        elif rot == 90:
+            ref_x, ref_y = x - 2.54, y
+            val_x, val_y = x + 2.54, y
+        elif rot == 180:
+            ref_x, ref_y = x, y + 2.54
+            val_x, val_y = x, y - 2.54
+        elif rot == 270:
+            ref_x, ref_y = x + 2.54, y
+            val_x, val_y = x - 2.54, y
+        else:
+            # Fallback for non-cardinal rotations
+            ref_x, ref_y = x, y - 2.54
+            val_x, val_y = x, y + 2.54
 
         with open(schematic_path, "r", encoding="utf-8") as f:
             content = f.read()
+
+        # Get project name and root UUID for the instances block
+        project_name = self._get_project_name(schematic_path)
+        root_uuid = self._get_root_uuid(content)
+
+        def _c(v):
+            """Format coordinate: strip trailing zeros (82.0 → 82, 148.604 → 148.604)"""
+            if isinstance(v, int): return str(v)
+            s = f"{v:.4f}".rstrip("0").rstrip(".")
+            return s
+
+        instance_block = f"""  (symbol (lib_id "{full_lib_id}") (at {_c(x)} {_c(y)} {_c(rotation)}) (unit 1)
+    (in_bom yes) (on_board yes) (dnp no)
+    (uuid "{new_uuid}")
+    (property "Reference" "{reference}" (at {_c(ref_x)} {_c(ref_y)} 0)
+      (effects (font (size 1.27 1.27)))
+    )
+    (property "Value" "{value or symbol_name}" (at {_c(val_x)} {_c(val_y)} 0)
+      (effects (font (size 1.27 1.27)))
+    )
+    (property "Footprint" "{footprint}" (at {_c(x)} {_c(y)} 0)
+      (effects (font (size 1.27 1.27)) (hide yes))
+    )
+    (property "Datasheet" "~" (at {_c(x)} {_c(y)} 0)
+      (effects (font (size 1.27 1.27)) (hide yes))
+    )
+    (instances (project "{project_name}"
+      (path "/{root_uuid}" (reference "{reference}") (unit 1))
+    ))
+  )"""
 
         # Insert before (sheet_instances using direct string search.
         # This works for both pretty-printed and sexpdata-compacted single-line files.
@@ -495,6 +593,7 @@ class DynamicSymbolLoader:
         footprint: str = "",
         x: float = 0,
         y: float = 0,
+        rotation: float = 0,
         project_path: Optional[Path] = None,
     ) -> bool:
         """
@@ -504,6 +603,7 @@ class DynamicSymbolLoader:
         Args:
             project_path: Optional project directory. When set, project-specific
                           sym-lib-table is also searched for the library file.
+            rotation: Component rotation in degrees (0, 90, 180, 270).
         """
         if project_path:
             self.project_path = project_path
@@ -520,6 +620,7 @@ class DynamicSymbolLoader:
             footprint=footprint,
             x=x,
             y=y,
+            rotation=rotation,
         )
 
 

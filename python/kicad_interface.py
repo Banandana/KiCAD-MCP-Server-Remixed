@@ -397,6 +397,24 @@ class KiCADInterface:
             "export_schematic_pdf": self._handle_export_schematic_pdf,
             "export_schematic_svg": self._handle_export_schematic_svg,
             "import_svg_logo": self._handle_import_svg_logo,
+            # New batch/power tools
+            "add_power_symbol": self._handle_add_power_symbol,
+            "batch_connect_to_net": self._handle_batch_connect_to_net,
+            "bulk_move_schematic_components": self._handle_bulk_move_schematic_components,
+            "batch_get_schematic_pin_locations": self._handle_batch_get_schematic_pin_locations,
+            "move_region": self._handle_move_region,
+            "batch_add_wire": self._handle_batch_add_wire,
+            "get_connected_items": self._handle_get_connected_items,
+            "batch_delete": self._handle_batch_delete,
+            "move_labels_by_offset": self._handle_move_labels_by_offset,
+            "batch_edit_schematic_components": self._handle_batch_edit_schematic_components,
+            "batch_delete_schematic_components": self._handle_batch_delete_schematic_components,
+            "add_no_connect": self._handle_add_no_connect,
+            "add_schematic_text": self._handle_add_schematic_text,
+            "rotate_schematic_label": self._handle_rotate_schematic_label,
+            "find_orphan_items": self._handle_find_orphan_items,
+            "check_schematic_overlaps": self._handle_check_schematic_overlaps,
+            "get_pin_connections": self._handle_get_pin_connections,
             # UI/Process management commands
             "check_kicad_ui": self._handle_check_kicad_ui,
             "launch_kicad_ui": self._handle_launch_kicad_ui,
@@ -614,6 +632,25 @@ class KiCADInterface:
             file_path = f"{path}/{project_name}.kicad_sch"
             success = SchematicManager.save_schematic(schematic, file_path)
 
+            # Apply paper/sheet size if specified
+            paper_size = params.get("paperSize")
+            if paper_size and success:
+                try:
+                    import re
+                    with open(file_path, "r", encoding="utf-8") as f:
+                        content = f.read()
+                    # Replace (paper "A4") or similar with the requested size
+                    content = re.sub(
+                        r'\(paper\s+"[^"]*"\)',
+                        f'(paper "{paper_size}")',
+                        content,
+                    )
+                    with open(file_path, "w", encoding="utf-8", newline="\n") as f:
+                        f.write(content)
+                    logger.info(f"Set paper size to {paper_size}")
+                except Exception as paper_err:
+                    logger.warning(f"Failed to set paper size: {paper_err}")
+
             return {"success": success, "file_path": file_path}
         except Exception as e:
             logger.error(f"Error creating schematic: {str(e)}")
@@ -703,6 +740,7 @@ class KiCADInterface:
             footprint = component.get("footprint", "")
             x = component.get("x", 0)
             y = component.get("y", 0)
+            rotation = component.get("rotation", 0)
 
             # Derive project path from schematic path for project-local library resolution
             schematic_file = Path(schematic_path)
@@ -718,6 +756,7 @@ class KiCADInterface:
                 footprint=footprint,
                 x=x,
                 y=y,
+                rotation=rotation,
                 project_path=derived_project_path,
             )
 
@@ -865,17 +904,19 @@ class KiCADInterface:
                 return {"success": False, "message": "schematicPath is required"}
             if not reference:
                 return {"success": False, "message": "reference is required"}
+            hidden_fields = params.get("hiddenFields")
             if not any(
                 [
                     new_footprint is not None,
                     new_value is not None,
                     new_reference is not None,
                     field_positions is not None,
+                    hidden_fields is not None,
                 ]
             ):
                 return {
                     "success": False,
-                    "message": "At least one of footprint, value, newReference, or fieldPositions must be provided",
+                    "message": "At least one of footprint, value, newReference, fieldPositions, or hiddenFields must be provided",
                 }
 
             sch_file = Path(schematic_path)
@@ -972,6 +1013,56 @@ class KiCADInterface:
                         block_text,
                     )
 
+            # Handle field visibility: {"Reference": true, "Value": false}
+            # true = hidden (hide yes), false = visible (remove hide)
+            if hidden_fields is not None:
+                for field_name, should_hide in hidden_fields.items():
+                    # Find the (property "FieldName" ...) block within block_text
+                    prop_start = block_text.find(f'(property "{field_name}"')
+                    if prop_start < 0:
+                        continue
+
+                    # Find end of this property block (balanced parens)
+                    depth = 0
+                    pi = prop_start
+                    while pi < len(block_text):
+                        if block_text[pi] == "(": depth += 1
+                        elif block_text[pi] == ")":
+                            depth -= 1
+                            if depth == 0:
+                                break
+                        pi += 1
+                    prop_block = block_text[prop_start:pi + 1]
+
+                    # Remove ALL existing hide directives — both at effects level
+                    # and inside (font ...) (from manual hacks or old KiCad format)
+                    # Order matters: remove (hide yes) everywhere first
+                    clean = re.sub(r'\s*\(hide\s+yes\)', '', prop_block)
+                    # Remove bare "hide" keyword (old format: (effects ... hide))
+                    clean = re.sub(r'\)\s+hide\b', ')', clean)
+                    # Fix any double-space artifacts from removal
+                    clean = re.sub(r'  +', ' ', clean)
+
+                    if should_hide:
+                        # Insert (hide yes) right before the closing ) of (effects ...)
+                        # Find the (effects ...) block
+                        effects_pos = clean.find('(effects')
+                        if effects_pos >= 0:
+                            # Find the closing ) of (effects ...)
+                            ed = effects_pos
+                            edepth = 0
+                            while ed < len(clean):
+                                if clean[ed] == "(": edepth += 1
+                                elif clean[ed] == ")":
+                                    edepth -= 1
+                                    if edepth == 0:
+                                        break
+                                ed += 1
+                            # Insert (hide yes) before the closing )
+                            clean = clean[:ed] + " (hide yes)" + clean[ed:]
+
+                    block_text = block_text[:prop_start] + clean + block_text[pi + 1:]
+
             content = content[:block_start] + block_text + content[block_end + 1 :]
 
             with open(sch_file, "w", encoding="utf-8") as f:
@@ -988,6 +1079,8 @@ class KiCADInterface:
             }
             if field_positions is not None:
                 changes["fieldPositions"] = field_positions
+            if hidden_fields is not None:
+                changes["hiddenFields"] = hidden_fields
             logger.info(f"Edited schematic component {reference}: {changes}")
             return {"success": True, "reference": reference, "updated": changes}
 
@@ -995,6 +1088,212 @@ class KiCADInterface:
             logger.error(f"Error editing schematic component: {e}")
             import traceback
 
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e)}
+
+    def _handle_batch_edit_schematic_components(self, params):
+        """Apply the same field edits to multiple components in one call.
+
+        Useful for bulk operations like hiding Reference on all power symbols.
+        """
+        logger.info("Batch editing schematic components")
+        try:
+            schematic_path = params.get("schematicPath")
+            references = params.get("references", [])
+            edits = params.get("edits", {})
+
+            if not schematic_path:
+                return {"success": False, "message": "schematicPath is required"}
+            if not references:
+                return {"success": False, "message": "references array is required"}
+            if not edits:
+                return {"success": False, "message": "edits object is required"}
+
+            results = {"edited": [], "failed": []}
+            for ref in references:
+                edit_params = {
+                    "schematicPath": schematic_path,
+                    "reference": ref,
+                    **edits,
+                }
+                result = self._handle_edit_schematic_component(edit_params)
+                if result.get("success"):
+                    results["edited"].append(ref)
+                else:
+                    results["failed"].append(f"{ref}: {result.get('message', 'unknown error')}")
+
+            n_ok = len(results["edited"])
+            n_fail = len(results["failed"])
+            return {
+                "success": n_fail == 0,
+                "message": f"Batch edit: {n_ok} edited, {n_fail} failed",
+                "edited": results["edited"],
+                "failed": results["failed"],
+            }
+
+        except Exception as e:
+            logger.error(f"Error in batch_edit_schematic_components: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e)}
+
+    def _handle_add_no_connect(self, params):
+        """Add a no-connect (X) flag at a position, typically on an unused pin."""
+        logger.info("Adding no-connect flag")
+        try:
+            from pathlib import Path
+            from commands.sexp_writer import add_no_connect
+
+            schematic_path = params.get("schematicPath")
+            position = params.get("position", {})
+
+            if not schematic_path:
+                return {"success": False, "message": "schematicPath is required"}
+
+            x = position.get("x", 0) if isinstance(position, dict) else 0
+            y = position.get("y", 0) if isinstance(position, dict) else 0
+
+            success = add_no_connect(Path(schematic_path), [x, y])
+            if success:
+                return {"success": True, "message": f"Added no-connect at ({x}, {y})"}
+            return {"success": False, "message": "Failed to add no-connect"}
+        except Exception as e:
+            logger.error(f"Error adding no-connect: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e)}
+
+    def _handle_add_schematic_text(self, params):
+        """Add a text annotation to the schematic."""
+        logger.info("Adding schematic text")
+        try:
+            from pathlib import Path
+            import uuid as _uuid
+
+            schematic_path = params.get("schematicPath")
+            text = params.get("text")
+            position = params.get("position", {})
+            size = params.get("size", 2.54)
+            angle = params.get("angle", 0)
+
+            if not schematic_path or not text:
+                return {"success": False, "message": "schematicPath and text are required"}
+
+            x = position.get("x", 0) if isinstance(position, dict) else 0
+            y = position.get("y", 0) if isinstance(position, dict) else 0
+
+            from commands.sexp_writer import _read_schematic, _write_schematic, _find_insert_position
+
+            content = _read_schematic(Path(schematic_path))
+            text_uuid = str(_uuid.uuid4())
+
+            text_block = (
+                f'  (text "{text}" (at {x} {y} {angle})\n'
+                f"    (effects (font (size {size} {size})))\n"
+                f"    (uuid {text_uuid})\n"
+                f"  )\n\n"
+            )
+
+            insert_at = _find_insert_position(content)
+            content = content[:insert_at] + text_block + content[insert_at:]
+            _write_schematic(Path(schematic_path), content)
+
+            return {"success": True, "message": f"Added text at ({x}, {y})"}
+        except Exception as e:
+            logger.error(f"Error adding schematic text: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e)}
+
+    def _handle_rotate_schematic_label(self, params):
+        """Rotate a net label to a new angle."""
+        logger.info("Rotating schematic label")
+        try:
+            import re
+
+            schematic_path = params.get("schematicPath")
+            net_name = params.get("netName")
+            position = params.get("position")
+            angle = params.get("angle", 0)
+
+            if not schematic_path or not net_name:
+                return {"success": False, "message": "schematicPath and netName are required"}
+
+            with open(schematic_path, "r", encoding="utf-8") as f:
+                content = f.read()
+
+            tolerance = 0.5
+            escaped = re.escape(net_name)
+            found = False
+
+            for label_type in ["label", "global_label", "hierarchical_label"]:
+                # Allow optional (shape ...) between label name and (at ...) for global labels
+                pat = re.compile(
+                    rf'(\({label_type}\s+"{escaped}"(?:\s+\(shape\s+[^)]*\))?\s+\(at\s+)([\d.e+-]+)\s+([\d.e+-]+)\s+[\d.e+-]+'
+                )
+                for m in pat.finditer(content):
+                    lx, ly = float(m.group(2)), float(m.group(3))
+                    if position:
+                        px = position.get("x", 0)
+                        py = position.get("y", 0)
+                        if abs(lx - px) >= tolerance or abs(ly - py) >= tolerance:
+                            continue
+
+                    # Replace the angle in (at X Y ANGLE
+                    old = m.group(0)
+                    new = f"{m.group(1)}{m.group(2)} {m.group(3)} {angle}"
+                    content = content.replace(old, new, 1)
+                    found = True
+                    break
+                if found:
+                    break
+
+            if not found:
+                return {"success": False, "message": f"Label '{net_name}' not found"}
+
+            with open(schematic_path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(content)
+
+            return {"success": True, "message": f"Rotated label '{net_name}' to {angle} degrees"}
+        except Exception as e:
+            logger.error(f"Error rotating label: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e)}
+
+    def _handle_batch_delete_schematic_components(self, params):
+        """Delete multiple schematic components in a single call."""
+        logger.info("Batch deleting schematic components")
+        try:
+            schematic_path = params.get("schematicPath")
+            references = params.get("references", [])
+
+            if not schematic_path:
+                return {"success": False, "message": "schematicPath is required"}
+            if not references:
+                return {"success": False, "message": "references array is required"}
+
+            deleted = []
+            failed = []
+            for ref in references:
+                result = self._handle_delete_schematic_component({
+                    "schematicPath": schematic_path,
+                    "reference": ref,
+                })
+                if result.get("success"):
+                    deleted.append(ref)
+                else:
+                    failed.append(f"{ref}: {result.get('message', 'unknown')}")
+
+            return {
+                "success": len(failed) == 0,
+                "message": f"Deleted {len(deleted)}, failed {len(failed)}",
+                "deleted": deleted,
+                "failed": failed,
+            }
+        except Exception as e:
+            logger.error(f"Error in batch_delete_schematic_components: {e}")
+            import traceback
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
 
@@ -1131,8 +1430,9 @@ class KiCADInterface:
             from commands.wire_manager import WireManager
 
             schematic_path = params.get("schematicPath")
-            start_point = params.get("startPoint")
-            end_point = params.get("endPoint")
+            # Accept both "startPoint"/"endPoint" (legacy) and "start"/"end" (TS tool)
+            start_point = params.get("startPoint") or params.get("start")
+            end_point = params.get("endPoint") or params.get("end")
             properties = params.get("properties", {})
 
             if not schematic_path:
@@ -1142,6 +1442,12 @@ class KiCADInterface:
                     "success": False,
                     "message": "Start and end points are required",
                 }
+
+            # Normalize {x, y} objects to [x, y] arrays
+            if isinstance(start_point, dict):
+                start_point = [start_point.get("x", 0), start_point.get("y", 0)]
+            if isinstance(end_point, dict):
+                end_point = [end_point.get("x", 0), end_point.get("y", 0)]
 
             # Extract wire properties
             stroke_width = properties.get("stroke_width", 0)
@@ -1442,9 +1748,14 @@ class KiCADInterface:
                 "labelType", "label"
             )  # 'label', 'global_label', 'hierarchical_label'
             orientation = params.get("orientation", 0)  # 0, 90, 180, 270
+            shape = params.get("shape")  # For global_label: input, output, bidirectional, passive
 
             if not all([schematic_path, net_name, position]):
                 return {"success": False, "message": "Missing required parameters"}
+
+            # Normalize position: accept both [x,y] array and {x,y} object
+            if isinstance(position, dict):
+                position = [position.get("x", 0), position.get("y", 0)]
 
             # Use WireManager for S-expression manipulation
             success = WireManager.add_label(
@@ -1453,6 +1764,7 @@ class KiCADInterface:
                 position,
                 label_type=label_type,
                 orientation=orientation,
+                shape=shape,
             )
 
             if success:
@@ -1474,7 +1786,12 @@ class KiCADInterface:
             }
 
     def _handle_connect_to_net(self, params):
-        """Connect a component pin to a named net using wire stub and label"""
+        """Connect a component pin to a named net using wire stub and label.
+
+        Supports power nets (GND, +3V3, +5V, VCC, etc.) — automatically places
+        a power symbol instead of a net label when a power net is detected.
+        Also supports global labels via labelType parameter.
+        """
         logger.info("Connecting component pin to net")
         try:
             from pathlib import Path
@@ -1483,13 +1800,16 @@ class KiCADInterface:
             component_ref = params.get("componentRef")
             pin_name = params.get("pinName")
             net_name = params.get("netName")
+            label_type = params.get("labelType")  # None, "label", "global_label"
+            shape = params.get("shape")  # For global_label: input, output, etc.
 
             if not all([schematic_path, component_ref, pin_name, net_name]):
                 return {"success": False, "message": "Missing required parameters"}
 
-            # Use ConnectionManager with new WireManager integration
+            # Use ConnectionManager with power-net awareness
             success = ConnectionManager.connect_to_net(
-                Path(schematic_path), component_ref, pin_name, net_name
+                Path(schematic_path), component_ref, pin_name, net_name,
+                label_type=label_type, shape=shape,
             )
 
             if success:
@@ -1602,6 +1922,993 @@ class KiCADInterface:
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
 
+    def _handle_batch_get_schematic_pin_locations(self, params):
+        """Return pin endpoint coordinates for multiple components in one call.
+
+        Reads the schematic once and computes pin positions for all requested
+        references using cached pin definitions.
+        """
+        logger.info("Batch getting schematic pin locations")
+        try:
+            from pathlib import Path
+            from commands.pin_locator import PinLocator
+            import math
+
+            schematic_path = params.get("schematicPath")
+            references = params.get("references", [])
+
+            if not schematic_path:
+                return {"success": False, "message": "schematicPath is required"}
+            if not references:
+                return {"success": False, "message": "references array is required"}
+
+            sch_file = Path(schematic_path)
+            schematic = SchematicManager.load_schematic(schematic_path)
+            if not schematic:
+                return {"success": False, "message": "Failed to load schematic"}
+
+            locator = PinLocator()
+            ref_set = set(references)
+            results = {}
+
+            for symbol in schematic.symbol:
+                if not hasattr(symbol.property, "Reference"):
+                    continue
+                ref = symbol.property.Reference.value
+                if ref not in ref_set:
+                    continue
+
+                lib_id = symbol.lib_id.value if hasattr(symbol, "lib_id") else ""
+                if not lib_id:
+                    results[ref] = {"error": "no lib_id"}
+                    continue
+
+                position = symbol.at.value if hasattr(symbol, "at") else [0, 0, 0]
+                sym_x = float(position[0])
+                sym_y = float(position[1])
+                sym_rot = float(position[2]) if len(position) > 2 else 0.0
+
+                pins_def = locator.get_symbol_pins(sch_file, lib_id)
+                if not pins_def:
+                    results[ref] = {"error": "no pin definitions"}
+                    continue
+
+                pins = {}
+                for pin_num, pin_data in pins_def.items():
+                    pin_rel_x = pin_data["x"]
+                    pin_rel_y = -pin_data["y"]  # Y-negate: symbol-local Y-up → schematic Y-down
+                    if sym_rot != 0:
+                        pin_rel_x, pin_rel_y = PinLocator.rotate_point(
+                            pin_rel_x, pin_rel_y, sym_rot
+                        )
+                    # Pin (at) IS the connectable endpoint — no length math needed
+                    ep_x = round(sym_x + pin_rel_x, 4)
+                    ep_y = round(sym_y + pin_rel_y, 4)
+
+                    pins[pin_num] = {
+                        "x": ep_x,
+                        "y": ep_y,
+                        "name": pin_data.get("name", pin_num),
+                        "angle": (pin_data.get("angle", 0) + sym_rot) % 360,
+                    }
+
+                results[ref] = {"pins": pins}
+
+            # Report any references not found
+            for ref in references:
+                if ref not in results:
+                    results[ref] = {"error": "not found"}
+
+            return {"success": True, "components": results}
+
+        except Exception as e:
+            logger.error(f"Error in batch pin locations: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e)}
+
+    # ── Region / batch tools ────────────────────────────────────────────
+
+    def _handle_move_region(self, params):
+        """Move everything (components, wires, labels) within a bounding box by an offset.
+
+        This is the block-select + move equivalent from KiCad's GUI.
+        Collects all edits first, then applies them in reverse order to
+        avoid corrupting string positions.
+        """
+        logger.info("Moving region in schematic")
+        try:
+            import re
+            schematic_path = params.get("schematicPath")
+            bbox = params.get("bbox", {})
+            offset = params.get("offset", {})
+
+            if not schematic_path:
+                return {"success": False, "message": "schematicPath is required"}
+
+            x1, y1 = float(bbox.get("x1", 0)), float(bbox.get("y1", 0))
+            x2, y2 = float(bbox.get("x2", 0)), float(bbox.get("y2", 0))
+            dx, dy = float(offset.get("dx", 0)), float(offset.get("dy", 0))
+
+            if x1 > x2: x1, x2 = x2, x1
+            if y1 > y2: y1, y2 = y2, y1
+
+            with open(schematic_path, "r", encoding="utf-8") as f:
+                content = f.read()
+
+            def in_bbox(x, y):
+                return x1 <= x <= x2 and y1 <= y <= y2
+
+            def find_block_end(s, start):
+                """Find end of balanced paren block starting at s[start]='('."""
+                depth = 0
+                i = start
+                while i < len(s):
+                    if s[i] == "(": depth += 1
+                    elif s[i] == ")":
+                        depth -= 1
+                        if depth == 0:
+                            return i + 1
+                    i += 1
+                return len(s)
+
+            # Skip lib_symbols section
+            lib_sym_start = content.find("(lib_symbols")
+            lib_sym_end = find_block_end(content, lib_sym_start) if lib_sym_start >= 0 else -1
+
+            moved = {"components": 0, "wires": 0, "labels": 0}
+            # Collect replacements as (start, end, new_text) — apply in reverse later
+            replacements = []
+
+            # --- Collect component replacements ---
+            symbol_pattern = re.compile(r'\(symbol\s+\(lib_id\s+"')
+            for m in symbol_pattern.finditer(content):
+                pos = m.start()
+                if lib_sym_start >= 0 and lib_sym_start <= pos < lib_sym_end:
+                    continue
+
+                end = find_block_end(content, pos)
+                block = content[pos:end]
+
+                # Get the FIRST (at X Y ...) which is the symbol position
+                at_m = re.search(r'\(at\s+([\d.e+-]+)\s+([\d.e+-]+)', block)
+                if not at_m:
+                    continue
+                sx, sy = float(at_m.group(1)), float(at_m.group(2))
+                if not in_bbox(sx, sy):
+                    continue
+
+                # Shift all (at X Y ...) in this block (symbol pos + field positions)
+                def _shift_at(match, _dx=dx, _dy=dy):
+                    ax = float(match.group(1)) + _dx
+                    ay = float(match.group(2)) + _dy
+                    rest = match.group(3)
+                    return f"(at {ax} {ay}{rest}"
+
+                new_block = re.sub(
+                    r'\(at\s+([\d.e+-]+)\s+([\d.e+-]+)([\s\d.e+-]*\))',
+                    _shift_at, block
+                )
+                replacements.append((pos, end, new_block))
+                moved["components"] += 1
+
+            # --- Collect wire replacements ---
+            wire_pattern = re.compile(r'\(wire\b')
+            for m in wire_pattern.finditer(content):
+                pos = m.start()
+                end = find_block_end(content, pos)
+                block = content[pos:end]
+
+                xy_matches = re.findall(r'\(xy\s+([\d.e+-]+)\s+([\d.e+-]+)\)', block)
+                if not xy_matches:
+                    continue
+
+                # Check if ANY point is in bbox
+                if not any(in_bbox(float(xm[0]), float(xm[1])) for xm in xy_matches):
+                    continue
+
+                def _shift_xy(match, _dx=dx, _dy=dy):
+                    return f"(xy {float(match.group(1)) + _dx} {float(match.group(2)) + _dy})"
+
+                new_block = re.sub(r'\(xy\s+([\d.e+-]+)\s+([\d.e+-]+)\)', _shift_xy, block)
+                replacements.append((pos, end, new_block))
+                moved["wires"] += 1
+
+            # --- Collect label replacements ---
+            for label_type in ["label", "global_label"]:
+                label_pat = re.compile(rf'\({label_type}\s+"[^"]*"\s+\(at\s+([\d.e+-]+)\s+([\d.e+-]+)')
+                for m in label_pat.finditer(content):
+                    lx, ly = float(m.group(1)), float(m.group(2))
+                    if not in_bbox(lx, ly):
+                        continue
+
+                    pos = m.start()
+                    end = find_block_end(content, pos)
+                    block = content[pos:end]
+
+                    def _shift_at_label(match, _dx=dx, _dy=dy):
+                        ax = float(match.group(1)) + _dx
+                        ay = float(match.group(2)) + _dy
+                        rest = match.group(3)
+                        return f"(at {ax} {ay}{rest}"
+
+                    # Only shift the FIRST (at ...) in the label block (the label position)
+                    new_block = re.sub(
+                        r'\(at\s+([\d.e+-]+)\s+([\d.e+-]+)([\s\d.e+-]*\))',
+                        _shift_at_label, block, count=1
+                    )
+                    replacements.append((pos, end, new_block))
+                    moved["labels"] += 1
+
+            # Apply all replacements in REVERSE order so positions stay valid
+            replacements.sort(key=lambda r: r[0], reverse=True)
+            for start, end, new_text in replacements:
+                content = content[:start] + new_text + content[end:]
+
+            with open(schematic_path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(content)
+
+            total = moved["components"] + moved["wires"] + moved["labels"]
+            return {
+                "success": True,
+                "message": f"Moved {total} items (dx={dx}, dy={dy})",
+                "moved": moved,
+            }
+
+        except Exception as e:
+            logger.error(f"Error in move_region: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e)}
+
+    def _handle_batch_add_wire(self, params):
+        """Add multiple wires in a single call."""
+        logger.info("Batch adding wires")
+        try:
+            from pathlib import Path
+            from commands.wire_manager import WireManager
+
+            schematic_path = params.get("schematicPath")
+            wires = params.get("wires", [])
+
+            if not schematic_path:
+                return {"success": False, "message": "schematicPath is required"}
+            if not wires:
+                return {"success": False, "message": "wires array is required"}
+
+            added = 0
+            failed = 0
+            for w in wires:
+                start = w.get("start", {})
+                end = w.get("end", {})
+                sp = [start.get("x", 0), start.get("y", 0)]
+                ep = [end.get("x", 0), end.get("y", 0)]
+                if WireManager.add_wire(Path(schematic_path), sp, ep):
+                    added += 1
+                else:
+                    failed += 1
+
+            return {
+                "success": failed == 0,
+                "message": f"Added {added} wires, {failed} failed",
+                "added": added,
+                "failed": failed,
+            }
+        except Exception as e:
+            logger.error(f"Error in batch_add_wire: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e)}
+
+    def _handle_get_connected_items(self, params):
+        """Given a component reference, return all wires and labels connected to its pins."""
+        logger.info("Getting connected items")
+        try:
+            from pathlib import Path
+            from commands.pin_locator import PinLocator
+            import re
+
+            schematic_path = params.get("schematicPath")
+            reference = params.get("reference")
+
+            if not schematic_path or not reference:
+                return {"success": False, "message": "schematicPath and reference are required"}
+
+            sch_file = Path(schematic_path)
+
+            # Get pin endpoints for this component
+            locator = PinLocator()
+            all_pins = locator.get_all_symbol_pins(sch_file, reference)
+            if not all_pins:
+                return {"success": False, "message": f"No pins found for {reference}"}
+
+            # Read schematic to find wires and labels at pin positions
+            with open(schematic_path, "r", encoding="utf-8") as f:
+                content = f.read()
+
+            tolerance = 0.5
+            connected_wires = []
+            connected_labels = []
+
+            pin_positions = list(all_pins.values())
+
+            def near_any_pin(x, y):
+                for pp in pin_positions:
+                    if abs(x - pp[0]) < tolerance and abs(y - pp[1]) < tolerance:
+                        return True
+                return False
+
+            # Find wires touching any pin
+            wire_pat = re.compile(r'\(wire\b')
+            for m in wire_pat.finditer(content):
+                pos = m.start()
+                depth = 0
+                end = pos
+                while end < len(content):
+                    if content[end] == "(": depth += 1
+                    elif content[end] == ")":
+                        depth -= 1
+                        if depth == 0:
+                            end += 1
+                            break
+                    end += 1
+                block = content[pos:end]
+                xy_matches = re.findall(r'\(xy\s+([\d.e+-]+)\s+([\d.e+-]+)\)', block)
+                for xm in xy_matches:
+                    if near_any_pin(float(xm[0]), float(xm[1])):
+                        pts = [{"x": float(p[0]), "y": float(p[1])} for p in xy_matches]
+                        connected_wires.append({"start": pts[0], "end": pts[-1]})
+                        break
+
+            # Find labels touching any pin or wire endpoint
+            for label_type in ["label", "global_label"]:
+                label_pat = re.compile(rf'\({label_type}\s+"([^"]*)"\s+\(at\s+([\d.e+-]+)\s+([\d.e+-]+)')
+                for m in label_pat.finditer(content):
+                    name = m.group(1)
+                    lx, ly = float(m.group(2)), float(m.group(3))
+                    if near_any_pin(lx, ly):
+                        connected_labels.append({"netName": name, "position": {"x": lx, "y": ly}, "type": label_type})
+
+            return {
+                "success": True,
+                "reference": reference,
+                "pins": {pn: {"x": pv[0], "y": pv[1]} for pn, pv in all_pins.items()},
+                "connectedWires": connected_wires,
+                "connectedLabels": connected_labels,
+            }
+
+        except Exception as e:
+            logger.error(f"Error in get_connected_items: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e)}
+
+    def _handle_batch_delete(self, params):
+        """Delete multiple wires and/or labels in a single call."""
+        logger.info("Batch deleting items")
+        try:
+            from pathlib import Path
+            from commands.wire_manager import WireManager
+
+            schematic_path = params.get("schematicPath")
+            wires = params.get("wires", [])
+            labels = params.get("labels", [])
+
+            if not schematic_path:
+                return {"success": False, "message": "schematicPath is required"}
+
+            deleted_wires = 0
+            deleted_labels = 0
+            failed = []
+
+            for w in wires:
+                start = w.get("start", {})
+                end = w.get("end", {})
+                sp = [start.get("x", 0), start.get("y", 0)]
+                ep = [end.get("x", 0), end.get("y", 0)]
+                if WireManager.delete_wire(Path(schematic_path), sp, ep):
+                    deleted_wires += 1
+                else:
+                    failed.append(f"wire {sp}->{ep}")
+
+            for l in labels:
+                net = l.get("netName")
+                pos = l.get("position")
+                pos_list = [pos.get("x", 0), pos.get("y", 0)] if pos else None
+                if WireManager.delete_label(Path(schematic_path), net, pos_list):
+                    deleted_labels += 1
+                else:
+                    failed.append(f"label '{net}'")
+
+            return {
+                "success": len(failed) == 0,
+                "message": f"Deleted {deleted_wires} wires, {deleted_labels} labels",
+                "deletedWires": deleted_wires,
+                "deletedLabels": deleted_labels,
+                "failed": failed,
+            }
+
+        except Exception as e:
+            logger.error(f"Error in batch_delete: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e)}
+
+    def _handle_move_labels_by_offset(self, params):
+        """Move a set of labels by an x,y offset."""
+        logger.info("Moving labels by offset")
+        try:
+            import re
+
+            schematic_path = params.get("schematicPath")
+            labels = params.get("labels", [])
+            offset = params.get("offset", {})
+            dx = float(offset.get("dx", 0))
+            dy = float(offset.get("dy", 0))
+
+            if not schematic_path:
+                return {"success": False, "message": "schematicPath is required"}
+            if not labels:
+                return {"success": False, "message": "labels array is required"}
+
+            with open(schematic_path, "r", encoding="utf-8") as f:
+                content = f.read()
+
+            tolerance = 0.5
+            moved = 0
+
+            for label_spec in labels:
+                net_name = label_spec.get("netName")
+                pos = label_spec.get("position", {})
+                target_x = float(pos.get("x", 0))
+                target_y = float(pos.get("y", 0))
+
+                # Find this label in content
+                escaped = re.escape(net_name)
+                for label_type in ["label", "global_label"]:
+                    pat = re.compile(
+                        rf'\({label_type}\s+"{escaped}"\s+\(at\s+([\d.e+-]+)\s+([\d.e+-]+)'
+                    )
+                    for m in pat.finditer(content):
+                        lx, ly = float(m.group(1)), float(m.group(2))
+                        if abs(lx - target_x) < tolerance and abs(ly - target_y) < tolerance:
+                            # Found it — replace (at X Y with shifted values
+                            new_x = lx + dx
+                            new_y = ly + dy
+                            old_at = f"(at {m.group(1)} {m.group(2)}"
+                            new_at = f"(at {new_x} {new_y}"
+                            # Replace just this occurrence
+                            start = m.start()
+                            at_pos = content.find(old_at, start)
+                            if at_pos >= 0:
+                                content = content[:at_pos] + new_at + content[at_pos + len(old_at):]
+                                moved += 1
+                            break
+
+            with open(schematic_path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(content)
+
+            return {
+                "success": True,
+                "message": f"Moved {moved} labels by ({dx}, {dy})",
+                "moved": moved,
+            }
+
+        except Exception as e:
+            logger.error(f"Error in move_labels_by_offset: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e)}
+
+    # ── Diagnostic tools ────────────────────────────────────────────────
+
+    def _handle_find_orphan_items(self, params):
+        """Find dangling wires, orphan labels, and unconnected pins in a schematic."""
+        logger.info("Finding orphan items")
+        try:
+            import re
+            from pathlib import Path
+            from commands.pin_locator import PinLocator
+
+            schematic_path = params.get("schematicPath")
+            if not schematic_path:
+                return {"success": False, "message": "schematicPath is required"}
+
+            sch_file = Path(schematic_path)
+            schematic = SchematicManager.load_schematic(schematic_path)
+            if not schematic:
+                return {"success": False, "message": "Failed to load schematic"}
+
+            with open(schematic_path, "r", encoding="utf-8") as f:
+                content = f.read()
+
+            tolerance = 0.5
+            locator = PinLocator()
+
+            # Collect all connectable points: pin endpoints, wire endpoints, label positions, junctions
+            pin_points = []  # [(x, y, ref, pin_num)]
+            wire_endpoints = []  # [(x, y)]
+            label_points = []  # [(x, y, name, type)]
+            junction_points = []  # [(x, y)]
+
+            # Get all pin endpoints
+            for symbol in schematic.symbol:
+                if not hasattr(symbol.property, "Reference"):
+                    continue
+                ref = symbol.property.Reference.value
+                if ref.startswith("_TEMPLATE") or ref.startswith("#"):
+                    continue
+                lib_id = symbol.lib_id.value if hasattr(symbol, "lib_id") else ""
+                if not lib_id:
+                    continue
+                position = symbol.at.value if hasattr(symbol, "at") else [0, 0, 0]
+                sx, sy = float(position[0]), float(position[1])
+                sym_rot = float(position[2]) if len(position) > 2 else 0.0
+                import math
+                pins_def = locator.get_symbol_pins(sch_file, lib_id)
+                for pin_num, pd in (pins_def or {}).items():
+                    prx, pry = pd["x"], -pd["y"]
+                    if sym_rot != 0:
+                        prx, pry = PinLocator.rotate_point(prx, pry, sym_rot)
+                    # Pin (at) IS the endpoint — no length math
+                    ex = round(sx + prx, 4)
+                    ey = round(sy + pry, 4)
+                    pin_points.append((ex, ey, ref, pin_num))
+
+            # Get wire endpoints
+            wire_pat = re.compile(r'\(wire\b')
+            for m in wire_pat.finditer(content):
+                pos = m.start()
+                depth = 0
+                end = pos
+                while end < len(content):
+                    if content[end] == "(": depth += 1
+                    elif content[end] == ")":
+                        depth -= 1
+                        if depth == 0: end += 1; break
+                    end += 1
+                block = content[pos:end]
+                xy_ms = re.findall(r'\(xy\s+([\d.e+-]+)\s+([\d.e+-]+)\)', block)
+                for xm in xy_ms:
+                    wire_endpoints.append((float(xm[0]), float(xm[1])))
+
+            # Get label positions
+            for lt in ["label", "global_label"]:
+                lp = re.compile(rf'\({lt}\s+"([^"]*)"\s+\(at\s+([\d.e+-]+)\s+([\d.e+-]+)')
+                for m in lp.finditer(content):
+                    label_points.append((float(m.group(2)), float(m.group(3)), m.group(1), lt))
+
+            # Get junctions
+            jp = re.compile(r'\(junction\s+\(at\s+([\d.e+-]+)\s+([\d.e+-]+)')
+            for m in jp.finditer(content):
+                junction_points.append((float(m.group(1)), float(m.group(2))))
+
+            tolerance = 1.0  # 1mm tolerance to handle floating-point and grid alignment
+
+            def point_near(x1, y1, x2, y2):
+                return abs(x1 - x2) < tolerance and abs(y1 - y2) < tolerance
+
+            def touches_any(px, py, point_lists):
+                """Check if (px, py) is near any point in the given lists of (x, y, ...) tuples."""
+                for pts in point_lists:
+                    for pt in pts:
+                        if point_near(px, py, pt[0], pt[1]):
+                            return True
+                return False
+
+            # All non-wire connection points (pins, labels, junctions)
+            non_wire_points = [(x, y) for x, y, _, _ in pin_points]
+            non_wire_points += [(x, y) for x, y, _, _ in label_points]
+            non_wire_points += list(junction_points)
+
+            # Find dangling wire endpoints (not touching a pin, label, junction, or other wire endpoint)
+            dangling_wires = []
+            seen = set()
+            for wx, wy in wire_endpoints:
+                key = (round(wx, 1), round(wy, 1))
+                if key in seen:
+                    continue
+                seen.add(key)
+                # Check against pins, labels, junctions
+                connected = False
+                for cx, cy in non_wire_points:
+                    if point_near(wx, wy, cx, cy):
+                        connected = True
+                        break
+                if not connected:
+                    # Check against OTHER wire endpoints (T-junctions, wire-to-wire)
+                    other_count = 0
+                    for ox, oy in wire_endpoints:
+                        if point_near(wx, wy, ox, oy):
+                            other_count += 1
+                    if other_count <= 1:  # only itself
+                        dangling_wires.append({"x": wx, "y": wy})
+
+            # Find orphan labels (not touching a wire or pin)
+            orphan_labels = []
+            for lx, ly, name, lt in label_points:
+                touching = False
+                for wx, wy in wire_endpoints:
+                    if point_near(lx, ly, wx, wy):
+                        touching = True
+                        break
+                if not touching:
+                    for px, py, _, _ in pin_points:
+                        if point_near(lx, ly, px, py):
+                            touching = True
+                            break
+                if not touching:
+                    orphan_labels.append({"netName": name, "x": lx, "y": ly, "type": lt})
+
+            # Find unconnected pins (check wires, labels, AND other pin endpoints for power symbols)
+            unconnected_pins = []
+            for px, py, ref, pnum in pin_points:
+                connected = False
+                for wx, wy in wire_endpoints:
+                    if point_near(px, py, wx, wy):
+                        connected = True
+                        break
+                if not connected:
+                    for lx, ly, _, _ in label_points:
+                        if point_near(px, py, lx, ly):
+                            connected = True
+                            break
+                if not connected:
+                    # Check if touching another component's pin (e.g. power symbol)
+                    for opx, opy, oref, _ in pin_points:
+                        if oref != ref and point_near(px, py, opx, opy):
+                            connected = True
+                            break
+                if not connected:
+                    unconnected_pins.append({"reference": ref, "pin": pnum, "x": px, "y": py})
+
+            return {
+                "success": True,
+                "danglingWires": dangling_wires,
+                "orphanLabels": orphan_labels,
+                "unconnectedPins": unconnected_pins,
+                "summary": {
+                    "danglingWires": len(dangling_wires),
+                    "orphanLabels": len(orphan_labels),
+                    "unconnectedPins": len(unconnected_pins),
+                },
+            }
+
+        except Exception as e:
+            logger.error(f"Error in find_orphan_items: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e)}
+
+    def _handle_check_schematic_overlaps(self, params):
+        """Check for overlapping components and text. Opinionated: filters noise,
+        groups by severity, returns only actionable results (max 50)."""
+        logger.info("Checking schematic overlaps")
+        try:
+            schematic_path = params.get("schematicPath")
+            clearance = float(params.get("clearance", 2.0))  # mm
+
+            if not schematic_path:
+                return {"success": False, "message": "schematicPath is required"}
+
+            schematic = SchematicManager.load_schematic(schematic_path)
+            if not schematic:
+                return {"success": False, "message": "Failed to load schematic"}
+
+            from pathlib import Path
+            from commands.pin_locator import PinLocator
+            locator = PinLocator()
+            sch_file = Path(schematic_path)
+
+            components = []  # [(ref, cx, cy, hw, hh, lib_id)]
+
+            for symbol in schematic.symbol:
+                if not hasattr(symbol.property, "Reference"):
+                    continue
+                ref = symbol.property.Reference.value
+                if ref.startswith("_TEMPLATE"):
+                    continue
+
+                lib_id = symbol.lib_id.value if hasattr(symbol, "lib_id") else ""
+                position = symbol.at.value if hasattr(symbol, "at") else [0, 0, 0]
+                cx, cy = float(position[0]), float(position[1])
+                sym_rot = float(position[2]) if len(position) > 2 else 0.0
+
+                pins_def = locator.get_symbol_pins(sch_file, lib_id) if lib_id else {}
+                if pins_def:
+                    xs = [pd["x"] for pd in pins_def.values()]
+                    ys = [pd["y"] for pd in pins_def.values()]
+                    hw = max(abs(max(xs, default=0)), abs(min(xs, default=0)), 2.54)
+                    hh = max(abs(max(ys, default=0)), abs(min(ys, default=0)), 2.54)
+                    if sym_rot in (90, 270):
+                        hw, hh = hh, hw
+                else:
+                    hw, hh = 2.54, 2.54
+
+                components.append((ref, cx, cy, hw, hh, lib_id))
+
+            # Collect global/hierarchical labels as bounding boxes
+            import re
+            with open(schematic_path, "r", encoding="utf-8") as f:
+                content = f.read()
+
+            label_boxes = []  # [(name, x, y, hw, hh)]
+            for lt in ["global_label", "hierarchical_label"]:
+                lp = re.compile(rf'\({lt}\s+"([^"]*)"\s+\(at\s+([\d.e+-]+)\s+([\d.e+-]+)\s+([\d.e+-]*)')
+                for m in lp.finditer(content):
+                    name = m.group(1)
+                    lx, ly = float(m.group(2)), float(m.group(3))
+                    angle = float(m.group(4)) if m.group(4) else 0
+                    # Approximate label bbox: shape body ~3mm + text ~0.7mm/char
+                    text_w = 3.0 + len(name) * 0.7
+                    text_h = 1.5
+                    # Rotate bbox for vertical labels
+                    if angle in (90, 270):
+                        text_w, text_h = text_h, text_w
+                    label_boxes.append((name, lx, ly, text_w / 2, text_h / 2))
+
+            # Check overlaps
+            critical = []   # component-body overlaps
+            warning = []    # label-component overlaps or close components
+            info_count = 0  # suppressed low-priority
+
+            # Component vs component
+            for i in range(len(components)):
+                for j in range(i + 1, len(components)):
+                    r1, x1, y1, hw1, hh1, lid1 = components[i]
+                    r2, x2, y2, hw2, hh2, lid2 = components[j]
+
+                    if r1.startswith("#PWR") or r2.startswith("#PWR"):
+                        continue
+                    if abs(x1 - x2) < 0.01 and abs(y1 - y2) < 0.01:
+                        continue
+
+                    dx = abs(x1 - x2)
+                    dy = abs(y1 - y2)
+                    gap = max(dx - (hw1 + hw2), dy - (hh1 + hh2))
+
+                    if gap < 0:
+                        critical.append({
+                            "pair": f"{r1} <-> {r2}",
+                            "gap": f"{gap:.1f}mm (overlapping)",
+                            "positions": f"({x1:.1f},{y1:.1f}) ({x2:.1f},{y2:.1f})",
+                            "severity": "critical",
+                        })
+                    elif gap < clearance:
+                        warning.append({
+                            "pair": f"{r1} <-> {r2}",
+                            "gap": f"{gap:.1f}mm",
+                            "positions": f"({x1:.1f},{y1:.1f}) ({x2:.1f},{y2:.1f})",
+                            "severity": "warning",
+                        })
+
+            # Label vs component (global labels have visible bodies)
+            for lname, lx, ly, lhw, lhh in label_boxes:
+                for ref, cx, cy, chw, chh, lid in components:
+                    if ref.startswith("#PWR"):
+                        continue
+                    dx = abs(lx - cx)
+                    dy = abs(ly - cy)
+                    gap = max(dx - (lhw + chw), dy - (lhh + chh))
+
+                    if gap < 0:
+                        warning.append({
+                            "pair": f"label:{lname} <-> {ref}",
+                            "gap": f"{gap:.1f}mm (overlapping)",
+                            "positions": f"({lx:.1f},{ly:.1f}) ({cx:.1f},{cy:.1f})",
+                            "severity": "warning",
+                        })
+
+            # Sort by gap
+            critical.sort(key=lambda x: float(x["gap"].split("mm")[0]))
+            warning.sort(key=lambda x: float(x["gap"].split("mm")[0]))
+
+            # Cap output
+            max_results = 50
+            total = len(critical) + len(warning)
+            suppressed = max(0, total - max_results)
+            critical = critical[:max_results]
+            remaining = max_results - len(critical)
+            warning = warning[:remaining] if remaining > 0 else []
+
+            summary = f"{len(critical)} critical, {len(warning)} warning"
+            if suppressed > 0:
+                summary += f", {suppressed} suppressed"
+
+            return {
+                "success": True,
+                "summary": summary,
+                "critical": critical,
+                "warning": warning,
+                "counts": {"critical": len(critical), "warning": len(warning), "suppressed": suppressed},
+            }
+
+        except Exception as e:
+            logger.error(f"Error checking overlaps: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e)}
+
+    def _handle_get_pin_connections(self, params):
+        """For a given component, show each pin and what it's connected to."""
+        logger.info("Getting pin connections")
+        try:
+            import re
+            from pathlib import Path
+            from commands.pin_locator import PinLocator
+            import math
+
+            schematic_path = params.get("schematicPath")
+            reference = params.get("reference")
+
+            if not schematic_path or not reference:
+                return {"success": False, "message": "schematicPath and reference are required"}
+
+            sch_file = Path(schematic_path)
+            schematic = SchematicManager.load_schematic(schematic_path)
+            if not schematic:
+                return {"success": False, "message": "Failed to load schematic"}
+
+            with open(schematic_path, "r", encoding="utf-8") as f:
+                content = f.read()
+
+            locator = PinLocator()
+            tolerance = 0.5
+
+            # Find the symbol
+            target = None
+            for symbol in schematic.symbol:
+                if not hasattr(symbol.property, "Reference"):
+                    continue
+                if symbol.property.Reference.value == reference:
+                    target = symbol
+                    break
+            if not target:
+                return {"success": False, "message": f"Component {reference} not found"}
+
+            lib_id = target.lib_id.value if hasattr(target, "lib_id") else ""
+            position = target.at.value if hasattr(target, "at") else [0, 0, 0]
+            sx, sy = float(position[0]), float(position[1])
+            sym_rot = float(position[2]) if len(position) > 2 else 0.0
+
+            pins_def = locator.get_symbol_pins(sch_file, lib_id) if lib_id else {}
+
+            # Get wire endpoints and labels from file
+            wire_endpoints = []
+            wire_pat = re.compile(r'\(wire\b')
+            for m in wire_pat.finditer(content):
+                pos = m.start()
+                depth = 0
+                end = pos
+                while end < len(content):
+                    if content[end] == "(": depth += 1
+                    elif content[end] == ")":
+                        depth -= 1
+                        if depth == 0: end += 1; break
+                    end += 1
+                block = content[pos:end]
+                xy_ms = re.findall(r'\(xy\s+([\d.e+-]+)\s+([\d.e+-]+)\)', block)
+                for xm in xy_ms:
+                    wire_endpoints.append((float(xm[0]), float(xm[1])))
+
+            label_map = []
+            for lt in ["label", "global_label"]:
+                lp = re.compile(rf'\({lt}\s+"([^"]*)"\s+\(at\s+([\d.e+-]+)\s+([\d.e+-]+)')
+                for m in lp.finditer(content):
+                    label_map.append((float(m.group(2)), float(m.group(3)), m.group(1), lt))
+
+            # Collect power symbol pin positions (these act as net sources)
+            # Power symbols have lib_id "power:XXX" — their Value is the net name
+            power_pins = []  # [(x, y, net_name)]
+            lib_sym_start = content.find("(lib_symbols")
+            lib_sym_end_pos = -1
+            if lib_sym_start >= 0:
+                depth_ls = 0
+                for _i in range(lib_sym_start, len(content)):
+                    if content[_i] == "(": depth_ls += 1
+                    elif content[_i] == ")":
+                        depth_ls -= 1
+                        if depth_ls == 0:
+                            lib_sym_end_pos = _i
+                            break
+
+            pwr_sym_pat = re.compile(r'\(symbol\s+\(lib_id\s+"power:([^"]+)"\)')
+            for pm in pwr_sym_pat.finditer(content):
+                ppos = pm.start()
+                # Skip if inside lib_symbols
+                if lib_sym_start >= 0 and lib_sym_start <= ppos <= lib_sym_end_pos:
+                    continue
+                # Find the (at X Y ...) of this power symbol
+                pend = ppos + 200  # power symbol blocks are small
+                if pend > len(content): pend = len(content)
+                snippet = content[ppos:pend]
+                at_m = re.search(r'\(at\s+([\d.e+-]+)\s+([\d.e+-]+)', snippet)
+                val_m = re.search(r'\(property\s+"Value"\s+"([^"]*)"', snippet)
+                if at_m:
+                    px, py = float(at_m.group(1)), float(at_m.group(2))
+                    pnet = val_m.group(1) if val_m else pm.group(1)
+                    power_pins.append((px, py, pnet))
+
+            # For each pin, determine connection status
+            pin_results = []
+            for pin_num, pd in (pins_def or {}).items():
+                prx, pry = pd["x"], -pd["y"]
+                if sym_rot != 0:
+                    prx, pry = PinLocator.rotate_point(prx, pry, sym_rot)
+                # Pin (at) IS the endpoint — no length math
+                ex = round(sx + prx, 4)
+                ey = round(sy + pry, 4)
+
+                # Check what's at this endpoint and along connected wires
+                net_name = None
+                has_wire = False
+
+                # Collect all wire points reachable from this pin endpoint
+                connected_points = set()
+                connected_points.add((round(ex, 1), round(ey, 1)))
+                for wx, wy in wire_endpoints:
+                    if abs(ex - wx) < tolerance and abs(ey - wy) < tolerance:
+                        has_wire = True
+                        connected_points.add((round(wx, 1), round(wy, 1)))
+
+                # Follow wires transitively to find all connected points
+                if has_wire:
+                    changed = True
+                    while changed:
+                        changed = False
+                        for wi in range(0, len(wire_endpoints), 2):
+                            if wi + 1 >= len(wire_endpoints):
+                                break
+                            w1 = (round(wire_endpoints[wi][0], 1), round(wire_endpoints[wi][1], 1))
+                            w2 = (round(wire_endpoints[wi+1][0], 1), round(wire_endpoints[wi+1][1], 1))
+                            if w1 in connected_points and w2 not in connected_points:
+                                connected_points.add(w2)
+                                changed = True
+                            elif w2 in connected_points and w1 not in connected_points:
+                                connected_points.add(w1)
+                                changed = True
+
+                # Check labels at any connected point
+                for lx, ly, name, lt in label_map:
+                    lkey = (round(lx, 1), round(ly, 1))
+                    if lkey in connected_points or (abs(ex - lx) < tolerance and abs(ey - ly) < tolerance):
+                        net_name = name
+                        break
+
+                # Check power symbols at any connected point
+                if not net_name:
+                    for ppx, ppy, pnet in power_pins:
+                        pkey = (round(ppx, 1), round(ppy, 1))
+                        if pkey in connected_points or (abs(ex - ppx) < tolerance and abs(ey - ppy) < tolerance):
+                            net_name = pnet
+                            break
+
+                status = "unconnected"
+                if net_name:
+                    status = f"net:{net_name}"
+                elif has_wire:
+                    status = "wire (no label)"
+
+                pin_results.append({
+                    "pin": pin_num,
+                    "name": pd.get("name", pin_num),
+                    "endpoint": {"x": ex, "y": ey},
+                    "status": status,
+                    "netName": net_name,
+                })
+
+            return {
+                "success": True,
+                "reference": reference,
+                "pins": pin_results,
+            }
+
+        except Exception as e:
+            logger.error(f"Error in get_pin_connections: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e)}
+
     def _handle_get_schematic_view(self, params):
         """Get a rasterised image of the schematic (SVG export → optional PNG conversion)"""
         logger.info("Getting schematic view")
@@ -1620,6 +2927,7 @@ class KiCADInterface:
             fmt = params.get("format", "png")
             width = params.get("width", 1200)
             height = params.get("height", 900)
+            region = params.get("region")  # {x, y, width, height} in schematic mm
 
             # Step 1: Export schematic to SVG via kicad-cli
             with tempfile.TemporaryDirectory() as tmpdir:
@@ -1652,6 +2960,47 @@ class KiCADInterface:
                         "message": "No SVG file produced by kicad-cli",
                     }
                 svg_path = svg_files[0]
+
+                # Step 1.5: If region specified, crop SVG by modifying viewBox
+                if region:
+                    import re as _re
+                    with open(svg_path, "r", encoding="utf-8") as f:
+                        svg_content = f.read()
+
+                    rx = float(region.get("x", 0))
+                    ry = float(region.get("y", 0))
+                    rw = float(region.get("width", 50))
+                    rh = float(region.get("height", 50))
+
+                    # KiCad SVG uses mm units with a scale factor (typically 1 SVG unit = 1mm,
+                    # but the viewBox may have an offset). Parse existing viewBox to find the
+                    # coordinate system, then replace with our region.
+                    # KiCad SVGs use style="...; width:NNmm; height:NNmm" and viewBox="x y w h"
+                    # The viewBox coordinates are in internal units (mils or mm depending on version).
+                    # KiCad 9 SVGs use mm in viewBox directly.
+
+                    # Replace viewBox with our region
+                    svg_content = _re.sub(
+                        r'viewBox="[^"]*"',
+                        f'viewBox="{rx} {ry} {rw} {rh}"',
+                        svg_content,
+                    )
+                    # Also update width/height attributes to match aspect ratio
+                    svg_content = _re.sub(
+                        r'width="[^"]*"',
+                        f'width="{rw}mm"',
+                        svg_content,
+                        count=1,
+                    )
+                    svg_content = _re.sub(
+                        r'height="[^"]*"',
+                        f'height="{rh}mm"',
+                        svg_content,
+                        count=1,
+                    )
+
+                    with open(svg_path, "w", encoding="utf-8") as f:
+                        f.write(svg_content)
 
                 if fmt == "svg":
                     with open(svg_path, "r", encoding="utf-8") as f:
@@ -1720,8 +3069,15 @@ class KiCADInterface:
             lib_id_filter = filter_params.get("libId", "")
             ref_prefix_filter = filter_params.get("referencePrefix", "")
 
+            # Create PinLocator once; pin_definition_cache is shared across calls
+            # so get_symbol_pins only parses the file once per lib_id.
             locator = PinLocator()
             components = []
+
+            # Pre-cache: parse pin definitions from the schematic file once
+            # (get_symbol_pins reads the file but caches by lib_id, so subsequent
+            # calls for the same lib_id are free)
+            import math
 
             for symbol in schematic.symbol:
                 if not hasattr(symbol.property, "Reference"):
@@ -1752,31 +3108,43 @@ class KiCADInterface:
                 position = symbol.at.value if hasattr(symbol, "at") else [0, 0, 0]
                 uuid_val = symbol.uuid.value if hasattr(symbol, "uuid") else ""
 
+                sym_x = float(position[0])
+                sym_y = float(position[1])
+                sym_rot = float(position[2]) if len(position) > 2 else 0.0
+
                 comp = {
                     "reference": ref,
                     "libId": lib_id,
                     "value": value,
                     "footprint": footprint,
-                    "position": {"x": float(position[0]), "y": float(position[1])},
-                    "rotation": float(position[2]) if len(position) > 2 else 0,
+                    "position": {"x": sym_x, "y": sym_y},
+                    "rotation": sym_rot,
                     "uuid": str(uuid_val),
                 }
 
-                # Get pins if available
+                # Compute pin positions inline using cached pin definitions
+                # (avoids re-reading the schematic file for every component)
                 try:
-                    all_pins = locator.get_all_symbol_pins(sch_file, ref)
-                    if all_pins:
-                        pins_def = locator.get_symbol_pins(sch_file, lib_id) or {}
+                    pins_def = locator.get_symbol_pins(sch_file, lib_id) if lib_id else {}
+                    if pins_def:
                         pin_list = []
-                        for pin_num, coords in all_pins.items():
+                        for pin_num, pin_data in pins_def.items():
+                            pin_rel_x = pin_data["x"]
+                            pin_rel_y = -pin_data["y"]  # Y-negate: symbol-local Y-up → schematic Y-down
+                            # Apply symbol rotation
+                            if sym_rot != 0:
+                                pin_rel_x, pin_rel_y = PinLocator.rotate_point(
+                                    pin_rel_x, pin_rel_y, sym_rot
+                                )
+                            # Pin (at) IS the endpoint — no length math
+                            ep_x = round(sym_x + pin_rel_x, 4)
+                            ep_y = round(sym_y + pin_rel_y, 4)
+
                             pin_info = {
                                 "number": pin_num,
-                                "position": {"x": coords[0], "y": coords[1]},
+                                "name": pin_data.get("name", pin_num),
+                                "position": {"x": ep_x, "y": ep_y},
                             }
-                            if pin_num in pins_def:
-                                pin_info["name"] = pins_def[pin_num].get(
-                                    "name", pin_num
-                                )
                             pin_list.append(pin_info)
                         comp["pins"] = pin_list
                 except Exception:
@@ -1794,11 +3162,14 @@ class KiCADInterface:
             return {"success": False, "message": str(e)}
 
     def _handle_list_schematic_nets(self, params):
-        """List all nets in a schematic with their connections"""
+        """List all nets in a schematic with label positions.
+
+        This is a fast operation that only collects net names and their label
+        locations.  For detailed connection tracing use get_net_connections
+        on individual nets.
+        """
         logger.info("Listing schematic nets")
         try:
-            from pathlib import Path
-
             schematic_path = params.get("schematicPath")
             if not schematic_path:
                 return {"success": False, "message": "schematicPath is required"}
@@ -1807,26 +3178,38 @@ class KiCADInterface:
             if not schematic:
                 return {"success": False, "message": "Failed to load schematic"}
 
-            # Get all net names from labels and global labels
-            net_names = set()
+            # Collect net names and their label positions (fast — no wire tracing)
+            net_labels = {}  # net_name -> list of {x, y, type}
             if hasattr(schematic, "label"):
                 for label in schematic.label:
                     if hasattr(label, "value"):
-                        net_names.add(label.value)
+                        name = label.value
+                        pos = {}
+                        if hasattr(label, "at") and hasattr(label.at, "value"):
+                            p = label.at.value
+                            pos = {"x": float(p[0]), "y": float(p[1])}
+                        if name not in net_labels:
+                            net_labels[name] = []
+                        net_labels[name].append({**pos, "type": "label"})
             if hasattr(schematic, "global_label"):
                 for label in schematic.global_label:
                     if hasattr(label, "value"):
-                        net_names.add(label.value)
+                        name = label.value
+                        pos = {}
+                        if hasattr(label, "at") and hasattr(label.at, "value"):
+                            p = label.at.value
+                            pos = {"x": float(p[0]), "y": float(p[1])}
+                        if name not in net_labels:
+                            net_labels[name] = []
+                        net_labels[name].append({**pos, "type": "global_label"})
 
             nets = []
-            for net_name in sorted(net_names):
-                connections = ConnectionManager.get_net_connections(
-                    schematic, net_name, Path(schematic_path)
-                )
+            for net_name in sorted(net_labels):
                 nets.append(
                     {
                         "name": net_name,
-                        "connections": connections,
+                        "labelCount": len(net_labels[net_name]),
+                        "labels": net_labels[net_name],
                     }
                 )
 
@@ -1903,13 +3286,15 @@ class KiCADInterface:
                         pos = (
                             label.at.value
                             if hasattr(label, "at") and hasattr(label.at, "value")
-                            else [0, 0]
+                            else [0, 0, 0]
                         )
+                        angle = float(pos[2]) if len(pos) > 2 else 0
                         labels.append(
                             {
                                 "name": label.value,
                                 "type": "net",
                                 "position": {"x": float(pos[0]), "y": float(pos[1])},
+                                "angle": angle,
                             }
                         )
 
@@ -1920,13 +3305,15 @@ class KiCADInterface:
                         pos = (
                             label.at.value
                             if hasattr(label, "at") and hasattr(label.at, "value")
-                            else [0, 0]
+                            else [0, 0, 0]
                         )
+                        angle = float(pos[2]) if len(pos) > 2 else 0
                         labels.append(
                             {
                                 "name": label.value,
                                 "type": "global",
                                 "position": {"x": float(pos[0]), "y": float(pos[1])},
+                                "angle": angle,
                             }
                         )
 
@@ -1998,7 +3385,26 @@ class KiCADInterface:
 
                     # Preserve rotation (third element)
                     rotation = float(old_pos[2]) if len(old_pos) > 2 else 0
+
+                    # Calculate delta between old and new positions
+                    dx = new_x - float(old_pos[0])
+                    dy = new_y - float(old_pos[1])
+
+                    # Move the symbol itself
                     symbol.at.value = [new_x, new_y, rotation]
+
+                    # Move all property fields by the same delta
+                    for prop_name in ["Reference", "Value", "Footprint", "Datasheet"]:
+                        if hasattr(symbol.property, prop_name):
+                            prop = getattr(symbol.property, prop_name)
+                            if hasattr(prop, "at") and hasattr(prop.at, "value"):
+                                try:
+                                    prop_pos = list(prop.at.value)
+                                    prop_pos[0] = float(prop_pos[0]) + dx
+                                    prop_pos[1] = float(prop_pos[1]) + dy
+                                    prop.at.value = prop_pos
+                                except (TypeError, IndexError):
+                                    pass
 
                     SchematicManager.save_schematic(schematic, schematic_path)
                     return {
@@ -2138,7 +3544,63 @@ class KiCADInterface:
                 )
 
             SchematicManager.save_schematic(schematic, schematic_path)
-            return {"success": True, "annotated": annotated}
+
+            # After annotation, fix missing (instances) blocks for all components
+            # KiCad 9 requires (instances ...) for reference designators to display
+            from pathlib import Path
+            from commands.sexp_writer import add_instances_block
+
+            with open(schematic_path, "r", encoding="utf-8") as f:
+                content = f.read()
+
+            instances_added = 0
+            for symbol in schematic.symbol:
+                if not hasattr(symbol.property, "Reference"):
+                    continue
+                ref = symbol.property.Reference.value
+                if ref.startswith("_TEMPLATE") or ref.endswith("?"):
+                    continue
+                uuid_val = str(symbol.uuid.value) if hasattr(symbol, "uuid") else ""
+                if not uuid_val:
+                    continue
+
+                # Check if THIS symbol already has (instances by finding its
+                # block via balanced-paren search (works on single-line files)
+                uuid_pos = content.find(uuid_val)
+                if uuid_pos >= 0:
+                    # Walk backwards to find the (symbol that owns this UUID
+                    sym_start = content.rfind("(symbol", 0, uuid_pos)
+                    if sym_start >= 0:
+                        # Find end of this symbol block
+                        depth = 0
+                        si = sym_start
+                        while si < len(content):
+                            if content[si] == "(": depth += 1
+                            elif content[si] == ")":
+                                depth -= 1
+                                if depth == 0:
+                                    break
+                            si += 1
+                        sym_block = content[sym_start:si + 1]
+                        if "(instances" in sym_block:
+                            continue  # Already has instances
+
+                # Add instances block
+                try:
+                    add_instances_block(Path(schematic_path), uuid_val, ref)
+                    instances_added += 1
+                    # Re-read content since add_instances_block modifies the file
+                    with open(schematic_path, "r", encoding="utf-8") as f:
+                        content = f.read()
+                except Exception as inst_err:
+                    logger.warning(f"Failed to add instances for {ref}: {inst_err}")
+
+            if instances_added > 0:
+                logger.info(f"Added (instances) blocks for {instances_added} components")
+                for entry in annotated:
+                    entry["instancesAdded"] = True
+
+            return {"success": True, "annotated": annotated, "instancesFixed": instances_added}
 
         except Exception as e:
             logger.error(f"Error annotating schematic: {e}")
@@ -2288,9 +3750,13 @@ class KiCADInterface:
             return {"success": False, "message": str(e)}
 
     def _handle_get_net_connections(self, params):
-        """Get all connections for a named net"""
+        """Get all connections for a named net (supports labels AND power symbols)"""
         logger.info("Getting net connections")
         try:
+            import re
+            from pathlib import Path
+            from commands.pin_locator import PinLocator
+
             schematic_path = params.get("schematicPath")
             net_name = params.get("netName")
 
@@ -2301,8 +3767,49 @@ class KiCADInterface:
             if not schematic:
                 return {"success": False, "message": "Failed to load schematic"}
 
-            connections = ConnectionManager.get_net_connections(schematic, net_name)
-            return {"success": True, "connections": connections}
+            # Try the standard label-based approach first
+            connections = ConnectionManager.get_net_connections(
+                schematic, net_name, Path(schematic_path)
+            )
+
+            # Also search for power symbols with matching Value
+            with open(schematic_path, "r", encoding="utf-8") as f:
+                content = f.read()
+
+            # Skip lib_symbols
+            lib_sym_start = content.find("(lib_symbols")
+            lib_sym_end = -1
+            if lib_sym_start >= 0:
+                d = 0
+                for i in range(lib_sym_start, len(content)):
+                    if content[i] == "(": d += 1
+                    elif content[i] == ")":
+                        d -= 1
+                        if d == 0: lib_sym_end = i; break
+
+            pwr_refs = []
+            pwr_pat = re.compile(r'\(symbol\s+\(lib_id\s+"power:[^"]*"\)')
+            for m in pwr_pat.finditer(content):
+                pos = m.start()
+                if lib_sym_start >= 0 and lib_sym_start <= pos <= lib_sym_end:
+                    continue
+                # Check if Value matches net_name
+                snippet = content[pos:pos+500]
+                val_m = re.search(r'\(property\s+"Value"\s+"([^"]*)"', snippet)
+                ref_m = re.search(r'\(property\s+"Reference"\s+"([^"]*)"', snippet)
+                if val_m and val_m.group(1) == net_name:
+                    pwr_ref = ref_m.group(1) if ref_m else "?"
+                    at_m = re.search(r'\(at\s+([\d.e+-]+)\s+([\d.e+-]+)', snippet)
+                    if at_m:
+                        pwr_refs.append({
+                            "component": pwr_ref,
+                            "pin": "1",
+                            "type": "power_symbol",
+                            "position": {"x": float(at_m.group(1)), "y": float(at_m.group(2))},
+                        })
+
+            all_connections = connections + pwr_refs
+            return {"success": True, "connections": all_connections}
         except Exception as e:
             logger.error(f"Error getting net connections: {str(e)}")
             return {"success": False, "message": str(e)}
@@ -2343,6 +3850,7 @@ class KiCADInterface:
                     "erc",
                     "--format",
                     "json",
+                    "--severity-all",
                     "--output",
                     json_output,
                     schematic_path,
@@ -2353,12 +3861,15 @@ class KiCADInterface:
                     cmd, capture_output=True, text=True, timeout=120
                 )
 
-                if result.returncode != 0:
-                    logger.error(f"ERC command failed: {result.stderr}")
+                # kicad-cli returns non-zero when violations are found — that's normal.
+                # Only treat as failure if the JSON output file wasn't created.
+                if not os.path.exists(json_output) or os.path.getsize(json_output) == 0:
+                    logger.error(f"ERC command produced no output: {result.stderr}")
                     return {
                         "success": False,
-                        "message": "ERC command failed",
+                        "message": "ERC command failed to produce output",
                         "errorDetails": result.stderr,
+                        "returnCode": result.returncode,
                     }
 
                 with open(json_output, "r", encoding="utf-8") as f:
@@ -2367,7 +3878,14 @@ class KiCADInterface:
                 violations = []
                 severity_counts = {"error": 0, "warning": 0, "info": 0}
 
-                for v in erc_data.get("violations", []):
+                # KiCad 9 nests violations under sheets[*].violations
+                all_raw_violations = []
+                for sheet in erc_data.get("sheets", []):
+                    all_raw_violations.extend(sheet.get("violations", []))
+                # Also check top-level for older formats
+                all_raw_violations.extend(erc_data.get("violations", []))
+
+                for v in all_raw_violations:
                     vseverity = v.get("severity", "error")
                     items = v.get("items", [])
                     loc = {}
@@ -2595,6 +4113,201 @@ class KiCADInterface:
             logger.error(f"Error importing SVG logo: {str(e)}")
             import traceback
 
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e)}
+
+    # ── New batch / power tools ──────────────────────────────────────────
+
+    def _handle_add_power_symbol(self, params):
+        """Place a power port symbol (GND, +3V3, +5V, VCC, etc.) from the power library"""
+        logger.info("Adding power symbol to schematic")
+        try:
+            from pathlib import Path
+            from commands.dynamic_symbol_loader import DynamicSymbolLoader
+
+            schematic_path = params.get("schematicPath")
+            symbol_name = params.get("symbol")  # e.g. "GND", "+3V3", "+5V"
+            position = params.get("position", {})
+            orientation = params.get("orientation", 0)
+            x = position.get("x", 0) if isinstance(position, dict) else 0
+            y = position.get("y", 0) if isinstance(position, dict) else 0
+
+            if not schematic_path or not symbol_name:
+                return {"success": False, "message": "schematicPath and symbol are required"}
+
+            schematic_file = Path(schematic_path)
+            derived_project_path = schematic_file.parent
+            loader = DynamicSymbolLoader(project_path=derived_project_path)
+
+            # Auto-number #PWR reference: find highest existing #PWR number
+            import re as _re
+            with open(schematic_file, "r", encoding="utf-8") as _f:
+                _content = _f.read()
+            existing_pwr = _re.findall(r'#PWR(\d+)', _content)
+            next_pwr = max((int(n) for n in existing_pwr), default=0) + 1
+            reference = f"#PWR{next_pwr:03d}"
+            loader.add_component(
+                schematic_file,
+                "power",
+                symbol_name,
+                reference=reference,
+                value=symbol_name,
+                footprint="",
+                x=x,
+                y=y,
+                rotation=orientation,
+                project_path=derived_project_path,
+            )
+
+            # Auto-hide the #PWR Reference field (matches KiCad's default behavior)
+            import re
+            with open(schematic_file, "r", encoding="utf-8") as f:
+                content = f.read()
+
+            # Find the last placed symbol with #PWR? reference and hide its Reference field
+            # Look for (property "Reference" "#PWR?" ... (effects (font ...))) and add (hide yes)
+            pwr_pattern = re.compile(
+                r'(\(property\s+"Reference"\s+"#PWR\?"\s+\(at[^)]*\)\s*\(effects\s+\(font[^)]*\))(\s*\))',
+            )
+            # Replace only the LAST occurrence (the one we just added)
+            matches = list(pwr_pattern.finditer(content))
+            if matches:
+                m = matches[-1]
+                content = content[:m.start()] + m.group(1) + " (hide yes)" + m.group(2) + content[m.end():]
+                with open(schematic_file, "w", encoding="utf-8", newline="\n") as f:
+                    f.write(content)
+
+            return {
+                "success": True,
+                "message": f"Placed power symbol {symbol_name} at ({x}, {y})",
+                "symbol": f"power:{symbol_name}",
+            }
+        except Exception as e:
+            logger.error(f"Error adding power symbol: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e)}
+
+    def _handle_batch_connect_to_net(self, params):
+        """Connect multiple component pins to named nets in a single call"""
+        logger.info("Batch connecting pins to nets")
+        try:
+            from pathlib import Path
+
+            schematic_path = params.get("schematicPath")
+            connections = params.get("connections", [])
+
+            if not schematic_path:
+                return {"success": False, "message": "schematicPath is required"}
+            if not connections:
+                return {"success": False, "message": "connections array is required"}
+
+            results = {"connected": [], "failed": []}
+            for conn in connections:
+                ref = conn.get("componentRef")
+                pin = conn.get("pinName")
+                net = conn.get("netName")
+                label_type = conn.get("labelType")
+                shape = conn.get("shape")
+
+                if not all([ref, pin, net]):
+                    results["failed"].append(f"Missing fields in {conn}")
+                    continue
+
+                try:
+                    success = ConnectionManager.connect_to_net(
+                        Path(schematic_path), ref, pin, net,
+                        label_type=label_type, shape=shape,
+                    )
+                    if success:
+                        results["connected"].append(f"{ref}/{pin} -> {net}")
+                    else:
+                        results["failed"].append(f"{ref}/{pin} -> {net}")
+                except Exception as e:
+                    results["failed"].append(f"{ref}/{pin} -> {net}: {e}")
+
+            n_ok = len(results["connected"])
+            n_fail = len(results["failed"])
+            return {
+                "success": n_fail == 0,
+                "message": f"Batch connect: {n_ok} connected, {n_fail} failed",
+                "connected": results["connected"],
+                "failed": results["failed"],
+            }
+        except Exception as e:
+            logger.error(f"Error in batch connect_to_net: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e)}
+
+    def _handle_bulk_move_schematic_components(self, params):
+        """Move multiple schematic components to new positions in a single call"""
+        logger.info("Bulk moving schematic components")
+        try:
+            schematic_path = params.get("schematicPath")
+            moves = params.get("moves", {})
+
+            if not schematic_path:
+                return {"success": False, "message": "schematicPath is required"}
+            if not moves:
+                return {"success": False, "message": "moves dict is required"}
+
+            schematic = SchematicManager.load_schematic(schematic_path)
+            if not schematic:
+                return {"success": False, "message": "Failed to load schematic"}
+
+            moved = []
+            failed = []
+
+            for reference, pos in moves.items():
+                new_x = pos.get("x")
+                new_y = pos.get("y")
+                if new_x is None or new_y is None:
+                    failed.append(f"{reference}: missing x or y")
+                    continue
+
+                found = False
+                for symbol in schematic.symbol:
+                    if not hasattr(symbol.property, "Reference"):
+                        continue
+                    if symbol.property.Reference.value == reference:
+                        old_pos = list(symbol.at.value)
+                        dx = new_x - float(old_pos[0])
+                        dy = new_y - float(old_pos[1])
+                        rotation = float(old_pos[2]) if len(old_pos) > 2 else 0
+                        symbol.at.value = [new_x, new_y, rotation]
+
+                        # Move all property fields by the same delta
+                        for prop_name in ["Reference", "Value", "Footprint", "Datasheet"]:
+                            try:
+                                if hasattr(symbol.property, prop_name):
+                                    prop = getattr(symbol.property, prop_name)
+                                    if hasattr(prop, "at") and hasattr(prop.at, "value"):
+                                        prop_pos = list(prop.at.value)
+                                        prop_pos[0] = float(prop_pos[0]) + dx
+                                        prop_pos[1] = float(prop_pos[1]) + dy
+                                        prop.at.value = prop_pos
+                            except Exception:
+                                pass
+
+                        moved.append(reference)
+                        found = True
+                        break
+
+                if not found:
+                    failed.append(f"{reference}: not found")
+
+            SchematicManager.save_schematic(schematic, schematic_path)
+
+            return {
+                "success": len(failed) == 0,
+                "message": f"Bulk move: {len(moved)} moved, {len(failed)} failed",
+                "moved": moved,
+                "failed": failed,
+            }
+        except Exception as e:
+            logger.error(f"Error in bulk move: {str(e)}")
+            import traceback
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
 
