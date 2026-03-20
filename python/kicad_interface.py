@@ -410,11 +410,16 @@ class KiCADInterface:
             "batch_edit_schematic_components": self._handle_batch_edit_schematic_components,
             "batch_delete_schematic_components": self._handle_batch_delete_schematic_components,
             "add_no_connect": self._handle_add_no_connect,
+            "add_junction": self._handle_add_junction,
+            "batch_add_junction": self._handle_batch_add_junction,
             "add_schematic_text": self._handle_add_schematic_text,
             "rotate_schematic_label": self._handle_rotate_schematic_label,
+            "batch_rotate_labels": self._handle_batch_rotate_labels,
             "find_orphan_items": self._handle_find_orphan_items,
             "check_schematic_overlaps": self._handle_check_schematic_overlaps,
             "get_pin_connections": self._handle_get_pin_connections,
+            "get_net_connectivity": self._handle_get_net_connectivity,
+            "validate_wire_connections": self._handle_validate_wire_connections,
             # UI/Process management commands
             "check_kicad_ui": self._handle_check_kicad_ui,
             "launch_kicad_ui": self._handle_launch_kicad_ui,
@@ -1165,6 +1170,484 @@ class KiCADInterface:
             return {"success": False, "message": "Failed to add no-connect"}
         except Exception as e:
             logger.error(f"Error adding no-connect: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e)}
+
+    def _handle_add_junction(self, params):
+        """Add a junction dot at a position (T-connections on wires)."""
+        logger.info("Adding junction")
+        try:
+            from pathlib import Path
+            from commands.sexp_writer import add_junction
+
+            schematic_path = params.get("schematicPath")
+            position = params.get("position", {})
+
+            if not schematic_path:
+                return {"success": False, "message": "schematicPath is required"}
+
+            x = position.get("x", 0) if isinstance(position, dict) else position[0]
+            y = position.get("y", 0) if isinstance(position, dict) else position[1]
+            diameter = float(params.get("diameter", 0))
+
+            success = add_junction(Path(schematic_path), [x, y], diameter=diameter)
+            if success:
+                return {"success": True, "message": f"Added junction at ({x}, {y})"}
+            return {"success": False, "message": "Failed to add junction"}
+        except Exception as e:
+            logger.error(f"Error adding junction: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e)}
+
+    def _handle_batch_add_junction(self, params):
+        """Add multiple junction dots in one call."""
+        logger.info("Batch adding junctions")
+        try:
+            from pathlib import Path
+            from commands.sexp_writer import add_junction
+
+            schematic_path = params.get("schematicPath")
+            positions = params.get("positions", [])
+
+            if not schematic_path:
+                return {"success": False, "message": "schematicPath is required"}
+            if not positions:
+                return {"success": False, "message": "positions array is required"}
+
+            sch_path = Path(schematic_path)
+            added = 0
+            failed = []
+            for pos in positions:
+                x = pos.get("x", 0) if isinstance(pos, dict) else pos[0]
+                y = pos.get("y", 0) if isinstance(pos, dict) else pos[1]
+                if add_junction(sch_path, [x, y]):
+                    added += 1
+                else:
+                    failed.append({"x": x, "y": y})
+
+            return {
+                "success": True,
+                "message": f"Added {added}/{len(positions)} junctions",
+                "added": added,
+                "failed": failed,
+            }
+        except Exception as e:
+            logger.error(f"Error in batch_add_junction: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e)}
+
+    def _handle_batch_rotate_labels(self, params):
+        """Rotate multiple labels in one call."""
+        logger.info("Batch rotating labels")
+        try:
+            schematic_path = params.get("schematicPath")
+            rotations = params.get("rotations", [])
+
+            if not schematic_path:
+                return {"success": False, "message": "schematicPath is required"}
+            if not rotations:
+                return {"success": False, "message": "rotations array is required"}
+
+            results = []
+            for rot in rotations:
+                sub_params = {
+                    "schematicPath": schematic_path,
+                    "netName": rot.get("netName"),
+                    "angle": rot.get("angle"),
+                }
+                if "position" in rot:
+                    sub_params["position"] = rot["position"]
+                r = self._handle_rotate_schematic_label(sub_params)
+                results.append({
+                    "netName": rot.get("netName"),
+                    "success": r.get("success", False),
+                    "message": r.get("message", ""),
+                })
+
+            succeeded = sum(1 for r in results if r["success"])
+            return {
+                "success": True,
+                "message": f"Rotated {succeeded}/{len(rotations)} labels",
+                "results": results,
+            }
+        except Exception as e:
+            logger.error(f"Error in batch_rotate_labels: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e)}
+
+    def _handle_get_net_connectivity(self, params):
+        """Get everything connected to a named net: pins, labels, wires, power symbols."""
+        logger.info("Getting net connectivity")
+        try:
+            import re
+            import math
+            from pathlib import Path
+            from commands.pin_locator import PinLocator
+
+            schematic_path = params.get("schematicPath")
+            net_name = params.get("netName")
+
+            if not schematic_path:
+                return {"success": False, "message": "schematicPath is required"}
+            if not net_name:
+                return {"success": False, "message": "netName is required"}
+
+            schematic = SchematicManager.load_schematic(schematic_path)
+            if not schematic:
+                return {"success": False, "message": "Failed to load schematic"}
+
+            sch_file = Path(schematic_path)
+            locator = PinLocator()
+
+            with open(schematic_path, "r", encoding="utf-8") as f:
+                content = f.read()
+
+            # ── Collect label positions for this net ──
+            labels = []
+            for lt in ["label", "global_label", "hierarchical_label"]:
+                escaped = re.escape(net_name)
+                pat = re.compile(
+                    rf'\({lt}\s+"{escaped}"(?:\s+\(shape\s+[^)]*\))?\s+\(at\s+([\d.e+-]+)\s+([\d.e+-]+)\s*([\d.e+-]*)'
+                )
+                for m in pat.finditer(content):
+                    lx, ly = float(m.group(1)), float(m.group(2))
+                    angle = float(m.group(3)) if m.group(3) else 0
+                    labels.append({
+                        "type": lt,
+                        "at": [lx, ly],
+                        "angle": angle,
+                    })
+
+            # ── Collect power symbols for this net ──
+            power_labels = []
+            if hasattr(schematic, "symbol"):
+                for symbol in schematic.symbol:
+                    if not hasattr(symbol.property, "Reference"):
+                        continue
+                    ref = symbol.property.Reference.value
+                    if not ref.startswith("#PWR"):
+                        continue
+                    val = symbol.property.Value.value if hasattr(symbol.property, "Value") else ""
+                    if val != net_name:
+                        continue
+                    pos = symbol.at.value if hasattr(symbol, "at") else [0, 0, 0]
+                    power_labels.append({
+                        "type": "power",
+                        "reference": ref,
+                        "at": [float(pos[0]), float(pos[1])],
+                    })
+
+            # ── All net points (label positions + power positions) ──
+            net_points = set()
+            for lb in labels:
+                net_points.add((lb["at"][0], lb["at"][1]))
+            for pw in power_labels:
+                net_points.add((pw["at"][0], pw["at"][1]))
+
+            # ── Collect ALL wires ──
+            all_wires = []
+            wire_pat = re.compile(r'\(wire\b')
+            xy_pat = re.compile(r'\(xy\s+([\d.e+-]+)\s+([\d.e+-]+)\)')
+            for wm in wire_pat.finditer(content):
+                depth = 0
+                i = wm.start()
+                block_end = i
+                while i < len(content):
+                    if content[i] == '(':
+                        depth += 1
+                    elif content[i] == ')':
+                        depth -= 1
+                        if depth == 0:
+                            block_end = i + 1
+                            break
+                    i += 1
+                block = content[wm.start():block_end]
+                xys = xy_pat.findall(block)
+                if len(xys) >= 2:
+                    all_wires.append((
+                        float(xys[0][0]), float(xys[0][1]),
+                        float(xys[-1][0]), float(xys[-1][1]),
+                    ))
+
+            # ── Find component pins that match net_points via wire tracing ──
+            # Build wire adjacency: which points are connected by wires
+            eps = 0.5
+            connected_points = set(net_points)
+            changed = True
+            while changed:
+                changed = False
+                for wx1, wy1, wx2, wy2 in all_wires:
+                    p1 = (wx1, wy1)
+                    p2 = (wx2, wy2)
+                    p1_in = any(abs(p1[0] - cp[0]) < eps and abs(p1[1] - cp[1]) < eps for cp in connected_points)
+                    p2_in = any(abs(p2[0] - cp[0]) < eps and abs(p2[1] - cp[1]) < eps for cp in connected_points)
+                    if p1_in and not p2_in:
+                        connected_points.add(p2)
+                        changed = True
+                    elif p2_in and not p1_in:
+                        connected_points.add(p1)
+                        changed = True
+
+            # ── Wires on this net ──
+            net_wires = []
+            for wx1, wy1, wx2, wy2 in all_wires:
+                p1_in = any(abs(wx1 - cp[0]) < eps and abs(wy1 - cp[1]) < eps for cp in connected_points)
+                p2_in = any(abs(wx2 - cp[0]) < eps and abs(wy2 - cp[1]) < eps for cp in connected_points)
+                if p1_in or p2_in:
+                    net_wires.append({"start": [wx1, wy1], "end": [wx2, wy2]})
+
+            # ── Component pins on this net ──
+            pins = []
+            if hasattr(schematic, "symbol"):
+                for symbol in schematic.symbol:
+                    if not hasattr(symbol.property, "Reference"):
+                        continue
+                    ref = symbol.property.Reference.value
+                    if ref.startswith("_TEMPLATE") or ref.startswith("#PWR"):
+                        continue
+                    lib_id = symbol.lib_id.value if hasattr(symbol, "lib_id") else ""
+                    position = symbol.at.value if hasattr(symbol, "at") else [0, 0, 0]
+                    sym_x, sym_y = float(position[0]), float(position[1])
+                    sym_rot = float(position[2]) if len(position) > 2 else 0.0
+
+                    mirror_x = False
+                    mirror_y = False
+                    if hasattr(symbol, "mirror"):
+                        mirror_val = str(symbol.mirror.value) if hasattr(symbol.mirror, "value") else str(symbol.mirror)
+                        mirror_x = "x" in mirror_val
+                        mirror_y = "y" in mirror_val
+
+                    pins_def = locator.get_symbol_pins(sch_file, lib_id)
+                    if not pins_def:
+                        continue
+
+                    for pin_name, pd in pins_def.items():
+                        import math as _math
+                        pin_rel_x = pd["x"]
+                        pin_rel_y = -pd["y"]  # Y-up to Y-down
+                        if mirror_x:
+                            pin_rel_y = -pin_rel_y
+                        if mirror_y:
+                            pin_rel_x = -pin_rel_x
+                        rad = _math.radians(sym_rot)
+                        cos_r, sin_r = _math.cos(rad), _math.sin(rad)
+                        rot_x = pin_rel_x * cos_r - pin_rel_y * sin_r
+                        rot_y = pin_rel_x * sin_r + pin_rel_y * cos_r
+                        pin_x = sym_x + rot_x
+                        pin_y = sym_y + rot_y
+
+                        if any(abs(pin_x - cp[0]) < eps and abs(pin_y - cp[1]) < eps for cp in connected_points):
+                            pins.append({
+                                "ref": ref,
+                                "pin": pin_name,
+                                "at": [round(pin_x, 2), round(pin_y, 2)],
+                            })
+
+            return {
+                "success": True,
+                "netName": net_name,
+                "pins": pins,
+                "labels": labels + power_labels,
+                "wires": net_wires,
+                "connected": len(pins) > 0 or len(labels) > 0,
+                "counts": {
+                    "pins": len(pins),
+                    "labels": len(labels),
+                    "powerSymbols": len(power_labels),
+                    "wires": len(net_wires),
+                },
+            }
+        except Exception as e:
+            logger.error(f"Error getting net connectivity: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e)}
+
+    def _handle_validate_wire_connections(self, params):
+        """Check if specific pins are electrically connected. Targeted alternative to full ERC."""
+        logger.info("Validating wire connections")
+        try:
+            import re
+            import math
+            from pathlib import Path
+            from commands.pin_locator import PinLocator
+
+            schematic_path = params.get("schematicPath")
+            checks = params.get("checks", [])
+
+            if not schematic_path:
+                return {"success": False, "message": "schematicPath is required"}
+            if not checks:
+                return {"success": False, "message": "checks array is required"}
+
+            schematic = SchematicManager.load_schematic(schematic_path)
+            if not schematic:
+                return {"success": False, "message": "Failed to load schematic"}
+
+            sch_file = Path(schematic_path)
+            locator = PinLocator()
+
+            with open(schematic_path, "r", encoding="utf-8") as f:
+                content = f.read()
+
+            # Build all wire segments
+            all_wires = []
+            wire_pat = re.compile(r'\(wire\b')
+            xy_pat = re.compile(r'\(xy\s+([\d.e+-]+)\s+([\d.e+-]+)\)')
+            for wm in wire_pat.finditer(content):
+                depth = 0
+                i = wm.start()
+                block_end = i
+                while i < len(content):
+                    if content[i] == '(':
+                        depth += 1
+                    elif content[i] == ')':
+                        depth -= 1
+                        if depth == 0:
+                            block_end = i + 1
+                            break
+                    i += 1
+                block = content[wm.start():block_end]
+                xys = xy_pat.findall(block)
+                if len(xys) >= 2:
+                    all_wires.append((
+                        float(xys[0][0]), float(xys[0][1]),
+                        float(xys[-1][0]), float(xys[-1][1]),
+                    ))
+
+            # Collect all label positions → net name mapping
+            label_net_map = {}  # (x, y) → net_name
+            for lt in ["label", "global_label", "hierarchical_label"]:
+                lp = re.compile(
+                    rf'\({lt}\s+"([^"]*)"(?:\s+\(shape\s+[^)]*\))?\s+\(at\s+([\d.e+-]+)\s+([\d.e+-]+)'
+                )
+                for m in lp.finditer(content):
+                    name, lx, ly = m.group(1), float(m.group(2)), float(m.group(3))
+                    label_net_map[(lx, ly)] = name
+
+            # Collect power symbol positions → net name
+            if hasattr(schematic, "symbol"):
+                for symbol in schematic.symbol:
+                    if not hasattr(symbol.property, "Reference"):
+                        continue
+                    ref = symbol.property.Reference.value
+                    if not ref.startswith("#PWR"):
+                        continue
+                    val = symbol.property.Value.value if hasattr(symbol.property, "Value") else ""
+                    pos = symbol.at.value if hasattr(symbol, "at") else [0, 0, 0]
+                    label_net_map[(float(pos[0]), float(pos[1]))] = val
+
+            eps = 0.5
+
+            def find_pin_position(reference, pin_name):
+                """Find schematic position of a specific pin."""
+                for symbol in schematic.symbol:
+                    if not hasattr(symbol.property, "Reference"):
+                        continue
+                    if symbol.property.Reference.value != reference:
+                        continue
+                    lib_id = symbol.lib_id.value if hasattr(symbol, "lib_id") else ""
+                    position = symbol.at.value if hasattr(symbol, "at") else [0, 0, 0]
+                    sym_x, sym_y = float(position[0]), float(position[1])
+                    sym_rot = float(position[2]) if len(position) > 2 else 0.0
+
+                    mirror_x = False
+                    mirror_y = False
+                    if hasattr(symbol, "mirror"):
+                        mirror_val = str(symbol.mirror.value) if hasattr(symbol.mirror, "value") else str(symbol.mirror)
+                        mirror_x = "x" in mirror_val
+                        mirror_y = "y" in mirror_val
+
+                    pins_def = locator.get_symbol_pins(sch_file, lib_id)
+                    if pin_name not in pins_def:
+                        return None
+                    pd = pins_def[pin_name]
+                    pin_rel_x = pd["x"]
+                    pin_rel_y = -pd["y"]
+                    if mirror_x:
+                        pin_rel_y = -pin_rel_y
+                    if mirror_y:
+                        pin_rel_x = -pin_rel_x
+                    rad = math.radians(sym_rot)
+                    cos_r, sin_r = math.cos(rad), math.sin(rad)
+                    rot_x = pin_rel_x * cos_r - pin_rel_y * sin_r
+                    rot_y = pin_rel_x * sin_r + pin_rel_y * cos_r
+                    return (sym_x + rot_x, sym_y + rot_y)
+                return None
+
+            def trace_connectivity(start_point):
+                """Trace wire connectivity from a point, return all reachable points."""
+                reached = {start_point}
+                changed = True
+                while changed:
+                    changed = False
+                    for wx1, wy1, wx2, wy2 in all_wires:
+                        p1 = (wx1, wy1)
+                        p2 = (wx2, wy2)
+                        p1_in = any(abs(p1[0] - r[0]) < eps and abs(p1[1] - r[1]) < eps for r in reached)
+                        p2_in = any(abs(p2[0] - r[0]) < eps and abs(p2[1] - r[1]) < eps for r in reached)
+                        if p1_in and not p2_in:
+                            reached.add(p2)
+                            changed = True
+                        elif p2_in and not p1_in:
+                            reached.add(p1)
+                            changed = True
+                return reached
+
+            results = []
+            for check in checks:
+                ref = check.get("reference")
+                pin = check.get("pin")
+                expected_net = check.get("expectedNet")
+
+                pin_pos = find_pin_position(ref, pin)
+                if pin_pos is None:
+                    results.append({
+                        "reference": ref, "pin": pin,
+                        "connected": False,
+                        "message": f"Pin {pin} not found on {ref}",
+                    })
+                    continue
+
+                reachable = trace_connectivity(pin_pos)
+
+                # Find what net this connects to
+                found_net = None
+                for pt in reachable:
+                    for (lx, ly), net in label_net_map.items():
+                        if abs(pt[0] - lx) < eps and abs(pt[1] - ly) < eps:
+                            found_net = net
+                            break
+                    if found_net:
+                        break
+
+                r = {
+                    "reference": ref, "pin": pin,
+                    "pinPosition": [round(pin_pos[0], 2), round(pin_pos[1], 2)],
+                    "connected": found_net is not None,
+                    "netName": found_net,
+                }
+                if expected_net:
+                    r["expectedNet"] = expected_net
+                    r["match"] = found_net == expected_net
+                results.append(r)
+
+            all_ok = all(r.get("connected", False) for r in results)
+            if any("match" in r for r in results):
+                all_ok = all(r.get("match", r.get("connected", False)) for r in results)
+
+            return {
+                "success": True,
+                "allConnected": all_ok,
+                "results": results,
+                "summary": f"{sum(1 for r in results if r.get('connected'))} of {len(results)} pins connected",
+            }
+        except Exception as e:
+            logger.error(f"Error validating wire connections: {e}")
             import traceback
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
@@ -3440,9 +3923,11 @@ class KiCADInterface:
             return {"success": False, "message": str(e)}
 
     def _handle_list_schematic_labels(self, params):
-        """List all net labels and power flags in a schematic"""
+        """List all net labels and power flags in a schematic, with geometry."""
         logger.info("Listing schematic labels")
         try:
+            import math
+
             schematic_path = params.get("schematicPath")
             if not schematic_path:
                 return {"success": False, "message": "schematicPath is required"}
@@ -3450,6 +3935,46 @@ class KiCADInterface:
             schematic = SchematicManager.load_schematic(schematic_path)
             if not schematic:
                 return {"success": False, "message": "Failed to load schematic"}
+
+            def _label_geometry(name, lx, ly, angle, label_type):
+                """Compute connectionPoint and boundingBox for a label."""
+                # Connection point is always the (at) position
+                conn = {"x": lx, "y": ly}
+
+                # Compute bounding box from position + angle + text length
+                char_w = 0.75  # mm per char
+                text_len = len(name) * char_w
+                if label_type == "global":
+                    body = 3.0
+                elif label_type == "hierarchical":
+                    body = 3.0
+                else:
+                    body = 0.5
+                total_w = body + text_len
+                total_h = 1.8
+
+                rad = math.radians(angle)
+                cos_a, sin_a = math.cos(rad), math.sin(rad)
+                dx_text = cos_a * total_w
+                dy_text = sin_a * total_w
+                perp_dx = -sin_a * (total_h / 2)
+                perp_dy = cos_a * (total_h / 2)
+
+                corners_x = [
+                    lx + perp_dx, lx - perp_dx,
+                    lx + dx_text + perp_dx, lx + dx_text - perp_dx,
+                ]
+                corners_y = [
+                    ly + perp_dy, ly - perp_dy,
+                    ly + dy_text + perp_dy, ly + dy_text - perp_dy,
+                ]
+                bbox = {
+                    "x1": round(min(corners_x), 2),
+                    "y1": round(min(corners_y), 2),
+                    "x2": round(max(corners_x), 2),
+                    "y2": round(max(corners_y), 2),
+                }
+                return conn, bbox
 
             labels = []
 
@@ -3462,13 +3987,17 @@ class KiCADInterface:
                             if hasattr(label, "at") and hasattr(label.at, "value")
                             else [0, 0, 0]
                         )
+                        lx, ly = float(pos[0]), float(pos[1])
                         angle = float(pos[2]) if len(pos) > 2 else 0
+                        conn, bbox = _label_geometry(label.value, lx, ly, angle, "net")
                         labels.append(
                             {
                                 "name": label.value,
                                 "type": "net",
-                                "position": {"x": float(pos[0]), "y": float(pos[1])},
+                                "position": {"x": lx, "y": ly},
                                 "angle": angle,
+                                "connectionPoint": conn,
+                                "boundingBox": bbox,
                             }
                         )
 
@@ -3481,13 +4010,17 @@ class KiCADInterface:
                             if hasattr(label, "at") and hasattr(label.at, "value")
                             else [0, 0, 0]
                         )
+                        lx, ly = float(pos[0]), float(pos[1])
                         angle = float(pos[2]) if len(pos) > 2 else 0
+                        conn, bbox = _label_geometry(label.value, lx, ly, angle, "global")
                         labels.append(
                             {
                                 "name": label.value,
                                 "type": "global",
-                                "position": {"x": float(pos[0]), "y": float(pos[1])},
+                                "position": {"x": lx, "y": ly},
                                 "angle": angle,
+                                "connectionPoint": conn,
+                                "boundingBox": bbox,
                             }
                         )
 
@@ -3507,13 +4040,15 @@ class KiCADInterface:
                         else ref
                     )
                     pos = symbol.at.value if hasattr(symbol, "at") else [0, 0, 0]
+                    lx, ly = float(pos[0]), float(pos[1])
                     angle = float(pos[2]) if len(pos) > 2 else 0
                     labels.append(
                         {
                             "name": value,
                             "type": "power",
-                            "position": {"x": float(pos[0]), "y": float(pos[1])},
+                            "position": {"x": lx, "y": ly},
                             "angle": angle,
+                            "connectionPoint": {"x": lx, "y": ly},
                         }
                     )
 
@@ -4061,14 +4596,33 @@ class KiCADInterface:
                 # Also check top-level for older formats
                 all_raw_violations.extend(erc_data.get("violations", []))
 
+                # Detect coordinate scale: kicad-cli may output coords
+                # in internal units (1/100mm) instead of mm. If the first
+                # coordinate is very small relative to typical schematic
+                # positions (< 10mm), assume it's 1/100mm and scale up.
+                coord_scale = 1.0
+                for v in all_raw_violations:
+                    items = v.get("items", [])
+                    if items and "pos" in items[0]:
+                        test_x = abs(items[0]["pos"].get("x", 0))
+                        test_y = abs(items[0]["pos"].get("y", 0))
+                        # Typical schematic coords are 20-300mm.
+                        # If both are < 5mm, they're probably in 1/100mm.
+                        if test_x > 0 and test_x < 5 and test_y < 5:
+                            coord_scale = 100.0
+                            logger.info(f"ERC coords appear scaled down, applying {coord_scale}x correction")
+                        break
+
                 for v in all_raw_violations:
                     vseverity = v.get("severity", "error")
                     items = v.get("items", [])
                     loc = {}
                     if items and "pos" in items[0]:
+                        raw_x = items[0]["pos"].get("x", 0)
+                        raw_y = items[0]["pos"].get("y", 0)
                         loc = {
-                            "x": items[0]["pos"].get("x", 0),
-                            "y": items[0]["pos"].get("y", 0),
+                            "x": round(raw_x * coord_scale, 2),
+                            "y": round(raw_y * coord_scale, 2),
                         }
                     violations.append(
                         {

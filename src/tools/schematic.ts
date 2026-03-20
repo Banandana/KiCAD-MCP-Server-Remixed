@@ -1407,4 +1407,83 @@ Note: operates on .kicad_sch files only. To modify a PCB footprint use edit_comp
       return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
     }
   );
+
+  // Add junction dot (T-connections)
+  server.tool(
+    "add_junction",
+    "Add a junction dot at a wire T-intersection. Required when wires meet at T-junctions — without junctions, KiCad won't recognize the electrical connection (causes ERC 'pin not connected' errors).",
+    {
+      schematicPath: z.string().describe("Path to the schematic file"),
+      position: z.object({ x: z.number(), y: z.number() }).describe("Position for the junction (must be at a wire intersection)"),
+      diameter: z.number().optional().describe("Junction dot diameter in mm (default: 0 = auto)"),
+    },
+    async (args) => {
+      const result = await callKicadScript("add_junction", args);
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    }
+  );
+
+  // Batch add junctions
+  server.tool(
+    "batch_add_junction",
+    "Add multiple junction dots in one call. Efficient for fixing many T-junction ERC errors at once.",
+    {
+      schematicPath: z.string().describe("Path to the schematic file"),
+      positions: z.array(z.object({ x: z.number(), y: z.number() })).describe("Array of positions for junction dots"),
+    },
+    async (args) => {
+      const result = await callKicadScript("batch_add_junction", args);
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    }
+  );
+
+  // Batch rotate labels
+  server.tool(
+    "batch_rotate_labels",
+    "Rotate multiple net labels in one call. Each rotation specifies netName, angle, and optional position for disambiguation.",
+    {
+      schematicPath: z.string().describe("Path to the schematic file"),
+      rotations: z.array(z.object({
+        netName: z.string().describe("Label text/net name"),
+        angle: z.number().describe("New rotation angle (0, 90, 180, 270)"),
+        position: z.object({ x: z.number(), y: z.number() }).optional().describe("Position to disambiguate if multiple labels share the same name"),
+      })).describe("Array of label rotations"),
+    },
+    async (args) => {
+      const result = await callKicadScript("batch_rotate_labels", args);
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    }
+  );
+
+  // Get net connectivity — everything connected to a named net
+  server.tool(
+    "get_net_connectivity",
+    "Get everything connected to a named net: component pins, labels, power symbols, and wire segments. Single call replaces cross-referencing list_schematic_wires + list_schematic_labels + get_schematic_pin_locations + run_erc.",
+    {
+      schematicPath: z.string().describe("Path to the schematic file"),
+      netName: z.string().describe("Net name to trace (e.g., '+5V', 'SDA', 'GND')"),
+    },
+    async (args) => {
+      const result = await callKicadScript("get_net_connectivity", args);
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    }
+  );
+
+  // Validate wire connections — targeted pin connectivity check
+  server.tool(
+    "validate_wire_connections",
+    "Check if specific pins are electrically connected to expected nets. Targeted alternative to full ERC — checks only the pins you specify. Traces wires from each pin to find connected labels/power symbols.",
+    {
+      schematicPath: z.string().describe("Path to the schematic file"),
+      checks: z.array(z.object({
+        reference: z.string().describe("Component reference (e.g., 'U1')"),
+        pin: z.string().describe("Pin name (e.g., 'VDD', '1')"),
+        expectedNet: z.string().optional().describe("Expected net name — if provided, result includes match: true/false"),
+      })).describe("Array of pin connectivity checks"),
+    },
+    async (args) => {
+      const result = await callKicadScript("validate_wire_connections", args);
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    }
+  );
 }
