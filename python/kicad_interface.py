@@ -1243,9 +1243,11 @@ class KiCADInterface:
             return {"success": False, "message": str(e)}
 
     def _handle_batch_rotate_labels(self, params):
-        """Rotate multiple labels in one call."""
+        """Rotate multiple labels in one call. Single read/write cycle."""
         logger.info("Batch rotating labels")
         try:
+            import re
+
             schematic_path = params.get("schematicPath")
             rotations = params.get("rotations", [])
 
@@ -1254,21 +1256,167 @@ class KiCADInterface:
             if not rotations:
                 return {"success": False, "message": "rotations array is required"}
 
+            with open(schematic_path, "r", encoding="utf-8") as f:
+                content = f.read()
+
+            tolerance = 0.5
             results = []
+            justify_pat = re.compile(r'\(justify\s+\w+\)')
+
             for rot in rotations:
-                sub_params = {
-                    "schematicPath": schematic_path,
-                    "netName": rot.get("netName"),
-                    "angle": rot.get("angle"),
-                }
-                if "position" in rot:
-                    sub_params["position"] = rot["position"]
-                r = self._handle_rotate_schematic_label(sub_params)
-                results.append({
-                    "netName": rot.get("netName"),
-                    "success": r.get("success", False),
-                    "message": r.get("message", ""),
-                })
+                net_name = rot.get("netName")
+                angle = rot.get("angle", 0)
+                position = rot.get("position")
+                escaped = re.escape(net_name)
+                found = False
+                found_label_type = None
+                label_x, label_y = 0.0, 0.0
+
+                for label_type in ["label", "global_label", "hierarchical_label"]:
+                    pat = re.compile(
+                        rf'(\({label_type}\s+"{escaped}"(?:\s+\(shape\s+[^)]*\))?\s+\(at\s+)([\d.e+-]+)\s+([\d.e+-]+)\s+[\d.e+-]+'
+                    )
+                    for m in pat.finditer(content):
+                        lx, ly = float(m.group(2)), float(m.group(3))
+                        if position:
+                            px = position.get("x", 0)
+                            py = position.get("y", 0)
+                            if abs(lx - px) >= tolerance or abs(ly - py) >= tolerance:
+                                continue
+
+                        old = m.group(0)
+                        new = f"{m.group(1)}{m.group(2)} {m.group(3)} {angle}"
+                        content = content.replace(old, new, 1)
+                        found = True
+                        found_label_type = label_type
+                        label_x, label_y = lx, ly
+                        break
+                    if found:
+                        break
+
+                if not found:
+                    results.append({"netName": net_name, "success": False, "message": "Not found"})
+                    continue
+
+                # Update justify
+                norm_angle = int(angle) % 360
+                new_justify = "right" if norm_angle in (180, 270) else "left"
+
+                if found_label_type in ("global_label", "hierarchical_label"):
+                    label_start_pat = re.compile(
+                        rf'\({found_label_type}\s+"{escaped}"(?:\s+\(shape\s+[^)]*\))?\s+\(at\s+{re.escape(str(label_x))}\s+{re.escape(str(label_y))}\s+'
+                    )
+                    lm = label_start_pat.search(content)
+                    if lm:
+                        depth = 0
+                        i = lm.start()
+                        block_end = i
+                        while i < len(content):
+                            if content[i] == '(':
+                                depth += 1
+                            elif content[i] == ')':
+                                depth -= 1
+                                if depth == 0:
+                                    block_end = i + 1
+                                    break
+                            i += 1
+                        block = content[lm.start():block_end]
+
+                        # Update justify in first (effects ...) block
+                        effects_match = re.search(r'\(effects\b', block)
+                        if effects_match:
+                            ed = 0
+                            ei = effects_match.start()
+                            effects_end = ei
+                            while ei < len(block):
+                                if block[ei] == '(':
+                                    ed += 1
+                                elif block[ei] == ')':
+                                    ed -= 1
+                                    if ed == 0:
+                                        effects_end = ei + 1
+                                        break
+                                ei += 1
+                            effects_block = block[effects_match.start():effects_end]
+
+                            if justify_pat.search(effects_block):
+                                new_effects = justify_pat.sub(f'(justify {new_justify})', effects_block, count=1)
+                            else:
+                                insert_pos = effects_block.rfind(')')
+                                indent = "\n\t\t\t" if "\n" in effects_block else " "
+                                new_effects = effects_block[:insert_pos] + f'{indent}(justify {new_justify})' + effects_block[insert_pos:]
+
+                            if new_effects != effects_block:
+                                new_block = block[:effects_match.start()] + new_effects + block[effects_end:]
+                                content = content[:lm.start()] + new_block + content[block_end:]
+
+                        # Update Intersheetrefs position
+                        char_w = 0.75
+                        text_len = len(net_name) * char_w
+                        total_w = 3.0 + text_len
+
+                        if norm_angle == 0:
+                            isr_x, isr_y = label_x, label_y
+                        elif norm_angle == 180:
+                            isr_x, isr_y = round(label_x - total_w, 4), label_y
+                        elif norm_angle == 90:
+                            isr_x, isr_y = label_x, label_y
+                        else:
+                            isr_x, isr_y = label_x, round(label_y - total_w, 4)
+
+                        # Re-search (content may have changed)
+                        lm2 = label_start_pat.search(content)
+                        if lm2:
+                            depth2 = 0
+                            i2 = lm2.start()
+                            block_end2 = i2
+                            while i2 < len(content):
+                                if content[i2] == '(':
+                                    depth2 += 1
+                                elif content[i2] == ')':
+                                    depth2 -= 1
+                                    if depth2 == 0:
+                                        block_end2 = i2 + 1
+                                        break
+                                i2 += 1
+                            block2 = content[lm2.start():block_end2]
+
+                            isr_at_pat = re.compile(
+                                r'(\(property\s+"Intersheetrefs"\s+"[^"]*"\s+\(at\s+)[\d.e+-]+\s+[\d.e+-]+\s+[\d.e+-]+'
+                            )
+                            isr_m = isr_at_pat.search(block2)
+                            if isr_m:
+                                old_isr = isr_m.group(0)
+                                new_isr = f"{isr_m.group(1)}{isr_x} {isr_y} {angle}"
+                                new_block2 = block2.replace(old_isr, new_isr, 1)
+
+                                isr_prop_start = new_block2.find('(property "Intersheetrefs"')
+                                if isr_prop_start >= 0:
+                                    pd = 0
+                                    pi = isr_prop_start
+                                    prop_end = pi
+                                    while pi < len(new_block2):
+                                        if new_block2[pi] == '(':
+                                            pd += 1
+                                        elif new_block2[pi] == ')':
+                                            pd -= 1
+                                            if pd == 0:
+                                                prop_end = pi + 1
+                                                break
+                                        pi += 1
+                                    isr_prop = new_block2[isr_prop_start:prop_end]
+                                    new_isr_prop = justify_pat.sub(f'(justify {new_justify})', isr_prop)
+                                    if new_isr_prop != isr_prop:
+                                        new_block2 = new_block2[:isr_prop_start] + new_isr_prop + new_block2[prop_end:]
+
+                                content = content[:lm2.start()] + new_block2 + content[block_end2:]
+
+                results.append({"netName": net_name, "success": True, "message": f"Rotated to {angle}° (justify {new_justify})"})
+
+            with open(schematic_path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(content)
+                f.flush()
+                os.fsync(f.fileno())
 
             succeeded = sum(1 for r in results if r["success"])
             return {
@@ -1698,7 +1846,7 @@ class KiCADInterface:
             return {"success": False, "message": str(e)}
 
     def _handle_rotate_schematic_label(self, params):
-        """Rotate a net label to a new angle."""
+        """Rotate a net label to a new angle, updating justify and Intersheetrefs position."""
         logger.info("Rotating schematic label")
         try:
             import re
@@ -1717,6 +1865,8 @@ class KiCADInterface:
             tolerance = 0.5
             escaped = re.escape(net_name)
             found = False
+            found_label_type = None
+            label_x, label_y = 0.0, 0.0
 
             for label_type in ["label", "global_label", "hierarchical_label"]:
                 # Allow optional (shape ...) between label name and (at ...) for global labels
@@ -1736,6 +1886,8 @@ class KiCADInterface:
                     new = f"{m.group(1)}{m.group(2)} {m.group(3)} {angle}"
                     content = content.replace(old, new, 1)
                     found = True
+                    found_label_type = label_type
+                    label_x, label_y = lx, ly
                     break
                 if found:
                     break
@@ -1743,12 +1895,148 @@ class KiCADInterface:
             if not found:
                 return {"success": False, "message": f"Label '{net_name}' not found"}
 
+            # Update justify for global_label and hierarchical_label.
+            # KiCad uses: 0°/90° → justify left, 180°/270° → justify right.
+            # The justify controls which direction the flag shape extends.
+            norm_angle = int(angle) % 360
+            new_justify = "right" if norm_angle in (180, 270) else "left"
+
+            if found_label_type in ("global_label", "hierarchical_label"):
+                # Find the label block and update its (justify ...) in (effects ...)
+                # Strategy: find the specific label occurrence, then find/replace
+                # justify within a bounded region after it.
+                label_start_pat = re.compile(
+                    rf'\({found_label_type}\s+"{escaped}"(?:\s+\(shape\s+[^)]*\))?\s+\(at\s+{re.escape(str(label_x))}\s+{re.escape(str(label_y))}\s+'
+                )
+                lm = label_start_pat.search(content)
+                if lm:
+                    # Find the label block end (balanced parens)
+                    depth = 0
+                    i = lm.start()
+                    block_end = i
+                    while i < len(content):
+                        if content[i] == '(':
+                            depth += 1
+                        elif content[i] == ')':
+                            depth -= 1
+                            if depth == 0:
+                                block_end = i + 1
+                                break
+                        i += 1
+                    block = content[lm.start():block_end]
+
+                    # Update justify in the FIRST (effects ...) block (the label's own effects,
+                    # not the Intersheetrefs property effects)
+                    effects_match = re.search(r'\(effects\b', block)
+                    if effects_match:
+                        # Find the closing paren of this effects block
+                        ed = 0
+                        ei = effects_match.start()
+                        effects_end = ei
+                        while ei < len(block):
+                            if block[ei] == '(':
+                                ed += 1
+                            elif block[ei] == ')':
+                                ed -= 1
+                                if ed == 0:
+                                    effects_end = ei + 1
+                                    break
+                            ei += 1
+                        effects_block = block[effects_match.start():effects_end]
+
+                        # Replace or insert justify
+                        justify_pat = re.compile(r'\(justify\s+\w+\)')
+                        if justify_pat.search(effects_block):
+                            new_effects = justify_pat.sub(f'(justify {new_justify})', effects_block, count=1)
+                        else:
+                            # Insert justify before closing paren of effects
+                            insert_pos = effects_block.rfind(')')
+                            indent = "\n\t\t\t" if "\n" in effects_block else " "
+                            new_effects = effects_block[:insert_pos] + f'{indent}(justify {new_justify})' + effects_block[insert_pos:]
+
+                        if new_effects != effects_block:
+                            new_block = block[:effects_match.start()] + new_effects + block[effects_end:]
+                            content = content[:lm.start()] + new_block + content[block_end:]
+
+                    # Update Intersheetrefs position.
+                    # Recompute flag width for positioning.
+                    char_w = 0.75
+                    text_len = len(net_name) * char_w
+                    body = 3.0  # global/hierarchical flag body
+                    total_w = body + text_len
+
+                    # Intersheetrefs (at) position depends on angle+justify:
+                    # At 0° (left): at label position (right end is connection pt)
+                    # At 180° (right): at label.x - total_w (flag extends left)
+                    # At 90° (left): at label position (bottom is connection pt)
+                    # At 270° (right): at label.y - total_w (flag extends up)
+                    if norm_angle == 0:
+                        isr_x, isr_y = label_x, label_y
+                    elif norm_angle == 180:
+                        isr_x, isr_y = round(label_x - total_w, 4), label_y
+                    elif norm_angle == 90:
+                        isr_x, isr_y = label_x, label_y
+                    else:  # 270
+                        isr_x, isr_y = label_x, round(label_y - total_w, 4)
+
+                    # Find and update Intersheetrefs property within this label block
+                    # Re-search since content may have changed
+                    lm2 = label_start_pat.search(content)
+                    if lm2:
+                        depth2 = 0
+                        i2 = lm2.start()
+                        block_end2 = i2
+                        while i2 < len(content):
+                            if content[i2] == '(':
+                                depth2 += 1
+                            elif content[i2] == ')':
+                                depth2 -= 1
+                                if depth2 == 0:
+                                    block_end2 = i2 + 1
+                                    break
+                            i2 += 1
+                        block2 = content[lm2.start():block_end2]
+
+                        # Update Intersheetrefs (at X Y angle)
+                        isr_at_pat = re.compile(
+                            r'(\(property\s+"Intersheetrefs"\s+"[^"]*"\s+\(at\s+)[\d.e+-]+\s+[\d.e+-]+\s+[\d.e+-]+'
+                        )
+                        isr_m = isr_at_pat.search(block2)
+                        if isr_m:
+                            old_isr = isr_m.group(0)
+                            new_isr = f"{isr_m.group(1)}{isr_x} {isr_y} {angle}"
+                            new_block2 = block2.replace(old_isr, new_isr, 1)
+
+                            # Also update justify in Intersheetrefs effects
+                            # Find the Intersheetrefs property block
+                            isr_prop_start = new_block2.find('(property "Intersheetrefs"')
+                            if isr_prop_start >= 0:
+                                # Find the end of this property block
+                                pd = 0
+                                pi = isr_prop_start
+                                prop_end = pi
+                                while pi < len(new_block2):
+                                    if new_block2[pi] == '(':
+                                        pd += 1
+                                    elif new_block2[pi] == ')':
+                                        pd -= 1
+                                        if pd == 0:
+                                            prop_end = pi + 1
+                                            break
+                                    pi += 1
+                                isr_prop = new_block2[isr_prop_start:prop_end]
+                                new_isr_prop = justify_pat.sub(f'(justify {new_justify})', isr_prop)
+                                if new_isr_prop != isr_prop:
+                                    new_block2 = new_block2[:isr_prop_start] + new_isr_prop + new_block2[prop_end:]
+
+                            content = content[:lm2.start()] + new_block2 + content[block_end2:]
+
             with open(schematic_path, "w", encoding="utf-8", newline="\n") as f:
                 f.write(content)
                 f.flush()
                 os.fsync(f.fileno())
 
-            return {"success": True, "message": f"Rotated label '{net_name}' to {angle} degrees"}
+            return {"success": True, "message": f"Rotated label '{net_name}' to {angle}° (justify {new_justify})"}
         except Exception as e:
             logger.error(f"Error rotating label: {e}")
             import traceback

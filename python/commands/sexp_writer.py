@@ -145,14 +145,44 @@ def add_label(
         if label_type == "global_label" and shape:
             shape_attr = f" (shape {shape})"
 
-        # Local labels use (justify left bottom); global/hierarchical use (justify left)
-        justify = "(justify left)" if label_type != "label" else "(justify left bottom)"
+        # Justify depends on angle: 0°/90° → left, 180°/270° → right.
+        # Local labels additionally use "bottom".
+        norm_angle = int(orientation) % 360
+        justify_dir = "right" if norm_angle in (180, 270) else "left"
+        if label_type == "label":
+            justify = f"(justify {justify_dir} bottom)"
+        else:
+            justify = f"(justify {justify_dir})"
+
+        # Global/hierarchical labels need an Intersheetrefs property
+        isr_block = ""
+        if label_type in ("global_label", "hierarchical_label"):
+            isr_uuid = str(uuid.uuid4())
+            # Intersheetrefs position: for justify left it's at the label position,
+            # for justify right it's offset by the flag width
+            char_w = 0.75
+            text_len = len(text) * char_w
+            body = 3.0
+            total_w = body + text_len
+            isr_x, isr_y = position[0], position[1]
+            if norm_angle == 180:
+                isr_x = round(position[0] - total_w, 4)
+            elif norm_angle == 270:
+                isr_y = round(position[1] - total_w, 4)
+            isr_block = (
+                f'    (property "Intersheetrefs" "${{INTERSHEET_REFS}}"\n'
+                f"      (at {_fmt(isr_x)} {_fmt(isr_y)} {orientation})\n"
+                f"      (effects (font (size 1.27 1.27)) (justify {justify_dir}) (hide yes))\n"
+                f"      (uuid {isr_uuid})\n"
+                f"    )\n"
+            )
 
         label_text = (
             f'  ({label_type} "{text}"{shape_attr} (at {_fmt(position[0])} {_fmt(position[1])} {orientation})\n'
             f"    (fields_autoplaced yes)\n"
             f"    (effects (font (size 1.27 1.27)) {justify})\n"
             f"    (uuid {label_uuid})\n"
+            f"{isr_block}"
             f"  )\n\n"
         )
 
