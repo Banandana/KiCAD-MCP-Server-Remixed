@@ -131,6 +131,7 @@ npm run lint                     # eslint + black + mypy + flake8
 ## Rules
 
 - **ALWAYS rebuild after every change**: Run `npm run build` after any edit to TypeScript files. The MCP server runs from `dist/`, not `src/`. Forgetting to rebuild means your changes won't take effect.
+- **ALWAYS commit and push after every change**: After fixing a bug or adding a feature, commit and push to `remix` remote immediately. Don't batch changes.
 - **Tool name must match across layers**: The `callKicadScript("command_name", ...)` string in TypeScript **must exactly match** the key in the `command_routes` dict in `python/kicad_interface.py`. A mismatch causes "unknown command" errors.
 - **Every tool needs `schematicPath` or `pcbPath`**: All schematic/board tools must include the file path parameter in both the Zod schema (TypeScript) and the Python handler. The Python backend is stateless per-call for schematics.
 - **Never use `sexpdata` round-trips for writing**: `sexpdata.loads()` → modify → `sexpdata.dumps()` collapses the entire `.kicad_sch` file to a single line, breaking git diffs and other parsers. Use text insertion via `python/commands/sexp_writer.py` instead.
@@ -138,6 +139,71 @@ npm run lint                     # eslint + black + mypy + flake8
 - **No stale caches for schematic state**: Never cache loaded `Schematic` objects across operations. The file changes between calls. Pin definition caches (lib_symbols → pin data) are OK since symbol definitions don't change.
 - **List/query tools must be fast**: Tools like `list_schematic_components` and `list_schematic_nets` must not call per-item functions that re-read the file. Load once, iterate in memory.
 - **Parameter format normalization**: Python handlers should accept both `{x, y}` objects and `[x, y]` arrays for coordinates, since TypeScript sends objects but some internal callers use arrays.
+- **Snap component positions to 1.27mm grid**: All component placements must snap to the KiCad schematic grid (1.27mm). Off-grid components = off-grid pins = broken connections. `DynamicSymbolLoader.create_component_instance` does this automatically.
+- **Verify with kicad-cli, not MCP tools**: MCP's own diagnostics (get_pin_connections, etc.) use the same math as the tools that placed the components. Always verify with `kicad-cli sch erc` via Bash as the ground truth.
+
+## KiCad S-Expression Gotchas
+
+These are hard-won lessons from debugging. Read before touching any schematic file manipulation code.
+
+### Pin coordinate system
+- Symbol-local pin definitions use **Y-up** coordinates. Schematic uses **Y-down**.
+- **Always negate Y** when converting pin (at) to schematic coords: `pin_rel_y = -pin_data["y"]`
+- The `(at x y angle)` in a pin definition IS the **connectable endpoint**. The `length` extends from endpoint toward the body, NOT outward. **Do not add length to get the endpoint.**
+- Pin angles in definitions point FROM endpoint TOWARD body. For wire stubs going AWAY from body, use `(angle + 180 + symbol_rotation) % 360`.
+
+### Global label format
+KiCad global labels have a `(shape ...)` attribute between the name and `(at ...)`:
+```
+(global_label "SDA" (shape bidirectional) (at 100 50 0) ...)
+```
+**Every regex that matches labels must include `(?:\s+\(shape\s+[^)]*\))?` after the label name.** This is the #1 recurring bug — it was found and fixed in 7 separate handlers. When adding new label-matching code, always use this pattern:
+```python
+rf'\({label_type}\s+"([^"]*)"(?:\s+\(shape\s+[^)]*\))?\s+\(at\s+([\d.e+-]+)\s+([\d.e+-]+)'
+```
+And always iterate `["label", "global_label", "hierarchical_label"]`, not just `["label", "global_label"]`.
+
+### (instances) blocks
+- KiCad 9 requires `(instances (project "name" (path "/uuid" (reference "R1") (unit 1))))` inside every placed symbol for annotation to work.
+- `DynamicSymbolLoader.create_component_instance` already includes this in the template.
+- Never add a second one. When checking if a symbol already has `(instances)`, use balanced-paren search to find the symbol block, not newline-based heuristics (single-line files have no newlines).
+
+### (hide yes) placement
+- Field visibility: `(hide yes)` goes inside `(effects ...)`, NOT inside `(font ...)`.
+- Correct: `(effects (font (size 1.27 1.27)) (hide yes))`
+- Wrong: `(effects (font (size 1.27 1.27) (hide yes)))` — malformed, kicad-cli rejects it.
+- When toggling visibility, **always strip ALL existing (hide yes) first** (from both effects and font levels), then add one at the effects level if hiding.
+
+### Wire connectivity
+- KiCad wires must be strictly horizontal or vertical. Diagonal wires don't form electrical connections.
+- Wire endpoints must exactly match label/pin positions for connectivity. Off-grid mismatches = dangling.
+- When creating wire stubs from pins, snap the stub endpoint to grid **only along the pin's axis** (vertical pins snap Y only, horizontal pins snap X only).
+
+### Power symbols
+- Power symbols (#PWR) use `lib_id "power:GND"` etc. They're symbols, not labels.
+- `get_net_connections` must search power symbols in addition to labels.
+- `get_pin_connections` must detect power symbol pins at wire endpoints.
+- Power symbol references must be auto-numbered (#PWR068, not #PWR?) to avoid collisions.
+- Their Reference field should be hidden by default (`(hide yes)` in effects).
+
+### String replacement in loops
+- **Never modify a string inside a `finditer` loop on that string.** After the first replacement changes string length, all subsequent match positions are wrong. Collect all `(start, end, new_text)` edits first, then apply in reverse order.
+
+## Validation Checklist for New Tools
+
+When adding or modifying a schematic tool, verify:
+
+1. [ ] `callKicadScript` command name matches `command_routes` key exactly
+2. [ ] TypeScript schema includes `schematicPath` as required parameter
+3. [ ] Python handler accepts both `{x,y}` objects and `[x,y]` arrays for coordinates
+4. [ ] Any label regex includes `(?:\s+\(shape\s+[^)]*\))?` for global labels
+5. [ ] Label iteration covers all three types: `label`, `global_label`, `hierarchical_label`
+6. [ ] Pin Y coordinate is negated when converting from symbol-local to schematic coords
+7. [ ] File writes use `sexp_writer.py` text insertion, not `sexpdata.dumps()`
+8. [ ] No line-start-anchored regex (`^`) — files may be single-line
+9. [ ] No string modification inside `finditer` loops
+10. [ ] `npm run build` run after TypeScript changes
+11. [ ] Commit and push to `remix` remote
 
 ## Code Patterns
 
@@ -184,14 +250,23 @@ Both layers log to `~/.kicad-mcp/logs/`:
 
 ## Common Pitfalls
 
-- **"Unknown command" error**: The `callKicadScript` command string in TypeScript doesn't match the `command_routes` key in Python. Check both files.
-- **Tool works in tests but not via MCP**: Forgot to run `npm run build`. The server runs from `dist/`, not `src/`.
-- **Schematic file becomes single-line**: Used `sexpdata.dumps()` to write the file. Use `sexp_writer.py` text insertion instead.
-- **connect_to_net fails for later components**: PinLocator was caching stale Schematic objects. Fixed — now re-reads from disk each call.
-- **Pin positions are wrong by 2.54mm**: You're getting body positions instead of endpoints. `PinLocator.get_pin_location()` now returns endpoints (body + pin length along angle).
-- **Components show "R?" instead of "R1"**: Missing `(instances)` block. `add_schematic_component` and `annotate_schematic` now add these automatically.
-- **list_schematic_nets/components times out**: The handler was re-reading the file per item. Fixed — loads once, iterates in memory.
-- **Labels not electrically connected**: Labels placed without a wire stub. `connect_to_net` adds wire stubs automatically.
+These are bugs that were actually encountered and fixed. If you see these symptoms, check the fix is still in place.
+
+- **"Unknown command" error**: `callKicadScript` string in TS doesn't match `command_routes` key in Python.
+- **Tool works in code but not via MCP**: Forgot `npm run build`. Server runs from `dist/`.
+- **Schematic file becomes single-line**: Used `sexpdata.dumps()`. Use `sexp_writer.py` instead.
+- **Pin positions wrong by ~2.5mm or pins swapped**: Forgot to negate Y (`-pin_data["y"]`), or added pin length to endpoint (the `(at)` IS the endpoint already).
+- **Pin positions reflected (correct offset, wrong sign)**: Symbol-local Y-up vs schematic Y-down. Must negate Y.
+- **Wires/labels placed at wrong location**: Pin angle formula wrong. Outward angle = `(pin_def_angle + 180 + symbol_rotation) % 360`.
+- **Labels placed but electrically dangling**: Component off-grid (not 1.27mm aligned), or wire stub creates diagonal (must snap along pin axis only).
+- **Global labels not found by tools**: Regex missing `(shape ...)` clause. This was the #1 recurring bug — fixed in 7 places.
+- **run_erc returns 0 violations**: Was parsing `erc_data["violations"]` but KiCad 9 puts them under `sheets[*].violations`. Also needs `--severity-all` flag.
+- **Duplicate (instances) blocks corrupt file**: The check for existing instances used newline-based heuristics that fail on single-line files. Must use balanced-paren search.
+- **#PWR? reference collisions**: Power symbols weren't auto-numbered. Now scans for highest existing #PWR number.
+- **get_net_connections empty for power nets**: Was only searching `(label)` elements, not power symbols. Now searches both.
+- **(hide yes) inside (font) instead of (effects)**: Malformed S-expression that kicad-cli rejects. Must strip all (hide yes) first, then add at effects level only.
+- **move_region moves items outside bbox**: String was modified inside `finditer` loop, corrupting match positions. Must collect edits first, apply in reverse order.
+- **Diagnostic tools report false results**: MCP tools use the same pin math as placement tools. A pin math bug makes both placement AND verification wrong in the same way — everything looks correct to itself. Always verify with `kicad-cli sch erc` as ground truth.
 
 ## Important Notes
 
