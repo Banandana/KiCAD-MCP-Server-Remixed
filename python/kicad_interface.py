@@ -3104,8 +3104,60 @@ class KiCADInterface:
             locator = PinLocator()
             sch_file = Path(schematic_path)
 
+            # Read file content once (used by body rect extraction and label parsing)
+            with open(schematic_path, "r", encoding="utf-8") as f:
+                content = f.read()
+
+            # ── Helper: extract body rectangle from lib_symbol ──
+            # The body outline is the (rectangle ... (fill (type background)))
+            # element in the symbol definition. This is smaller than the
+            # pin-extent bbox because pins extend outward from the body.
+            def _get_body_rect(content_str, lib_id_str):
+                """Find the body rectangle (fill background) for a lib_symbol.
+                Returns (half_width, half_height) in symbol-local coords, or None."""
+                # Find the lib_symbol block
+                escaped = re.escape(lib_id_str)
+                sym_match = re.search(rf'\(symbol\s+"{escaped}"\s', content_str)
+                if not sym_match:
+                    return None
+                # Find matching close paren
+                depth = 0
+                i = sym_match.start()
+                block_end = i
+                while i < len(content_str):
+                    if content_str[i] == '(':
+                        depth += 1
+                    elif content_str[i] == ')':
+                        depth -= 1
+                        if depth == 0:
+                            block_end = i + 1
+                            break
+                    i += 1
+                block = content_str[sym_match.start():block_end]
+
+                # Find all (rectangle (start X Y) (end X Y) ... (fill (type background)))
+                rect_pat = re.compile(
+                    r'\(rectangle\s+\(start\s+([\d.e+-]+)\s+([\d.e+-]+)\)\s+\(end\s+([\d.e+-]+)\s+([\d.e+-]+)\)'
+                    r'[^)]*\(fill\s+\(type\s+background\)\)'
+                )
+                best = None
+                best_area = 0
+                for rm in rect_pat.finditer(block):
+                    x1, y1 = float(rm.group(1)), float(rm.group(2))
+                    x2, y2 = float(rm.group(3)), float(rm.group(4))
+                    area = abs(x2 - x1) * abs(y2 - y1)
+                    if area > best_area:
+                        best_area = area
+                        best = (x1, y1, x2, y2)
+                if best:
+                    x1, y1, x2, y2 = best
+                    hw = max(abs(x1), abs(x2))
+                    hh = max(abs(y1), abs(y2))
+                    return (hw, hh)
+                return None
+
             # ── Build component bounding boxes ──
-            components = []  # [{ref, cx, cy, hw, hh, lib_id}]
+            components = []  # [{ref, cx, cy, hw, hh, body_hw, body_hh, lib_id, pin_endpoints}]
 
             for symbol in schematic.symbol:
                 if not hasattr(symbol.property, "Reference"):
@@ -3152,15 +3204,24 @@ class KiCADInterface:
                 else:
                     hw, hh = 2.54, 2.54
 
+                # Extract body rectangle (artwork outline, smaller than pin bbox)
+                body_hw, body_hh = hw, hh
+                body_rect = _get_body_rect(content, lib_id) if lib_id else None
+                if body_rect:
+                    body_hw, body_hh = body_rect
+                    if sym_rot in (90, 270):
+                        body_hw, body_hh = body_hh, body_hw
+
                 components.append({
                     "ref": ref, "cx": cx, "cy": cy,
-                    "hw": hw, "hh": hh, "lib_id": lib_id,
+                    "hw": hw, "hh": hh,
+                    "body_hw": body_hw, "body_hh": body_hh,
+                    "lib_id": lib_id,
                     "pin_endpoints": pin_endpoints,
                 })
 
             # ── Build label bounding boxes ──
-            with open(schematic_path, "r", encoding="utf-8") as f:
-                content = f.read()
+            # (content already read above)
 
             # label_box: {name, type, x, y, angle, x1, y1, x2, y2}
             label_boxes = []
@@ -3303,26 +3364,27 @@ class KiCADInterface:
 
             # ── 2. Label vs component ──
             if "label_component" in check_types:
-                # Labels connect to pins via short wire stubs (typically 2.54mm).
-                # Suppress if the label's connection point is within one stub
-                # length of any pin on the overlapping component.
-                pin_suppress_dist = 5.5  # mm — covers 2×2.54mm stub + tolerance
                 for lb in label_boxes:
                     for comp in components:
                         if comp["ref"].startswith("#PWR"):
                             continue
+
+                        # Use BODY rectangle (artwork outline) for label overlap,
+                        # not the full pin-extent bbox. Labels in the pin-stub area
+                        # outside the body are normal KiCad practice.
+                        bhw = comp["body_hw"]
+                        bhh = comp["body_hh"]
                         gap = aabb_overlap(
                             lb["x1"], lb["y1"], lb["x2"], lb["y2"],
-                            comp["cx"] - comp["hw"], comp["cy"] - comp["hh"],
-                            comp["cx"] + comp["hw"], comp["cy"] + comp["hh"],
+                            comp["cx"] - bhw, comp["cy"] - bhh,
+                            comp["cx"] + bhw, comp["cy"] + bhh,
                         )
                         if gap < 0:
-                            # Suppress if the label's connection point is near any pin
-                            # of the overlapping component. These are standard pin-endpoint
-                            # labels — the flag visually overlaps the component's pin-stub
-                            # area but that's normal KiCad practice. The bounding box
-                            # includes pin stubs, so labels at pin tips always "overlap".
+                            # With body rect, suppress is simpler: only suppress
+                            # labels whose connection point is near a pin AND the
+                            # overlap is marginal (label barely touches body edge).
                             if suppress_pin_labels and comp.get("pin_endpoints"):
+                                pin_suppress_dist = 5.5
                                 lx, ly = lb["x"], lb["y"]
                                 is_pin_label = any(
                                     abs(lx - px) <= pin_suppress_dist and abs(ly - py) <= pin_suppress_dist
