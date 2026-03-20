@@ -3265,15 +3265,22 @@ class KiCADInterface:
                         y1 = ly
                         y2 = ly + total_w
 
-                    corners_x = [x1, x2]
-                    corners_y = [y1, y2]
-
-                    x1, x2 = min(corners_x), max(corners_x)
-                    y1, y2 = min(corners_y), max(corners_y)
+                    # Connection point: the electrical end where wires attach.
+                    # At 0°: right end (at.x + width). At 180°: left end (at.x).
+                    # At 90°: bottom (at.y + width). At 270°: top (at.y).
+                    if norm_angle == 0:
+                        conn_x, conn_y = lx + total_w, ly
+                    elif norm_angle == 180:
+                        conn_x, conn_y = lx, ly
+                    elif norm_angle == 90:
+                        conn_x, conn_y = lx, ly + total_w
+                    else:  # 270
+                        conn_x, conn_y = lx, ly
 
                     label_boxes.append({
                         "name": name, "type": lt,
                         "x": lx, "y": ly, "angle": angle,
+                        "conn_x": conn_x, "conn_y": conn_y,
                         "x1": x1, "y1": y1, "x2": x2, "y2": y2,
                         "hw": (x2 - x1) / 2, "hh": (y2 - y1) / 2,
                         "mx": (x1 + x2) / 2, "my": (y1 + y2) / 2,
@@ -3421,11 +3428,12 @@ class KiCADInterface:
             if "wire_label" in check_types:
                 for lb in label_boxes:
                     for w in wires:
-                        # Skip wires that connect to the label's connection point
-                        conn_x, conn_y = lb["x"], lb["y"]
-                        eps = 0.1
-                        touches_start = abs(w["x1"] - conn_x) < eps and abs(w["y1"] - conn_y) < eps
-                        touches_end = abs(w["x2"] - conn_x) < eps and abs(w["y2"] - conn_y) < eps
+                        # Skip wires that touch the label's electrical CONNECTION
+                        # point (not the "at" position, which is the arrow tip).
+                        cx, cy = lb["conn_x"], lb["conn_y"]
+                        eps = 0.5
+                        touches_start = abs(w["x1"] - cx) < eps and abs(w["y1"] - cy) < eps
+                        touches_end = abs(w["x2"] - cx) < eps and abs(w["y2"] - cy) < eps
                         if touches_start or touches_end:
                             continue
 
@@ -4058,9 +4066,6 @@ class KiCADInterface:
 
             def _label_geometry(name, lx, ly, angle, label_type):
                 """Compute connectionPoint and boundingBox for a label."""
-                # Connection point is always the (at) position
-                conn = {"x": lx, "y": ly}
-
                 # Compute bounding box from position + angle + text length
                 char_w = 0.75  # mm per char
                 text_len = len(name) * char_w
@@ -4086,6 +4091,15 @@ class KiCADInterface:
                     x2 = lx + total_h / 2
                     y1 = ly
                     y2 = ly + total_w
+
+                # Connection point: electrical end where wires attach.
+                # 0°: right end. 180°: left end (=at). 90°: bottom. 270°: top (=at).
+                if norm_angle == 0:
+                    conn = {"x": round(lx + total_w, 2), "y": ly}
+                elif norm_angle == 90:
+                    conn = {"x": lx, "y": round(ly + total_w, 2)}
+                else:  # 180, 270
+                    conn = {"x": lx, "y": ly}
 
                 corners_x = [x1, x2]
                 corners_y = [y1, y2]
