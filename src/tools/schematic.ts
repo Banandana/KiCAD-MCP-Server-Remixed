@@ -895,6 +895,60 @@ Note: operates on .kicad_sch files only. To modify a PCB footprint use edit_comp
     },
   );
 
+  // Delete no-connect flag from schematic
+  server.tool(
+    "delete_no_connect",
+    "Remove a no-connect (X) flag from the schematic at a given position.",
+    {
+      schematicPath: z.string().describe("Path to the .kicad_sch file"),
+      position: z
+        .object({ x: z.number(), y: z.number() })
+        .describe("Position of the no-connect flag (mm)"),
+    },
+    async (args: {
+      schematicPath: string;
+      position: { x: number; y: number };
+    }) => {
+      const result = await callKicadScript("delete_no_connect", args);
+      if (result.success) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Deleted no-connect at (${args.position.x}, ${args.position.y})`,
+            },
+          ],
+        };
+      }
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Failed to delete no-connect: ${result.message || "Unknown error"}`,
+          },
+        ],
+        isError: true,
+      };
+    },
+  );
+
+  // Batch delete no-connect flags
+  server.tool(
+    "batch_delete_no_connect",
+    "Delete multiple no-connect (X) flags in a single call. Each is identified by position.",
+    {
+      schematicPath: z.string().describe("Path to the .kicad_sch file"),
+      positions: z.array(z.object({
+        x: z.number(),
+        y: z.number(),
+      })).describe("Array of positions where no-connect flags should be removed"),
+    },
+    async (args) => {
+      const result = await callKicadScript("batch_delete_no_connect", args);
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    }
+  );
+
   // Export schematic to SVG
   server.tool(
     "export_schematic_svg",
@@ -1526,6 +1580,45 @@ Note: operates on .kicad_sch files only. To modify a PCB footprint use edit_comp
     }
   );
 
+  // Trace all electrically connected elements from a coordinate
+  server.tool(
+    "trace_from_point",
+    "Trace all electrically connected elements (wires, pins, labels, junctions, power symbols) reachable from a given coordinate. Use this to debug connectivity issues — shows exact path taken and any dead ends where connectivity breaks.",
+    {
+      schematicPath: z.string().describe("Path to the .kicad_sch file"),
+      x: z.number().describe("X coordinate to trace from (in mm)"),
+      y: z.number().describe("Y coordinate to trace from (in mm)"),
+      tolerance: z.number().optional().describe("Coordinate matching tolerance in mm (default: 0.05)"),
+    },
+    async (params) => {
+      const result = await callKicadScript("trace_from_point", params);
+      return {
+        content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
+        isError: !result.success,
+      };
+    }
+  );
+
+  // Split a wire at a given point into two segments
+  server.tool(
+    "split_wire_at_point",
+    "Split a wire segment at a given point, creating two wire segments that meet at that point. Converts implicit T-junctions into explicit shared endpoints for reliable connectivity. Optionally adds a junction dot at the split point.",
+    {
+      schematicPath: z.string().describe("Path to the .kicad_sch file"),
+      x: z.number().describe("X coordinate of split point (in mm)"),
+      y: z.number().describe("Y coordinate of split point (in mm)"),
+      addJunction: z.boolean().optional().describe("Whether to add a junction dot at split point (default: true)"),
+      tolerance: z.number().optional().describe("Coordinate matching tolerance in mm (default: 0.05)"),
+    },
+    async (params) => {
+      const result = await callKicadScript("split_wire_at_point", params);
+      return {
+        content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
+        isError: !result.success,
+      };
+    }
+  );
+
   // Move a component and everything connected to its pins
   server.tool(
     "move_connected",
@@ -1541,6 +1634,96 @@ Note: operates on .kicad_sch files only. To modify a PCB footprint use edit_comp
     async (args) => {
       const result = await callKicadScript("move_connected", args);
       return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    }
+  );
+
+  // ── Net analysis tools ──
+
+  // Get all pin-to-net mappings for a component
+  server.tool(
+    "get_component_nets",
+    "Return the net name for every pin of a component. The #1 tool for understanding what a component is connected to — replaces dozens of trace_from_point calls. Returns {pin_num: {net, name, x, y}} for all pins.",
+    {
+      schematicPath: z.string().describe("Path to the .kicad_sch file"),
+      reference: z.string().describe("Component reference (e.g., 'U1', 'R1')"),
+    },
+    async (params) => {
+      const result = await callKicadScript("get_component_nets", params);
+      return {
+        content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
+        isError: !result.success,
+      };
+    }
+  );
+
+  // Get all components/pins on a named net
+  server.tool(
+    "get_net_components",
+    "Return all component pins connected to a named net. Inverse of get_component_nets — given a net name like 'VCC' or 'SDA', returns every component reference and pin number on that net.",
+    {
+      schematicPath: z.string().describe("Path to the .kicad_sch file"),
+      netName: z.string().describe("Net name to query (e.g., 'VCC', 'SDA', 'Net-(R1-Pad1)')"),
+    },
+    async (params) => {
+      const result = await callKicadScript("get_net_components", params);
+      return {
+        content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
+        isError: !result.success,
+      };
+    }
+  );
+
+  // Get the net name for a single pin
+  server.tool(
+    "get_pin_net_name",
+    "Return just the net name string for a single component pin. Simplest possible net query — e.g., get_pin_net_name(ref='U1', pin='14') returns '+3V3'.",
+    {
+      schematicPath: z.string().describe("Path to the .kicad_sch file"),
+      reference: z.string().describe("Component reference (e.g., 'U1')"),
+      pin: z.string().describe("Pin number (e.g., '1', '14')"),
+    },
+    async (params) => {
+      const result = await callKicadScript("get_pin_net_name", params);
+      return {
+        content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
+        isError: !result.success,
+      };
+    }
+  );
+
+  // Export complete netlist as simple text
+  server.tool(
+    "export_netlist_summary",
+    "Dump the complete netlist in a simple text format: every component with its pin-to-net assignments, every net with its connected pins, and all unconnected pins. Single call replaces 50+ individual trace calls for full schematic audit.",
+    {
+      schematicPath: z.string().describe("Path to the .kicad_sch file"),
+    },
+    async (params) => {
+      const result = await callKicadScript("export_netlist_summary", params);
+      return {
+        content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
+        isError: !result.success,
+      };
+    }
+  );
+
+  // Validate component connections against expected pin-net mapping
+  server.tool(
+    "validate_component_connections",
+    "Verify a component's actual pin-to-net connections against expected values. Pass a map of pin->expected_net. Prefix with '!' to assert NOT on that net (e.g., '!+5V'). Use null or 'unconnected' to assert no connection. Returns per-pin pass/fail with actual vs expected.",
+    {
+      schematicPath: z.string().describe("Path to the .kicad_sch file"),
+      reference: z.string().describe("Component reference (e.g., 'U1')"),
+      expected: z.record(z.string(), z.string().nullable()).describe(
+        "Map of pin_number -> expected_net_name. Prefix '!' to negate (e.g., '!+5V' = must NOT be +5V). Use null or 'unconnected' for no connection."
+      ),
+    },
+    async (params) => {
+      const result = await callKicadScript("validate_component_connections", params);
+      return {
+        content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
+        isError: !result.success,
+      };
     }
   );
 }

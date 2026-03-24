@@ -239,6 +239,66 @@ except ImportError as e:
     sys.exit(1)
 
 
+def _point_on_wire_segment(px, py, wx1, wy1, wx2, wy2, tolerance=0.01):
+    """Check if point (px,py) lies on wire segment (wx1,wy1)->(wx2,wy2).
+
+    KiCad wires are strictly horizontal or vertical.
+    Returns True if the point is on the segment (not just at endpoints).
+    """
+    px, py = float(px), float(py)
+    wx1, wy1, wx2, wy2 = float(wx1), float(wy1), float(wx2), float(wy2)
+
+    # Horizontal wire
+    if abs(wy1 - wy2) < tolerance:
+        if abs(py - wy1) < tolerance:
+            min_x = min(wx1, wx2)
+            max_x = max(wx1, wx2)
+            if min_x - tolerance < px < max_x + tolerance:
+                # Exclude exact endpoints (those are handled by normal endpoint matching)
+                if abs(px - wx1) > tolerance and abs(px - wx2) > tolerance:
+                    return True
+
+    # Vertical wire
+    if abs(wx1 - wx2) < tolerance:
+        if abs(px - wx1) < tolerance:
+            min_y = min(wy1, wy2)
+            max_y = max(wy1, wy2)
+            if min_y - tolerance < py < max_y + tolerance:
+                if abs(py - wy1) > tolerance and abs(py - wy2) > tolerance:
+                    return True
+
+    return False
+
+
+def _find_connected_wires(px, py, wires, tolerance=0.01):
+    """Find all wires connected to point (px,py), including T-junctions.
+
+    Args:
+        px, py: Point coordinates.
+        wires: List of (x1, y1, x2, y2) tuples.
+        tolerance: Matching tolerance in mm.
+
+    Returns list of (wire_index, 'start'|'end'|'mid') tuples indicating
+    which wires connect and at which position.
+    """
+    px, py = float(px), float(py)
+    connections = []
+    for i, wire in enumerate(wires):
+        x1, y1 = float(wire[0]), float(wire[1])
+        x2, y2 = float(wire[2]), float(wire[3])
+
+        # Endpoint match
+        if abs(px - x1) < tolerance and abs(py - y1) < tolerance:
+            connections.append((i, 'start'))
+        elif abs(px - x2) < tolerance and abs(py - y2) < tolerance:
+            connections.append((i, 'end'))
+        # T-junction: point on middle of wire
+        elif _point_on_wire_segment(px, py, x1, y1, x2, y2, tolerance):
+            connections.append((i, 'mid'))
+
+    return connections
+
+
 class KiCADInterface:
     """Main interface class to handle KiCAD operations"""
 
@@ -287,6 +347,10 @@ class KiCADInterface:
 
         # Schematic-related classes don't need board reference
         # as they operate directly on schematic files
+
+        # Shared PinLocator instance (preserves pin definition cache across calls)
+        from commands.pin_locator import PinLocator
+        self.pin_locator = PinLocator()
 
         # Command routing dictionary
         self.command_routes = {
@@ -396,6 +460,8 @@ class KiCADInterface:
             "delete_schematic_wire": self._handle_delete_schematic_wire,
             "batch_delete_schematic_wire": self._handle_batch_delete_schematic_wire,
             "delete_schematic_net_label": self._handle_delete_schematic_net_label,
+            "delete_no_connect": self._handle_delete_no_connect,
+            "batch_delete_no_connect": self._handle_batch_delete_no_connect,
             "export_schematic_pdf": self._handle_export_schematic_pdf,
             "export_schematic_svg": self._handle_export_schematic_svg,
             "import_svg_logo": self._handle_import_svg_logo,
@@ -423,6 +489,14 @@ class KiCADInterface:
             "get_pin_connections": self._handle_get_pin_connections,
             "get_net_connectivity": self._handle_get_net_connectivity,
             "validate_wire_connections": self._handle_validate_wire_connections,
+            "trace_from_point": self._handle_trace_from_point,
+            "split_wire_at_point": self._handle_split_wire_at_point,
+            # Net analysis commands
+            "get_component_nets": self._handle_get_component_nets,
+            "get_net_components": self._handle_get_net_components,
+            "get_pin_net_name": self._handle_get_pin_net_name,
+            "export_netlist_summary": self._handle_export_netlist_summary,
+            "validate_component_connections": self._handle_validate_component_connections,
             # UI/Process management commands
             "check_kicad_ui": self._handle_check_kicad_ui,
             "launch_kicad_ui": self._handle_launch_kicad_ui,
@@ -777,7 +851,7 @@ class KiCADInterface:
             }
         except Exception as e:
             logger.error(f"Error adding component to schematic: {str(e)}")
-            import traceback
+
 
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
@@ -890,7 +964,7 @@ class KiCADInterface:
 
         except Exception as e:
             logger.error(f"Error deleting schematic component: {e}")
-            import traceback
+
 
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
@@ -1093,7 +1167,7 @@ class KiCADInterface:
 
         except Exception as e:
             logger.error(f"Error editing schematic component: {e}")
-            import traceback
+
 
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
@@ -1154,7 +1228,7 @@ class KiCADInterface:
 
         except Exception as e:
             logger.error(f"Error in batch_edit_schematic_components: {e}")
-            import traceback
+
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
 
@@ -1180,7 +1254,7 @@ class KiCADInterface:
             return {"success": False, "message": "Failed to add no-connect"}
         except Exception as e:
             logger.error(f"Error adding no-connect: {e}")
-            import traceback
+
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
 
@@ -1207,14 +1281,16 @@ class KiCADInterface:
             return {"success": False, "message": "Failed to add junction"}
         except Exception as e:
             logger.error(f"Error adding junction: {e}")
-            import traceback
+
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
 
     def _handle_batch_add_junction(self, params):
-        """Add multiple junction dots in one call. Single read/write cycle."""
+        """Add multiple junction dots in one call. Single read/write cycle.
+        Verifies each junction lies on a wire intersection and warns about misplacements."""
         logger.info("Batch adding junctions")
         try:
+            import re
             from commands.sexp_writer import add_junction_to_content, _read_schematic, _write_schematic
             from pathlib import Path
 
@@ -1227,24 +1303,79 @@ class KiCADInterface:
                 return {"success": False, "message": "positions array is required"}
 
             content = _read_schematic(Path(schematic_path))
+
+            # Collect junction positions for verification
+            added_positions = []
             added = 0
             for pos in positions:
                 x = pos.get("x", 0) if isinstance(pos, dict) else pos[0]
                 y = pos.get("y", 0) if isinstance(pos, dict) else pos[1]
                 content = add_junction_to_content(content, [x, y])
+                added_positions.append((float(x), float(y)))
                 added += 1
 
             _write_schematic(Path(schematic_path), content)
 
-            return {
+            # Verification: re-read file and parse wires to check junction placement
+            verification_content = _read_schematic(Path(schematic_path))
+            wire_segments = []
+            wire_pat = re.compile(r'\(wire\b')
+            xy_pat = re.compile(r'\(xy\s+([\d.e+-]+)\s+([\d.e+-]+)\)')
+            for wm in wire_pat.finditer(verification_content):
+                depth = 0
+                i = wm.start()
+                block_end = i
+                while i < len(verification_content):
+                    if verification_content[i] == '(':
+                        depth += 1
+                    elif verification_content[i] == ')':
+                        depth -= 1
+                        if depth == 0:
+                            block_end = i + 1
+                            break
+                    i += 1
+                block = verification_content[wm.start():block_end]
+                xys = xy_pat.findall(block)
+                if len(xys) >= 2:
+                    wire_segments.append((
+                        float(xys[0][0]), float(xys[0][1]),
+                        float(xys[-1][0]), float(xys[-1][1]),
+                    ))
+
+            tolerance = 0.5
+            warnings = []
+            valid_placements = []
+            for jx, jy in added_positions:
+                on_wire = False
+                for wx1, wy1, wx2, wy2 in wire_segments:
+                    # Check endpoints
+                    if (abs(jx - wx1) < tolerance and abs(jy - wy1) < tolerance) or \
+                       (abs(jx - wx2) < tolerance and abs(jy - wy2) < tolerance):
+                        on_wire = True
+                        break
+                    # Check mid-segment (T-junction)
+                    if _point_on_wire_segment(jx, jy, wx1, wy1, wx2, wy2, tolerance):
+                        on_wire = True
+                        break
+                if on_wire:
+                    valid_placements.append({"x": jx, "y": jy})
+                else:
+                    warnings.append(f"Junction at ({jx}, {jy}) does not lie on any wire segment")
+
+            result = {
                 "success": True,
                 "message": f"Added {added}/{len(positions)} junctions",
                 "added": added,
                 "failed": [],
+                "valid_placements": len(valid_placements),
+                "misplaced": len(warnings),
             }
+            if warnings:
+                result["warnings"] = warnings
+            return result
         except Exception as e:
             logger.error(f"Error in batch_add_junction: {e}")
-            import traceback
+
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
 
@@ -1432,7 +1563,7 @@ class KiCADInterface:
             }
         except Exception as e:
             logger.error(f"Error in batch_rotate_labels: {e}")
-            import traceback
+
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
 
@@ -1458,7 +1589,7 @@ class KiCADInterface:
                 return {"success": False, "message": "Failed to load schematic"}
 
             sch_file = Path(schematic_path)
-            locator = PinLocator()
+            locator = self.pin_locator
 
             with open(schematic_path, "r", encoding="utf-8") as f:
                 content = f.read()
@@ -1532,6 +1663,7 @@ class KiCADInterface:
 
             # ── Find component pins that match net_points via wire tracing ──
             # Build wire adjacency: which points are connected by wires
+            # Includes T-junction detection (point on mid-segment of another wire)
             eps = 0.5
             connected_points = set(net_points)
             changed = True
@@ -1548,13 +1680,47 @@ class KiCADInterface:
                     elif p2_in and not p1_in:
                         connected_points.add(p1)
                         changed = True
+                    elif not p1_in and not p2_in:
+                        # T-junction check: does any connected point land on this wire's mid-segment?
+                        for cp in list(connected_points):
+                            if _point_on_wire_segment(cp[0], cp[1], wx1, wy1, wx2, wy2, eps):
+                                connected_points.add(p1)
+                                connected_points.add(p2)
+                                changed = True
+                                break
+                    # Also check: does either endpoint of this wire land on the mid-segment of
+                    # any already-connected wire? (reverse T-junction direction)
+                    if not p1_in:
+                        for owx1, owy1, owx2, owy2 in all_wires:
+                            if (owx1, owy1, owx2, owy2) == (wx1, wy1, wx2, wy2):
+                                continue
+                            o1_in = any(abs(owx1 - cp[0]) < eps and abs(owy1 - cp[1]) < eps for cp in connected_points)
+                            o2_in = any(abs(owx2 - cp[0]) < eps and abs(owy2 - cp[1]) < eps for cp in connected_points)
+                            if (o1_in or o2_in) and _point_on_wire_segment(p1[0], p1[1], owx1, owy1, owx2, owy2, eps):
+                                connected_points.add(p1)
+                                connected_points.add(p2)
+                                changed = True
+                                break
+                    if not p2_in:
+                        for owx1, owy1, owx2, owy2 in all_wires:
+                            if (owx1, owy1, owx2, owy2) == (wx1, wy1, wx2, wy2):
+                                continue
+                            o1_in = any(abs(owx1 - cp[0]) < eps and abs(owy1 - cp[1]) < eps for cp in connected_points)
+                            o2_in = any(abs(owx2 - cp[0]) < eps and abs(owy2 - cp[1]) < eps for cp in connected_points)
+                            if (o1_in or o2_in) and _point_on_wire_segment(p2[0], p2[1], owx1, owy1, owx2, owy2, eps):
+                                connected_points.add(p1)
+                                connected_points.add(p2)
+                                changed = True
+                                break
 
             # ── Wires on this net ──
             net_wires = []
             for wx1, wy1, wx2, wy2 in all_wires:
                 p1_in = any(abs(wx1 - cp[0]) < eps and abs(wy1 - cp[1]) < eps for cp in connected_points)
                 p2_in = any(abs(wx2 - cp[0]) < eps and abs(wy2 - cp[1]) < eps for cp in connected_points)
-                if p1_in or p2_in:
+                # Also check if any connected point lands on this wire mid-segment (T-junction)
+                mid_hit = any(_point_on_wire_segment(cp[0], cp[1], wx1, wy1, wx2, wy2, eps) for cp in connected_points)
+                if p1_in or p2_in or mid_hit:
                     net_wires.append({"start": [wx1, wy1], "end": [wx2, wy2]})
 
             # ── Component pins on this net ──
@@ -1593,7 +1759,7 @@ class KiCADInterface:
                         rad = _math.radians(sym_rot)
                         cos_r, sin_r = _math.cos(rad), _math.sin(rad)
                         rot_x = pin_rel_x * cos_r - pin_rel_y * sin_r
-                        rot_y = pin_rel_x * sin_r + pin_rel_y * cos_r
+                        rot_y = -pin_rel_x * sin_r + pin_rel_y * cos_r
                         pin_x = sym_x + rot_x
                         pin_y = sym_y + rot_y
 
@@ -1620,7 +1786,7 @@ class KiCADInterface:
             }
         except Exception as e:
             logger.error(f"Error getting net connectivity: {e}")
-            import traceback
+
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
 
@@ -1646,7 +1812,7 @@ class KiCADInterface:
                 return {"success": False, "message": "Failed to load schematic"}
 
             sch_file = Path(schematic_path)
-            locator = PinLocator()
+            locator = self.pin_locator
 
             with open(schematic_path, "r", encoding="utf-8") as f:
                 content = f.read()
@@ -1732,12 +1898,13 @@ class KiCADInterface:
                     rad = math.radians(sym_rot)
                     cos_r, sin_r = math.cos(rad), math.sin(rad)
                     rot_x = pin_rel_x * cos_r - pin_rel_y * sin_r
-                    rot_y = pin_rel_x * sin_r + pin_rel_y * cos_r
+                    rot_y = -pin_rel_x * sin_r + pin_rel_y * cos_r
                     return (sym_x + rot_x, sym_y + rot_y)
                 return None
 
             def trace_connectivity(start_point):
-                """Trace wire connectivity from a point, return all reachable points."""
+                """Trace wire connectivity from a point, return all reachable points.
+                Includes T-junction detection (point on mid-segment of another wire)."""
                 reached = {start_point}
                 changed = True
                 while changed:
@@ -1753,6 +1920,37 @@ class KiCADInterface:
                         elif p2_in and not p1_in:
                             reached.add(p1)
                             changed = True
+                        elif not p1_in and not p2_in:
+                            # T-junction: does a reached point lie on this wire's mid-segment?
+                            for rp in list(reached):
+                                if _point_on_wire_segment(rp[0], rp[1], wx1, wy1, wx2, wy2, eps):
+                                    reached.add(p1)
+                                    reached.add(p2)
+                                    changed = True
+                                    break
+                        # Reverse T-junction: does this wire's endpoint lie on a connected wire?
+                        if not p1_in:
+                            for owx1, owy1, owx2, owy2 in all_wires:
+                                if (owx1, owy1, owx2, owy2) == (wx1, wy1, wx2, wy2):
+                                    continue
+                                o1_in = any(abs(owx1 - r[0]) < eps and abs(owy1 - r[1]) < eps for r in reached)
+                                o2_in = any(abs(owx2 - r[0]) < eps and abs(owy2 - r[1]) < eps for r in reached)
+                                if (o1_in or o2_in) and _point_on_wire_segment(p1[0], p1[1], owx1, owy1, owx2, owy2, eps):
+                                    reached.add(p1)
+                                    reached.add(p2)
+                                    changed = True
+                                    break
+                        if not p2_in:
+                            for owx1, owy1, owx2, owy2 in all_wires:
+                                if (owx1, owy1, owx2, owy2) == (wx1, wy1, wx2, wy2):
+                                    continue
+                                o1_in = any(abs(owx1 - r[0]) < eps and abs(owy1 - r[1]) < eps for r in reached)
+                                o2_in = any(abs(owx2 - r[0]) < eps and abs(owy2 - r[1]) < eps for r in reached)
+                                if (o1_in or o2_in) and _point_on_wire_segment(p2[0], p2[1], owx1, owy1, owx2, owy2, eps):
+                                    reached.add(p1)
+                                    reached.add(p2)
+                                    changed = True
+                                    break
                 return reached
 
             results = []
@@ -1805,7 +2003,7 @@ class KiCADInterface:
             }
         except Exception as e:
             logger.error(f"Error validating wire connections: {e}")
-            import traceback
+
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
 
@@ -1836,7 +2034,7 @@ class KiCADInterface:
             text_block = (
                 f'  (text "{text}" (at {x} {y} {angle})\n'
                 f"    (effects (font (size {size} {size})))\n"
-                f"    (uuid {text_uuid})\n"
+                f'    (uuid "{text_uuid}")\n'
                 f"  )\n\n"
             )
 
@@ -1847,7 +2045,7 @@ class KiCADInterface:
             return {"success": True, "message": f"Added text at ({x}, {y})"}
         except Exception as e:
             logger.error(f"Error adding schematic text: {e}")
-            import traceback
+
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
 
@@ -2045,7 +2243,7 @@ class KiCADInterface:
             return {"success": True, "message": f"Rotated label '{net_name}' to {angle}° (justify {new_justify})"}
         except Exception as e:
             logger.error(f"Error rotating label: {e}")
-            import traceback
+
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
 
@@ -2090,7 +2288,7 @@ class KiCADInterface:
             }
         except Exception as e:
             logger.error(f"Error in batch_delete_schematic_components: {e}")
-            import traceback
+
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
 
@@ -2214,7 +2412,7 @@ class KiCADInterface:
 
         except Exception as e:
             logger.error(f"Error getting schematic component: {e}")
-            import traceback
+
 
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
@@ -2265,7 +2463,7 @@ class KiCADInterface:
                 return {"success": False, "message": "Failed to add wire"}
         except Exception as e:
             logger.error(f"Error adding wire to schematic: {str(e)}")
-            import traceback
+
 
             logger.error(traceback.format_exc())
             return {
@@ -2522,7 +2720,7 @@ class KiCADInterface:
                 return {"success": False, "message": "Failed to add connection"}
         except Exception as e:
             logger.error(f"Error adding schematic connection: {str(e)}")
-            import traceback
+
 
             logger.error(traceback.format_exc())
             return {
@@ -2573,7 +2771,7 @@ class KiCADInterface:
                 return {"success": False, "message": "Failed to add net label"}
         except Exception as e:
             logger.error(f"Error adding net label: {str(e)}")
-            import traceback
+
 
             logger.error(traceback.format_exc())
             return {
@@ -2618,7 +2816,7 @@ class KiCADInterface:
                 return {"success": False, "message": "Failed to connect to net"}
         except Exception as e:
             logger.error(f"Error connecting to net: {str(e)}")
-            import traceback
+
 
             logger.error(traceback.format_exc())
             return {
@@ -2659,7 +2857,7 @@ class KiCADInterface:
             }
         except Exception as e:
             logger.error(f"Error in connect_passthrough: {str(e)}")
-            import traceback
+
 
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
@@ -2680,7 +2878,7 @@ class KiCADInterface:
                     "message": "Missing required parameters: schematicPath, reference",
                 }
 
-            locator = PinLocator()
+            locator = self.pin_locator
             all_pins = locator.get_all_symbol_pins(Path(schematic_path), reference)
 
             if not all_pins:
@@ -2714,7 +2912,7 @@ class KiCADInterface:
 
         except Exception as e:
             logger.error(f"Error getting pin locations: {e}")
-            import traceback
+
 
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
@@ -2744,7 +2942,7 @@ class KiCADInterface:
             if not schematic:
                 return {"success": False, "message": "Failed to load schematic"}
 
-            locator = PinLocator()
+            locator = self.pin_locator
             ref_set = set(references)
             results = {}
 
@@ -2770,10 +2968,22 @@ class KiCADInterface:
                     results[ref] = {"error": "no pin definitions"}
                     continue
 
+                # Extract mirror transforms
+                mirror_x = False
+                mirror_y = False
+                if hasattr(symbol, "mirror"):
+                    mirror_val = str(symbol.mirror.value) if hasattr(symbol.mirror, 'value') else str(symbol.mirror)
+                    mirror_x = "x" in mirror_val
+                    mirror_y = "y" in mirror_val
+
                 pins = {}
                 for pin_num, pin_data in pins_def.items():
                     pin_rel_x = pin_data["x"]
                     pin_rel_y = -pin_data["y"]  # Y-negate: symbol-local Y-up → schematic Y-down
+                    if mirror_x:
+                        pin_rel_y = -pin_rel_y
+                    if mirror_y:
+                        pin_rel_x = -pin_rel_x
                     if sym_rot != 0:
                         pin_rel_x, pin_rel_y = PinLocator.rotate_point(
                             pin_rel_x, pin_rel_y, sym_rot
@@ -2800,7 +3010,7 @@ class KiCADInterface:
 
         except Exception as e:
             logger.error(f"Error in batch pin locations: {e}")
-            import traceback
+
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
 
@@ -2956,7 +3166,7 @@ class KiCADInterface:
 
         except Exception as e:
             logger.error(f"Error in move_region: {e}")
-            import traceback
+
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
 
@@ -2995,7 +3205,7 @@ class KiCADInterface:
             }
         except Exception as e:
             logger.error(f"Error in batch_add_wire: {e}")
-            import traceback
+
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
 
@@ -3016,7 +3226,7 @@ class KiCADInterface:
             sch_file = Path(schematic_path)
 
             # Get pin endpoints for this component
-            locator = PinLocator()
+            locator = self.pin_locator
             all_pins = locator.get_all_symbol_pins(sch_file, reference)
             if not all_pins:
                 return {"success": False, "message": f"No pins found for {reference}"}
@@ -3078,7 +3288,7 @@ class KiCADInterface:
 
         except Exception as e:
             logger.error(f"Error in get_connected_items: {e}")
-            import traceback
+
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
 
@@ -3139,7 +3349,7 @@ class KiCADInterface:
 
         except Exception as e:
             logger.error(f"Error in batch_delete: {e}")
-            import traceback
+
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
 
@@ -3207,7 +3417,7 @@ class KiCADInterface:
 
         except Exception as e:
             logger.error(f"Error in move_labels_by_offset: {e}")
-            import traceback
+
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
 
@@ -3234,7 +3444,7 @@ class KiCADInterface:
                 content = f.read()
 
             tolerance = 0.5
-            locator = PinLocator()
+            locator = self.pin_locator
 
             # Collect all connectable points: pin endpoints, wire endpoints, label positions, junctions
             pin_points = []  # [(x, y, ref, pin_num)]
@@ -3257,8 +3467,18 @@ class KiCADInterface:
                 sym_rot = float(position[2]) if len(position) > 2 else 0.0
                 import math
                 pins_def = locator.get_symbol_pins(sch_file, lib_id)
+                _mirror_x = False
+                _mirror_y = False
+                if hasattr(symbol, "mirror"):
+                    _mv = str(symbol.mirror.value) if hasattr(symbol.mirror, 'value') else str(symbol.mirror)
+                    _mirror_x = "x" in _mv
+                    _mirror_y = "y" in _mv
                 for pin_num, pd in (pins_def or {}).items():
                     prx, pry = pd["x"], -pd["y"]
+                    if _mirror_x:
+                        pry = -pry
+                    if _mirror_y:
+                        prx = -prx
                     if sym_rot != 0:
                         prx, pry = PinLocator.rotate_point(prx, pry, sym_rot)
                     # Pin (at) IS the endpoint — no length math
@@ -3266,7 +3486,8 @@ class KiCADInterface:
                     ey = round(sy + pry, 4)
                     pin_points.append((ex, ey, ref, pin_num))
 
-            # Get wire endpoints
+            # Get wire endpoints and wire segments
+            wire_segments = []  # [(x1, y1, x2, y2)] for T-junction detection
             wire_pat = re.compile(r'\(wire\b')
             for m in wire_pat.finditer(content):
                 pos = m.start()
@@ -3280,8 +3501,12 @@ class KiCADInterface:
                     end += 1
                 block = content[pos:end]
                 xy_ms = re.findall(r'\(xy\s+([\d.e+-]+)\s+([\d.e+-]+)\)', block)
-                for xm in xy_ms:
-                    wire_endpoints.append((float(xm[0]), float(xm[1])))
+                if len(xy_ms) >= 2:
+                    x1, y1 = float(xy_ms[0][0]), float(xy_ms[0][1])
+                    x2, y2 = float(xy_ms[-1][0]), float(xy_ms[-1][1])
+                    wire_endpoints.append((x1, y1))
+                    wire_endpoints.append((x2, y2))
+                    wire_segments.append((x1, y1, x2, y2))
 
             # Get label positions
             for lt in ["label", "global_label", "hierarchical_label"]:
@@ -3307,12 +3532,20 @@ class KiCADInterface:
                             return True
                 return False
 
+            def point_on_any_wire_segment(px, py):
+                """Check if (px, py) lies on the mid-segment of any wire (T-junction)."""
+                for wx1, wy1, wx2, wy2 in wire_segments:
+                    if _point_on_wire_segment(px, py, wx1, wy1, wx2, wy2, tolerance):
+                        return True
+                return False
+
             # All non-wire connection points (pins, labels, junctions)
             non_wire_points = [(x, y) for x, y, _, _ in pin_points]
             non_wire_points += [(x, y) for x, y, _, _ in label_points]
             non_wire_points += list(junction_points)
 
             # Find dangling wire endpoints (not touching a pin, label, junction, or other wire endpoint)
+            # Also checks T-junctions: an endpoint that lands on another wire's mid-segment is connected
             dangling_wires = []
             seen = set()
             for wx, wy in wire_endpoints:
@@ -3327,15 +3560,26 @@ class KiCADInterface:
                         connected = True
                         break
                 if not connected:
-                    # Check against OTHER wire endpoints (T-junctions, wire-to-wire)
+                    # Check against OTHER wire endpoints (wire-to-wire at shared endpoint)
                     other_count = 0
                     for ox, oy in wire_endpoints:
                         if point_near(wx, wy, ox, oy):
                             other_count += 1
-                    if other_count <= 1:  # only itself
-                        dangling_wires.append({"x": wx, "y": wy})
+                    if other_count > 1:  # more than just itself
+                        connected = True
+                if not connected:
+                    # T-junction: does this endpoint land on another wire's mid-segment?
+                    for sx1, sy1, sx2, sy2 in wire_segments:
+                        # Skip the wire this endpoint belongs to
+                        if (point_near(wx, wy, sx1, sy1) or point_near(wx, wy, sx2, sy2)):
+                            continue
+                        if _point_on_wire_segment(wx, wy, sx1, sy1, sx2, sy2, tolerance):
+                            connected = True
+                            break
+                if not connected:
+                    dangling_wires.append({"x": wx, "y": wy})
 
-            # Find orphan labels (not touching a wire or pin)
+            # Find orphan labels (not touching a wire endpoint, wire mid-segment, or pin)
             orphan_labels = []
             for lx, ly, name, lt in label_points:
                 touching = False
@@ -3343,6 +3587,10 @@ class KiCADInterface:
                     if point_near(lx, ly, wx, wy):
                         touching = True
                         break
+                if not touching:
+                    # T-junction: label on a wire mid-segment
+                    if point_on_any_wire_segment(lx, ly):
+                        touching = True
                 if not touching:
                     for px, py, _, _ in pin_points:
                         if point_near(lx, ly, px, py):
@@ -3352,6 +3600,7 @@ class KiCADInterface:
                     orphan_labels.append({"netName": name, "x": lx, "y": ly, "type": lt})
 
             # Find unconnected pins (check wires, labels, AND other pin endpoints for power symbols)
+            # Also checks T-junctions: pin on wire mid-segment
             unconnected_pins = []
             for px, py, ref, pnum in pin_points:
                 connected = False
@@ -3359,6 +3608,10 @@ class KiCADInterface:
                     if point_near(px, py, wx, wy):
                         connected = True
                         break
+                if not connected:
+                    # T-junction: pin endpoint on a wire mid-segment
+                    if point_on_any_wire_segment(px, py):
+                        connected = True
                 if not connected:
                     for lx, ly, _, _ in label_points:
                         if point_near(px, py, lx, ly):
@@ -3387,7 +3640,7 @@ class KiCADInterface:
 
         except Exception as e:
             logger.error(f"Error in find_orphan_items: {e}")
-            import traceback
+
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
 
@@ -3407,7 +3660,7 @@ class KiCADInterface:
         if not schematic:
             return None
 
-        locator = PinLocator()
+        locator = self.pin_locator
         sch_file = Path(schematic_path)
 
         with open(schematic_path, "r", encoding="utf-8") as f:
@@ -3849,7 +4102,7 @@ class KiCADInterface:
 
         except Exception as e:
             logger.error(f"Error checking overlaps: {e}")
-            import traceback
+
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
 
@@ -4076,7 +4329,7 @@ class KiCADInterface:
 
         except Exception as e:
             logger.error(f"Error getting schematic layout: {e}")
-            import traceback
+
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
 
@@ -4103,7 +4356,7 @@ class KiCADInterface:
             with open(schematic_path, "r", encoding="utf-8") as f:
                 content = f.read()
 
-            locator = PinLocator()
+            locator = self.pin_locator
             tolerance = 0.5
 
             # Find the symbol
@@ -4123,6 +4376,14 @@ class KiCADInterface:
             sym_rot = float(position[2]) if len(position) > 2 else 0.0
 
             pins_def = locator.get_symbol_pins(sch_file, lib_id) if lib_id else {}
+
+            # Extract mirror transforms for pin math
+            mirror_x = False
+            mirror_y = False
+            if hasattr(target, "mirror"):
+                mirror_val = str(target.mirror.value) if hasattr(target.mirror, 'value') else str(target.mirror)
+                mirror_x = "x" in mirror_val
+                mirror_y = "y" in mirror_val
 
             # Get wire endpoints and labels from file
             wire_endpoints = []
@@ -4184,6 +4445,10 @@ class KiCADInterface:
             pin_results = []
             for pin_num, pd in (pins_def or {}).items():
                 prx, pry = pd["x"], -pd["y"]
+                if mirror_x:
+                    pry = -pry
+                if mirror_y:
+                    prx = -prx
                 if sym_rot != 0:
                     prx, pry = PinLocator.rotate_point(prx, pry, sym_rot)
                 # Pin (at) IS the endpoint — no length math
@@ -4202,7 +4467,20 @@ class KiCADInterface:
                         has_wire = True
                         connected_points.add((round(wx, 1), round(wy, 1)))
 
+                # Also check T-junctions: pin endpoint on mid-segment of a wire
+                if not has_wire:
+                    for wi in range(0, len(wire_endpoints), 2):
+                        if wi + 1 >= len(wire_endpoints):
+                            break
+                        w1x, w1y = wire_endpoints[wi]
+                        w2x, w2y = wire_endpoints[wi + 1]
+                        if _point_on_wire_segment(ex, ey, w1x, w1y, w2x, w2y, tolerance):
+                            has_wire = True
+                            connected_points.add((round(w1x, 1), round(w1y, 1)))
+                            connected_points.add((round(w2x, 1), round(w2y, 1)))
+
                 # Follow wires transitively to find all connected points
+                # Includes T-junction detection
                 if has_wire:
                     changed = True
                     while changed:
@@ -4212,12 +4490,45 @@ class KiCADInterface:
                                 break
                             w1 = (round(wire_endpoints[wi][0], 1), round(wire_endpoints[wi][1], 1))
                             w2 = (round(wire_endpoints[wi+1][0], 1), round(wire_endpoints[wi+1][1], 1))
-                            if w1 in connected_points and w2 not in connected_points:
+                            w1_in = w1 in connected_points
+                            w2_in = w2 in connected_points
+                            if w1_in and not w2_in:
                                 connected_points.add(w2)
                                 changed = True
-                            elif w2 in connected_points and w1 not in connected_points:
+                            elif w2_in and not w1_in:
                                 connected_points.add(w1)
                                 changed = True
+                            elif not w1_in and not w2_in:
+                                # Forward T-junction: does a connected point lie on this wire mid-segment?
+                                w1x, w1y = wire_endpoints[wi]
+                                w2x, w2y = wire_endpoints[wi + 1]
+                                for cp in list(connected_points):
+                                    if _point_on_wire_segment(cp[0], cp[1], w1x, w1y, w2x, w2y, tolerance):
+                                        connected_points.add(w1)
+                                        connected_points.add(w2)
+                                        changed = True
+                                        break
+                            # Reverse T-junction: does this wire's endpoint land on a connected wire's mid-segment?
+                            if not changed and (w1_in or w2_in):
+                                pass  # Already handled above
+                            elif not changed:
+                                w1x, w1y = wire_endpoints[wi]
+                                w2x, w2y = wire_endpoints[wi + 1]
+                                for wj in range(0, len(wire_endpoints), 2):
+                                    if wj == wi or wj + 1 >= len(wire_endpoints):
+                                        continue
+                                    cw1 = (round(wire_endpoints[wj][0], 1), round(wire_endpoints[wj][1], 1))
+                                    cw2 = (round(wire_endpoints[wj+1][0], 1), round(wire_endpoints[wj+1][1], 1))
+                                    if cw1 not in connected_points and cw2 not in connected_points:
+                                        continue
+                                    cw1x, cw1y = wire_endpoints[wj]
+                                    cw2x, cw2y = wire_endpoints[wj + 1]
+                                    if _point_on_wire_segment(w1x, w1y, cw1x, cw1y, cw2x, cw2y, tolerance) or \
+                                       _point_on_wire_segment(w2x, w2y, cw1x, cw1y, cw2x, cw2y, tolerance):
+                                        connected_points.add(w1)
+                                        connected_points.add(w2)
+                                        changed = True
+                                        break
 
                 # Check labels at any connected point
                 for lx, ly, name, lt in label_map:
@@ -4256,7 +4567,167 @@ class KiCADInterface:
 
         except Exception as e:
             logger.error(f"Error in get_pin_connections: {e}")
-            import traceback
+
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e)}
+
+    def _handle_trace_from_point(self, params):
+        """Trace all electrically connected elements from a coordinate."""
+        logger.info("Tracing from point")
+        try:
+            schematic_path = params.get("schematicPath")
+            x = float(params.get("x", 0))
+            y = float(params.get("y", 0))
+            tolerance = float(params.get("tolerance", 0.05))
+
+            if not schematic_path or not os.path.exists(schematic_path):
+                return {"success": False, "message": "schematicPath is required and must exist"}
+
+            # Parse geometry using existing helper
+            geometry = self._parse_schematic_geometry(schematic_path)
+            if geometry is None:
+                return {"success": False, "message": "Failed to load schematic"}
+
+            wires = geometry.get("wires", [])
+            junctions = geometry.get("junctions", [])
+            labels = geometry.get("labels", [])
+            components = geometry.get("components", [])
+
+            # Build wire list as (x1, y1, x2, y2) tuples
+            wire_segments = []
+            for w in wires:
+                if isinstance(w, dict):
+                    wire_segments.append((w["x1"], w["y1"], w["x2"], w["y2"]))
+                elif isinstance(w, (list, tuple)) and len(w) >= 4:
+                    wire_segments.append((w[0], w[1], w[2], w[3]))
+
+            # Build pin list from components' pin_endpoints
+            all_pins = []  # [(x, y, ref)]
+            for comp in components:
+                ref = comp.get("ref", "")
+                for ep in comp.get("pin_endpoints", []):
+                    if isinstance(ep, (list, tuple)) and len(ep) >= 2:
+                        all_pins.append((float(ep[0]), float(ep[1]), ref))
+
+            # Flood fill from starting point
+            visited_points = set()
+            queue = [(x, y)]
+            traced_wires = []
+            traced_junctions = []
+            traced_labels = []
+            traced_pins = []
+            dead_ends = []
+
+            while queue:
+                px, py = queue.pop(0)
+                # Round for set membership
+                key = (round(px, 2), round(py, 2))
+                if key in visited_points:
+                    continue
+                visited_points.add(key)
+
+                # Find connected wires (endpoints + T-junctions)
+                connections = _find_connected_wires(px, py, wire_segments, tolerance)
+
+                if not connections:
+                    # Check if this point is a pin, label, or junction
+                    is_something = False
+                    for pin_x, pin_y, _ref in all_pins:
+                        if abs(px - pin_x) < tolerance and abs(py - pin_y) < tolerance:
+                            is_something = True
+                            break
+                    if not is_something:
+                        for lbl in labels:
+                            lx = float(lbl.get("x", 0))
+                            ly = float(lbl.get("y", 0))
+                            if abs(px - lx) < tolerance and abs(py - ly) < tolerance:
+                                is_something = True
+                                break
+                    if not is_something:
+                        dead_ends.append({"x": px, "y": py})
+                    continue
+
+                for wire_idx, pos_type in connections:
+                    w = wire_segments[wire_idx]
+                    wire_info = {"x1": w[0], "y1": w[1], "x2": w[2], "y2": w[3], "connection": pos_type}
+                    if wire_info not in traced_wires:
+                        traced_wires.append(wire_info)
+
+                    # Add the other endpoint(s) to queue
+                    if pos_type == 'start':
+                        queue.append((float(w[2]), float(w[3])))
+                    elif pos_type == 'end':
+                        queue.append((float(w[0]), float(w[1])))
+                    elif pos_type == 'mid':
+                        # T-junction: trace to both endpoints
+                        queue.append((float(w[0]), float(w[1])))
+                        queue.append((float(w[2]), float(w[3])))
+
+                # Check for labels at this point
+                for lbl in labels:
+                    lx = float(lbl.get("x", 0))
+                    ly = float(lbl.get("y", 0))
+                    if abs(px - lx) < tolerance and abs(py - ly) < tolerance:
+                        lbl_info = {"name": lbl.get("name", ""), "type": lbl.get("type", ""), "x": lx, "y": ly}
+                        if lbl_info not in traced_labels:
+                            traced_labels.append(lbl_info)
+
+                # Check for pins at this point
+                for pin_x, pin_y, pin_ref in all_pins:
+                    if abs(px - pin_x) < tolerance and abs(py - pin_y) < tolerance:
+                        pin_info = {"ref": pin_ref, "x": pin_x, "y": pin_y}
+                        if pin_info not in traced_pins:
+                            traced_pins.append(pin_info)
+
+                # Check for junctions at this point
+                for junc in junctions:
+                    jx = float(junc.get("x", 0))
+                    jy = float(junc.get("y", 0))
+                    if abs(px - jx) < tolerance and abs(py - jy) < tolerance:
+                        junc_info = {"x": jx, "y": jy}
+                        if junc_info not in traced_junctions:
+                            traced_junctions.append(junc_info)
+
+            return {
+                "success": True,
+                "start": {"x": x, "y": y},
+                "wires": traced_wires,
+                "junctions": traced_junctions,
+                "labels": traced_labels,
+                "pins": traced_pins,
+                "dead_ends": dead_ends,
+                "total_points_visited": len(visited_points),
+            }
+        except Exception as e:
+            logger.error(f"Error in trace_from_point: {e}")
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e)}
+
+    def _handle_split_wire_at_point(self, params):
+        """Split a wire at a given point, creating two wire segments."""
+        logger.info("Splitting wire at point")
+        try:
+            schematic_path = params.get("schematicPath")
+            split_x = float(params.get("x", 0))
+            split_y = float(params.get("y", 0))
+            add_junction = params.get("addJunction", True)
+            tolerance = float(params.get("tolerance", 0.05))
+
+            if not schematic_path or not os.path.exists(schematic_path):
+                return {"success": False, "message": "schematicPath is required and must exist"}
+
+            from commands.sexp_writer import split_wire_at_point
+            result = split_wire_at_point(schematic_path, split_x, split_y, add_junction, tolerance)
+            if result:
+                return {
+                    "success": True,
+                    "message": f"Wire split at ({split_x}, {split_y})",
+                    "split_point": {"x": split_x, "y": split_y},
+                }
+            else:
+                return {"success": False, "message": f"No wire found at ({split_x}, {split_y}) to split"}
+        except Exception as e:
+            logger.error(f"Error in split_wire_at_point: {e}")
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
 
@@ -4388,7 +4859,7 @@ class KiCADInterface:
             return {"success": False, "message": "kicad-cli not found in PATH"}
         except Exception as e:
             logger.error(f"Error getting schematic view: {e}")
-            import traceback
+
 
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
@@ -4422,7 +4893,7 @@ class KiCADInterface:
 
             # Create PinLocator once; pin_definition_cache is shared across calls
             # so get_symbol_pins only parses the file once per lib_id.
-            locator = PinLocator()
+            locator = self.pin_locator
             components = []
 
             # Pre-cache: parse pin definitions from the schematic file once
@@ -4478,10 +4949,21 @@ class KiCADInterface:
                 try:
                     pins_def = locator.get_symbol_pins(sch_file, lib_id) if lib_id else {}
                     if pins_def:
+                        # Extract mirror transforms
+                        _mirror_x = False
+                        _mirror_y = False
+                        if hasattr(symbol, "mirror"):
+                            _mv = str(symbol.mirror.value) if hasattr(symbol.mirror, 'value') else str(symbol.mirror)
+                            _mirror_x = "x" in _mv
+                            _mirror_y = "y" in _mv
                         pin_list = []
                         for pin_num, pin_data in pins_def.items():
                             pin_rel_x = pin_data["x"]
                             pin_rel_y = -pin_data["y"]  # Y-negate: symbol-local Y-up → schematic Y-down
+                            if _mirror_x:
+                                pin_rel_y = -pin_rel_y
+                            if _mirror_y:
+                                pin_rel_x = -pin_rel_x
                             # Apply symbol rotation
                             if sym_rot != 0:
                                 pin_rel_x, pin_rel_y = PinLocator.rotate_point(
@@ -4507,7 +4989,7 @@ class KiCADInterface:
 
         except Exception as e:
             logger.error(f"Error listing schematic components: {e}")
-            import traceback
+
 
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
@@ -4568,7 +5050,7 @@ class KiCADInterface:
 
         except Exception as e:
             logger.error(f"Error listing schematic nets: {e}")
-            import traceback
+
 
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
@@ -4611,7 +5093,7 @@ class KiCADInterface:
 
         except Exception as e:
             logger.error(f"Error listing schematic wires: {e}")
-            import traceback
+
 
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
@@ -4757,7 +5239,7 @@ class KiCADInterface:
 
         except Exception as e:
             logger.error(f"Error listing schematic labels: {e}")
-            import traceback
+
 
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
@@ -4829,7 +5311,7 @@ class KiCADInterface:
 
         except Exception as e:
             logger.error(f"Error moving schematic component: {e}")
-            import traceback
+
 
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
@@ -4864,7 +5346,7 @@ class KiCADInterface:
                 return {"success": False, "message": "offset with non-zero x or y is required"}
 
             sch_file = Path(schematic_path)
-            locator = PinLocator()
+            locator = self.pin_locator
 
             # 1. Get OLD pin positions before moving
             old_pins = locator.get_all_symbol_pins(sch_file, reference)
@@ -5060,7 +5542,7 @@ class KiCADInterface:
             }
         except Exception as e:
             logger.error(f"Error in move_connected: {e}")
-            import traceback
+
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
 
@@ -5112,7 +5594,7 @@ class KiCADInterface:
 
         except Exception as e:
             logger.error(f"Error rotating schematic component: {e}")
-            import traceback
+
 
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
@@ -5246,7 +5728,7 @@ class KiCADInterface:
 
         except Exception as e:
             logger.error(f"Error annotating schematic: {e}")
-            import traceback
+
 
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
@@ -5278,7 +5760,7 @@ class KiCADInterface:
 
         except Exception as e:
             logger.error(f"Error deleting schematic wire: {e}")
-            import traceback
+
 
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
@@ -5323,7 +5805,7 @@ class KiCADInterface:
             }
         except Exception as e:
             logger.error(f"Error in batch_delete_schematic_wire: {e}")
-            import traceback
+
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
 
@@ -5356,8 +5838,77 @@ class KiCADInterface:
 
         except Exception as e:
             logger.error(f"Error deleting schematic net label: {e}")
-            import traceback
 
+
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e)}
+
+    def _handle_delete_no_connect(self, params):
+        """Delete a no-connect flag from the schematic at a given position"""
+        logger.info("Deleting no-connect")
+        try:
+            schematic_path = params.get("schematicPath")
+            position = params.get("position", {})
+
+            if not schematic_path:
+                return {"success": False, "message": "schematicPath is required"}
+            if not position:
+                return {"success": False, "message": "position is required"}
+
+            from pathlib import Path
+            from commands.sexp_writer import delete_no_connect
+
+            pos = [position.get("x", 0), position.get("y", 0)]
+            deleted = delete_no_connect(Path(schematic_path), pos)
+            if deleted:
+                return {"success": True, "message": f"Deleted no-connect at ({pos[0]}, {pos[1]})"}
+            else:
+                return {"success": False, "message": f"No matching no-connect found at ({pos[0]}, {pos[1]})"}
+
+        except Exception as e:
+            logger.error(f"Error deleting no-connect: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e)}
+
+    def _handle_batch_delete_no_connect(self, params):
+        """Delete multiple no-connect flags in a single call. Single read/write cycle."""
+        logger.info("Batch deleting no-connects")
+        try:
+            from pathlib import Path
+            from commands.sexp_writer import delete_no_connect_from_content, _read_schematic, _write_schematic
+
+            schematic_path = params.get("schematicPath")
+            positions = params.get("positions", [])
+
+            if not schematic_path:
+                return {"success": False, "message": "schematicPath is required"}
+            if not positions:
+                return {"success": False, "message": "positions array is required"}
+
+            content = _read_schematic(Path(schematic_path))
+            deleted = 0
+            failed = []
+            for p in positions:
+                pos = [p.get("x", 0), p.get("y", 0)]
+                result = delete_no_connect_from_content(content, pos)
+                if result is not None:
+                    content = result
+                    deleted += 1
+                else:
+                    failed.append({"x": pos[0], "y": pos[1]})
+
+            _write_schematic(Path(schematic_path), content)
+
+            return {
+                "success": True,
+                "message": f"Deleted {deleted}/{len(positions)} no-connects",
+                "deleted": deleted,
+                "failed": failed,
+            }
+        except Exception as e:
+            logger.error(f"Error in batch_delete_no_connect: {e}")
+            import traceback
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
 
@@ -5651,6 +6202,154 @@ class KiCADInterface:
             logger.error(f"Error generating netlist: {str(e)}")
             return {"success": False, "message": str(e)}
 
+    # ── Net analysis tools (delegate to commands/net_analysis.py) ──
+
+    def _handle_get_component_nets(self, params):
+        """Return pin-to-net mapping for every pin of a component."""
+        logger.info("Getting component nets")
+        try:
+            from commands.net_analysis import get_component_nets
+
+            schematic_path = params.get("schematicPath")
+            reference = params.get("reference")
+            if not schematic_path:
+                return {"success": False, "message": "schematicPath is required"}
+            if not reference:
+                return {"success": False, "message": "reference is required"}
+
+            schematic = SchematicManager.load_schematic(schematic_path)
+            if not schematic:
+                return {"success": False, "message": "Failed to load schematic"}
+
+            result, error = get_component_nets(
+                schematic, schematic_path, self.pin_locator, reference
+            )
+            if error:
+                return {"success": False, "message": error}
+            return {"success": True, **result}
+        except Exception as e:
+            logger.error(f"Error in get_component_nets: {e}")
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e)}
+
+    def _handle_get_net_components(self, params):
+        """Return all component pins connected to a named net."""
+        logger.info("Getting net components")
+        try:
+            from commands.net_analysis import get_net_components
+
+            schematic_path = params.get("schematicPath")
+            net_name = params.get("netName")
+            if not schematic_path:
+                return {"success": False, "message": "schematicPath is required"}
+            if not net_name:
+                return {"success": False, "message": "netName is required"}
+
+            schematic = SchematicManager.load_schematic(schematic_path)
+            if not schematic:
+                return {"success": False, "message": "Failed to load schematic"}
+
+            result, error = get_net_components(
+                schematic, schematic_path, self.pin_locator, net_name
+            )
+            if error:
+                return {"success": False, "message": error}
+            return {"success": True, **result}
+        except Exception as e:
+            logger.error(f"Error in get_net_components: {e}")
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e)}
+
+    def _handle_get_pin_net_name(self, params):
+        """Return just the net name for a single component pin."""
+        logger.info("Getting pin net name")
+        try:
+            from commands.net_analysis import get_pin_net_name
+
+            schematic_path = params.get("schematicPath")
+            reference = params.get("reference")
+            pin = params.get("pin")
+            if not schematic_path:
+                return {"success": False, "message": "schematicPath is required"}
+            if not reference:
+                return {"success": False, "message": "reference is required"}
+            if not pin:
+                return {"success": False, "message": "pin is required"}
+
+            schematic = SchematicManager.load_schematic(schematic_path)
+            if not schematic:
+                return {"success": False, "message": "Failed to load schematic"}
+
+            result, error = get_pin_net_name(
+                schematic, schematic_path, self.pin_locator, reference, str(pin)
+            )
+            if error:
+                return {"success": False, "message": error}
+            return {"success": True, **result}
+        except Exception as e:
+            logger.error(f"Error in get_pin_net_name: {e}")
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e)}
+
+    def _handle_export_netlist_summary(self, params):
+        """Dump the complete netlist as simple text: component->pin->net."""
+        logger.info("Exporting netlist summary")
+        try:
+            from commands.net_analysis import export_netlist_summary
+
+            schematic_path = params.get("schematicPath")
+            if not schematic_path:
+                return {"success": False, "message": "schematicPath is required"}
+
+            schematic = SchematicManager.load_schematic(schematic_path)
+            if not schematic:
+                return {"success": False, "message": "Failed to load schematic"}
+
+            text, error = export_netlist_summary(
+                schematic, schematic_path, self.pin_locator
+            )
+            if error:
+                return {"success": False, "message": error}
+            return {"success": True, "summary": text}
+        except Exception as e:
+            logger.error(f"Error in export_netlist_summary: {e}")
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e)}
+
+    def _handle_validate_component_connections(self, params):
+        """Validate a component's pin-net mapping against expected values."""
+        logger.info("Validating component connections")
+        try:
+            from commands.net_analysis import validate_component_connections
+
+            schematic_path = params.get("schematicPath")
+            reference = params.get("reference")
+            expected = params.get("expected")
+            if not schematic_path:
+                return {"success": False, "message": "schematicPath is required"}
+            if not reference:
+                return {"success": False, "message": "reference is required"}
+            if not expected or not isinstance(expected, dict):
+                return {
+                    "success": False,
+                    "message": "expected is required (dict of pin->net)",
+                }
+
+            schematic = SchematicManager.load_schematic(schematic_path)
+            if not schematic:
+                return {"success": False, "message": "Failed to load schematic"}
+
+            result, error = validate_component_connections(
+                schematic, schematic_path, self.pin_locator, reference, expected
+            )
+            if error:
+                return {"success": False, "message": error}
+            return {"success": True, **result}
+        except Exception as e:
+            logger.error(f"Error in validate_component_connections: {e}")
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e)}
+
     def _handle_sync_schematic_to_board(self, params):
         """Sync schematic netlist to PCB board (equivalent to KiCAD F8 'Update PCB from Schematic').
         Reads net connections from the schematic and assigns them to the matching pads in the PCB.
@@ -5767,7 +6466,7 @@ class KiCADInterface:
 
         except Exception as e:
             logger.error(f"Error in sync_schematic_to_board: {e}")
-            import traceback
+
 
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
@@ -5816,7 +6515,7 @@ class KiCADInterface:
 
         except Exception as e:
             logger.error(f"Error importing SVG logo: {str(e)}")
-            import traceback
+
 
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
@@ -5891,7 +6590,7 @@ class KiCADInterface:
             }
         except Exception as e:
             logger.error(f"Error adding power symbol: {str(e)}")
-            import traceback
+
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
 
@@ -5943,7 +6642,7 @@ class KiCADInterface:
             }
         except Exception as e:
             logger.error(f"Error in batch connect_to_net: {str(e)}")
-            import traceback
+
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
 
@@ -6014,7 +6713,7 @@ class KiCADInterface:
             }
         except Exception as e:
             logger.error(f"Error in bulk move: {str(e)}")
-            import traceback
+
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
 
