@@ -1726,4 +1726,37 @@ Note: operates on .kicad_sch files only. To modify a PCB footprint use edit_comp
       };
     }
   );
+
+  // Detect accidentally shorted nets
+  server.tool(
+    "find_shorted_nets",
+    "Detect when two or more named nets are accidentally merged — e.g., +5V and an output signal sharing the same wire. Returns each group of shorted net names with the labels and power symbols involved.",
+    {
+      schematicPath: z.string().describe("Path to the .kicad_sch file"),
+    },
+    async (params) => {
+      const result = await callKicadScript("find_shorted_nets", params);
+      return {
+        content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
+        isError: !result.success,
+      };
+    }
+  );
+
+  // Find nets with only one pin (likely broken connection)
+  server.tool(
+    "find_single_pin_nets",
+    "Find nets with only one component pin connected — usually indicates a broken connection where one side of a wire was deleted or a component was moved off-grid.",
+    {
+      schematicPath: z.string().describe("Path to the .kicad_sch file"),
+      excludeNoConnect: z.boolean().optional().describe("Exclude nets where the pin has a no-connect flag (default: true)"),
+    },
+    async (params) => {
+      const result = await callKicadScript("find_single_pin_nets", params);
+      return {
+        content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
+        isError: !result.success,
+      };
+    }
+  );
 }

@@ -497,6 +497,8 @@ class KiCADInterface:
             "get_pin_net_name": self._handle_get_pin_net_name,
             "export_netlist_summary": self._handle_export_netlist_summary,
             "validate_component_connections": self._handle_validate_component_connections,
+            "find_shorted_nets": self._handle_find_shorted_nets,
+            "find_single_pin_nets": self._handle_find_single_pin_nets,
             # UI/Process management commands
             "check_kicad_ui": self._handle_check_kicad_ui,
             "launch_kicad_ui": self._handle_launch_kicad_ui,
@@ -6347,6 +6349,58 @@ class KiCADInterface:
             return {"success": True, **result}
         except Exception as e:
             logger.error(f"Error in validate_component_connections: {e}")
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e)}
+
+    def _handle_find_shorted_nets(self, params):
+        """Detect accidentally merged nets (two+ named nets on same wire)."""
+        logger.info("Finding shorted nets")
+        try:
+            from commands.net_analysis import find_shorted_nets
+
+            schematic_path = params.get("schematicPath")
+            if not schematic_path:
+                return {"success": False, "message": "schematicPath is required"}
+
+            schematic = SchematicManager.load_schematic(schematic_path)
+            if not schematic:
+                return {"success": False, "message": "Failed to load schematic"}
+
+            result, error = find_shorted_nets(
+                schematic, schematic_path, self.pin_locator
+            )
+            if error:
+                return {"success": False, "message": error}
+            return {"success": True, **result}
+        except Exception as e:
+            logger.error(f"Error in find_shorted_nets: {e}")
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e)}
+
+    def _handle_find_single_pin_nets(self, params):
+        """Find nets with only one component pin (likely broken connection)."""
+        logger.info("Finding single-pin nets")
+        try:
+            from commands.net_analysis import find_single_pin_nets
+
+            schematic_path = params.get("schematicPath")
+            if not schematic_path:
+                return {"success": False, "message": "schematicPath is required"}
+
+            exclude_nc = params.get("excludeNoConnect", True)
+
+            schematic = SchematicManager.load_schematic(schematic_path)
+            if not schematic:
+                return {"success": False, "message": "Failed to load schematic"}
+
+            result, error = find_single_pin_nets(
+                schematic, schematic_path, self.pin_locator, exclude_nc
+            )
+            if error:
+                return {"success": False, "message": error}
+            return {"success": True, **result}
+        except Exception as e:
+            logger.error(f"Error in find_single_pin_nets: {e}")
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
 

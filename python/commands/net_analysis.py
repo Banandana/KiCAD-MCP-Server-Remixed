@@ -283,6 +283,7 @@ def build_net_graph(schematic, schematic_path, pin_locator, tolerance=0.5):
         pin_nets:  dict  (ref, pin_num) -> net_name | None
         net_pins:  dict  net_name -> [(ref, pin_num, pin_name)]
         components: dict ref -> {lib_id, value, pins: {pin_num: {net, name, x, y}}}
+        shorted_nets: list of {nets: [name1, name2, ...], labels: [...], power_symbols: [...]}
     """
     with open(schematic_path, "r", encoding="utf-8") as f:
         content = f.read()
@@ -329,19 +330,35 @@ def build_net_graph(schematic, schematic_path, pin_locator, tolerance=0.5):
         if sp not in all_endpoints:
             _find_t_junctions(sp, h_index, v_index, all_wires, uf, tolerance)
 
-    # Phase 2: Assign net names to union-find roots
-    root_to_net = {}  # uf root -> net_name
+    # Phase 2: Assign net names to union-find roots, detect shorts
+    root_to_net = {}       # uf root -> canonical net_name (first wins)
+    root_to_all = {}       # uf root -> {names: set, labels: list, power: list}
     for lx, ly, name, _lt in all_labels:
         sp = _snap_pt(lx, ly)
         root = uf.find(sp)
-        # First label wins for a given connected region
         if root not in root_to_net:
             root_to_net[root] = name
+        info = root_to_all.setdefault(root, {"names": set(), "labels": [], "power": []})
+        info["names"].add(name)
+        info["labels"].append({"name": name, "type": _lt, "at": [lx, ly]})
     for px, py, name in power_syms:
         sp = _snap_pt(px, py)
         root = uf.find(sp)
         if root not in root_to_net:
             root_to_net[root] = name
+        info = root_to_all.setdefault(root, {"names": set(), "labels": [], "power": []})
+        info["names"].add(name)
+        info["power"].append({"name": name, "at": [px, py]})
+
+    # Detect shorted nets: roots where 2+ different net names merged
+    shorted_nets = []
+    for root, info in root_to_all.items():
+        if len(info["names"]) > 1:
+            shorted_nets.append({
+                "nets": sorted(info["names"]),
+                "labels": info["labels"],
+                "power_symbols": info["power"],
+            })
 
     # Phase 3: Compute pin endpoints and match to nets via O(1) UF lookup
     all_pins = _compute_all_pin_endpoints(
@@ -399,7 +416,7 @@ def build_net_graph(schematic, schematic_path, pin_locator, tolerance=0.5):
                 (ref, pin_num, pin_name)
             )
 
-    return pin_nets, net_pins, components
+    return pin_nets, net_pins, components, shorted_nets
 
 
 # ── Query functions (thin wrappers over build_net_graph) ──
@@ -407,7 +424,7 @@ def build_net_graph(schematic, schematic_path, pin_locator, tolerance=0.5):
 
 def get_component_nets(schematic, schematic_path, pin_locator, reference):
     """Return {pin_num: net_name_or_null} for every pin of a component."""
-    _pin_nets, _net_pins, components = build_net_graph(
+    _pin_nets, _net_pins, components, _shorted = build_net_graph(
         schematic, schematic_path, pin_locator
     )
     if reference not in components:
@@ -432,7 +449,7 @@ def get_component_nets(schematic, schematic_path, pin_locator, reference):
 
 def get_net_components(schematic, schematic_path, pin_locator, net_name):
     """Return all component pins on a given net."""
-    _pin_nets, net_pins, _components = build_net_graph(
+    _pin_nets, net_pins, _components, _shorted = build_net_graph(
         schematic, schematic_path, pin_locator
     )
     if net_name not in net_pins:
@@ -454,7 +471,7 @@ def get_net_components(schematic, schematic_path, pin_locator, net_name):
 
 def get_pin_net_name(schematic, schematic_path, pin_locator, reference, pin):
     """Return just the net name for a single component pin."""
-    _pin_nets, _net_pins, components = build_net_graph(
+    _pin_nets, _net_pins, components, _shorted = build_net_graph(
         schematic, schematic_path, pin_locator
     )
     if reference not in components:
@@ -475,7 +492,7 @@ def get_pin_net_name(schematic, schematic_path, pin_locator, reference, pin):
 
 def export_netlist_summary(schematic, schematic_path, pin_locator):
     """Dump the complete netlist in a simple text format."""
-    _pin_nets, net_pins, components = build_net_graph(
+    _pin_nets, net_pins, components, _shorted = build_net_graph(
         schematic, schematic_path, pin_locator
     )
 
@@ -523,7 +540,7 @@ def validate_component_connections(
             Prefix with "!" to assert pin is NOT on that net.
             Use None or "unconnected" to assert pin has no net.
     """
-    _pin_nets, _net_pins, components = build_net_graph(
+    _pin_nets, _net_pins, components, _shorted = build_net_graph(
         schematic, schematic_path, pin_locator
     )
     if reference not in components:
@@ -588,4 +605,45 @@ def validate_component_connections(
         "results": results,
         "checkedPins": len(results),
         "failedPins": sum(1 for r in results if not r["pass"]),
+    }, None
+
+
+def find_shorted_nets(schematic, schematic_path, pin_locator):
+    """Detect nets that are accidentally merged (two+ named nets on same wire)."""
+    _pin_nets, _net_pins, _components, shorted_nets = build_net_graph(
+        schematic, schematic_path, pin_locator
+    )
+    return {
+        "shorted": shorted_nets,
+        "count": len(shorted_nets),
+    }, None
+
+
+def find_single_pin_nets(
+    schematic, schematic_path, pin_locator, exclude_no_connect=True
+):
+    """Find nets with only one component pin — usually a broken connection.
+
+    Args:
+        exclude_no_connect: If True (default), skip nets where the single
+            pin has a no-connect flag. (Not yet implemented — reserved.)
+    """
+    _pin_nets, net_pins, _components, _shorted = build_net_graph(
+        schematic, schematic_path, pin_locator
+    )
+
+    singles = []
+    for net_name, pins in net_pins.items():
+        if len(pins) == 1:
+            ref, pin_num, pin_name = pins[0]
+            singles.append({
+                "net": net_name,
+                "component": ref,
+                "pin": pin_num,
+                "pinName": pin_name,
+            })
+
+    return {
+        "singlePinNets": singles,
+        "count": len(singles),
     }, None
