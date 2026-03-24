@@ -1759,4 +1759,21 @@ Note: operates on .kicad_sch files only. To modify a PCB footprint use edit_comp
       };
     }
   );
+
+  // Auto-fix connectivity issues using kicad-cli ERC as ground truth
+  server.tool(
+    "fix_connectivity",
+    "Run kicad-cli ERC, parse the violations, and auto-fix what it can (mainly T-junctions that need junction dots). Returns what was fixed and what remains. Use dryRun=true to preview without changes. This is the ground truth — it uses kicad-cli's own connectivity engine, not MCP's.",
+    {
+      schematicPath: z.string().describe("Path to the .kicad_sch file"),
+      dryRun: z.boolean().optional().describe("If true, report what would be fixed without changing the file (default: false)"),
+    },
+    async (params) => {
+      const result = await callKicadScript("fix_connectivity", params);
+      return {
+        content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
+        isError: !result.success,
+      };
+    }
+  );
 }

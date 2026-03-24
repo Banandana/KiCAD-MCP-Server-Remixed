@@ -499,6 +499,7 @@ class KiCADInterface:
             "validate_component_connections": self._handle_validate_component_connections,
             "find_shorted_nets": self._handle_find_shorted_nets,
             "find_single_pin_nets": self._handle_find_single_pin_nets,
+            "fix_connectivity": self._handle_fix_connectivity,
             # UI/Process management commands
             "check_kicad_ui": self._handle_check_kicad_ui,
             "launch_kicad_ui": self._handle_launch_kicad_ui,
@@ -3189,21 +3190,31 @@ class KiCADInterface:
 
             content = _read_schematic(Path(schematic_path))
             added = 0
+            all_new_endpoints = []
             for w in wires:
                 start = w.get("start", {})
                 end = w.get("end", {})
                 sp = [start.get("x", 0), start.get("y", 0)]
                 ep = [end.get("x", 0), end.get("y", 0)]
                 content = add_wire_to_content(content, sp, ep)
+                all_new_endpoints.append((sp[0], sp[1]))
+                all_new_endpoints.append((ep[0], ep[1]))
                 added += 1
 
+            # Auto-detect and fix T-junctions for all new wire endpoints
+            from commands.sexp_writer import auto_add_t_junctions
+            content, n_junctions = auto_add_t_junctions(content, all_new_endpoints)
             _write_schematic(Path(schematic_path), content)
 
+            msg = f"Added {added} wires, 0 failed"
+            if n_junctions:
+                msg += f" (auto-added {n_junctions} junction(s))"
             return {
                 "success": True,
-                "message": f"Added {added} wires, 0 failed",
+                "message": msg,
                 "added": added,
                 "failed": 0,
+                "junctionsAdded": n_junctions,
             }
         except Exception as e:
             logger.error(f"Error in batch_add_wire: {e}")
@@ -3459,7 +3470,7 @@ class KiCADInterface:
                 if not hasattr(symbol.property, "Reference"):
                     continue
                 ref = symbol.property.Reference.value
-                if ref.startswith("_TEMPLATE") or ref.startswith("#"):
+                if ref.startswith("_TEMPLATE"):
                     continue
                 lib_id = symbol.lib_id.value if hasattr(symbol, "lib_id") else ""
                 if not lib_id:
@@ -3521,7 +3532,7 @@ class KiCADInterface:
             for m in jp.finditer(content):
                 junction_points.append((float(m.group(1)), float(m.group(2))))
 
-            tolerance = 1.0  # 1mm tolerance to handle floating-point and grid alignment
+            tolerance = 0.05  # 0.05mm tolerance — tight enough to avoid false matches
 
             def point_near(x1, y1, x2, y2):
                 return abs(x1 - x2) < tolerance and abs(y1 - y2) < tolerance
@@ -6401,6 +6412,196 @@ class KiCADInterface:
             return {"success": True, **result}
         except Exception as e:
             logger.error(f"Error in find_single_pin_nets: {e}")
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e)}
+
+    def _handle_fix_connectivity(self, params):
+        """Run kicad-cli ERC, parse violations, auto-fix T-junctions and report."""
+        logger.info("Running fix_connectivity")
+        try:
+            import subprocess
+            import json as _json
+            import tempfile
+            import re
+            from pathlib import Path
+            from commands.sexp_writer import (
+                _read_schematic, _write_schematic, _parse_wire_segments,
+                _point_on_wire_mid, add_junction_to_content,
+                _parse_existing_junctions, auto_add_t_junctions,
+            )
+
+            schematic_path = params.get("schematicPath")
+            dry_run = params.get("dryRun", False)
+
+            if not schematic_path:
+                return {"success": False, "message": "schematicPath is required"}
+
+            sch_file = Path(schematic_path)
+            if not sch_file.exists():
+                return {"success": False, "message": f"File not found: {schematic_path}"}
+
+            # Step 1: Run kicad-cli ERC
+            with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tmp:
+                erc_output = tmp.name
+
+            try:
+                result = subprocess.run(
+                    [
+                        "kicad-cli", "sch", "erc",
+                        "--severity-all",
+                        "--format", "json",
+                        "-o", erc_output,
+                        str(schematic_path),
+                    ],
+                    capture_output=True, text=True, timeout=120,
+                )
+            except FileNotFoundError:
+                return {"success": False, "message": "kicad-cli not found on PATH"}
+            except subprocess.TimeoutExpired:
+                return {"success": False, "message": "kicad-cli ERC timed out"}
+
+            # Step 2: Parse ERC output
+            try:
+                with open(erc_output, "r") as f:
+                    erc_data = _json.load(f)
+            except Exception:
+                return {"success": False, "message": "Failed to parse ERC output"}
+            finally:
+                try:
+                    os.unlink(erc_output)
+                except Exception:
+                    pass
+
+            # Extract violations from sheets
+            violations = []
+            if "sheets" in erc_data:
+                for sheet in erc_data["sheets"]:
+                    for v in sheet.get("violations", []):
+                        violations.append(v)
+            elif "violations" in erc_data:
+                violations = erc_data["violations"]
+
+            # Step 3: Categorize violations
+            pin_not_connected = []
+            wire_not_connected = []
+            other_violations = []
+
+            for v in violations:
+                vtype = v.get("type", "")
+                severity = v.get("severity", "")
+                desc = v.get("description", "")
+                items = v.get("items", [])
+
+                # Extract coordinates from violation items
+                coords = []
+                for item in items:
+                    pos = item.get("pos", {})
+                    if "x" in pos and "y" in pos:
+                        x = float(pos["x"])
+                        y = float(pos["y"])
+                        # Auto-detect 1/100mm scale (kicad-cli quirk)
+                        if x > 1000 or y > 1000:
+                            x /= 100.0
+                            y /= 100.0
+                        coords.append((x, y))
+
+                entry = {
+                    "type": vtype,
+                    "severity": severity,
+                    "description": desc,
+                    "coords": coords,
+                }
+
+                if vtype == "pin_not_connected":
+                    pin_not_connected.append(entry)
+                elif vtype == "wire_not_connected" or "unconnected" in vtype:
+                    wire_not_connected.append(entry)
+                else:
+                    other_violations.append(entry)
+
+            # Step 4: Auto-fix — find T-junctions at violation coordinates
+            content = _read_schematic(sch_file)
+            all_wires = _parse_wire_segments(content)
+            existing_junctions = _parse_existing_junctions(content)
+
+            fixes = []
+            unfixable = []
+            fix_points = []
+
+            # Check each violation coordinate for T-junction
+            for v in pin_not_connected + wire_not_connected:
+                for cx, cy in v["coords"]:
+                    # Is this point on the mid-segment of any wire?
+                    is_t_junction = False
+                    for wx1, wy1, wx2, wy2 in all_wires:
+                        if _point_on_wire_mid(cx, cy, wx1, wy1, wx2, wy2, 0.5):
+                            is_t_junction = True
+                            break
+
+                    # Also check if any wire endpoint near this coord is a T-junction
+                    if not is_t_junction:
+                        for wx1, wy1, wx2, wy2 in all_wires:
+                            for px, py in [(wx1, wy1), (wx2, wy2)]:
+                                if abs(px - cx) < 0.5 and abs(py - cy) < 0.5:
+                                    # This wire endpoint is near the violation.
+                                    # Check if it's on mid-segment of another wire.
+                                    for owx1, owy1, owx2, owy2 in all_wires:
+                                        if (owx1, owy1, owx2, owy2) == (wx1, wy1, wx2, wy2):
+                                            continue
+                                        if _point_on_wire_mid(px, py, owx1, owy1, owx2, owy2, 0.5):
+                                            is_t_junction = True
+                                            cx, cy = px, py
+                                            break
+                                    if is_t_junction:
+                                        break
+                            if is_t_junction:
+                                break
+
+                    pt = (round(cx, 4), round(cy, 4))
+                    if is_t_junction and pt not in existing_junctions:
+                        fix_points.append(pt)
+                        fixes.append({
+                            "action": "add_junction",
+                            "at": [pt[0], pt[1]],
+                            "reason": v["description"],
+                        })
+                    elif not is_t_junction:
+                        unfixable.append(v)
+
+            # Step 5: Apply fixes
+            actually_fixed = 0
+            if not dry_run and fix_points:
+                seen = set()
+                for pt in fix_points:
+                    if pt in seen:
+                        continue
+                    seen.add(pt)
+                    content = add_junction_to_content(content, [pt[0], pt[1]])
+                    actually_fixed += 1
+                _write_schematic(sch_file, content)
+
+            return {
+                "success": True,
+                "erc_total": len(violations),
+                "pin_not_connected": len(pin_not_connected),
+                "wire_not_connected": len(wire_not_connected),
+                "other_violations": len(other_violations),
+                "fixes_applied": actually_fixed if not dry_run else 0,
+                "fixes_available": len(set(fix_points)),
+                "fixes": fixes,
+                "unfixable": [
+                    {"type": v["type"], "description": v["description"], "coords": v["coords"]}
+                    for v in unfixable
+                ],
+                "remaining_other": [
+                    {"type": v["type"], "severity": v["severity"], "description": v["description"]}
+                    for v in other_violations
+                ],
+                "dryRun": dry_run,
+            }
+
+        except Exception as e:
+            logger.error(f"Error in fix_connectivity: {e}")
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
 
