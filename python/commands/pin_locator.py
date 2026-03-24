@@ -156,12 +156,16 @@ class PinLocator:
     @staticmethod
     def rotate_point(x: float, y: float, angle_degrees: float) -> Tuple[float, float]:
         """
-        Rotate a point around the origin
+        Apply KiCad schematic coordinate transform (rotation in Y-down space).
+
+        This is NOT a standard CCW rotation. KiCad schematics use a Y-down
+        coordinate system, so the Y component uses -x*sin + y*cos instead of
+        the standard x*sin + y*cos.
 
         Args:
             x: X coordinate
             y: Y coordinate
-            angle_degrees: Rotation angle in degrees (counterclockwise)
+            angle_degrees: Rotation angle in degrees
 
         Returns:
             (rotated_x, rotated_y)
@@ -174,7 +178,7 @@ class PinLocator:
         sin_a = math.sin(angle_rad)
 
         rotated_x = x * cos_a - y * sin_a
-        rotated_y = x * sin_a + y * cos_a
+        rotated_y = -x * sin_a + y * cos_a
 
         return (rotated_x, rotated_y)
 

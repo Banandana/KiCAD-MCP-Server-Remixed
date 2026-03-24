@@ -72,20 +72,52 @@ class ConnectionManager:
             return False
 
     @staticmethod
-    def get_pin_location(symbol, pin_name: str):
+    def get_pin_location(symbol_or_path, pin_name: str, symbol_ref: str = None):
         """
-        Get the absolute location of a pin on a symbol
+        Get the absolute location of a pin on a symbol.
+
+        DEPRECATED: This method exists for backward compatibility. Prefer using
+        PinLocator.get_pin_location() directly, which correctly handles Y-negation,
+        mirror transforms, and rotation.
 
         Args:
-            symbol: Symbol object
+            symbol_or_path: Either a kicad-skip Symbol object (legacy) or a Path
+                to the .kicad_sch file (preferred).
             pin_name: Name or number of the pin (e.g., "1", "GND", "VCC")
+            symbol_ref: Reference designator (required when symbol_or_path is a Path)
 
         Returns:
             [x, y] coordinates or None if pin not found
         """
         try:
+            # If a file path was provided, use PinLocator directly
+            if isinstance(symbol_or_path, (str, Path)):
+                if not WIRE_MANAGER_AVAILABLE:
+                    logger.error("PinLocator not available for accurate pin location")
+                    return None
+                if not symbol_ref:
+                    logger.error("symbol_ref is required when passing a file path to get_pin_location")
+                    return None
+                locator = PinLocator()
+                return locator.get_pin_location(symbol_or_path, symbol_ref, pin_name)
+
+            # Legacy path: symbol object passed directly.
+            # Delegate to PinLocator if possible, otherwise warn about inaccuracy.
+            symbol = symbol_or_path
+            ref = (
+                symbol.property.Reference.value
+                if hasattr(symbol.property, "Reference")
+                else None
+            )
+
+            logger.warning(
+                f"get_pin_location called with symbol object for '{ref}' -- "
+                "this path cannot apply Y-negation, mirror, or rotation transforms. "
+                "Use PinLocator.get_pin_location(schematic_path, ref, pin) instead."
+            )
+
             if not hasattr(symbol, "pin"):
-                logger.warning(f"Symbol {symbol.property.Reference.value} has no pins")
+                logger.warning(f"Symbol {ref} has no pins")
                 return None
 
             # Find the pin by name
@@ -96,9 +128,7 @@ class ConnectionManager:
                     break
 
             if not target_pin:
-                logger.warning(
-                    f"Pin '{pin_name}' not found on {symbol.property.Reference.value}"
-                )
+                logger.warning(f"Pin '{pin_name}' not found on {ref}")
                 return None
 
             # Get pin location relative to symbol
@@ -106,10 +136,30 @@ class ConnectionManager:
             # Get symbol location
             symbol_at = symbol.at.value
 
-            # Calculate absolute position
-            # pin_loc is relative to symbol origin, need to add symbol position
-            abs_x = symbol_at[0] + pin_loc[0]
-            abs_y = symbol_at[1] + pin_loc[1]
+            import math
+
+            # Apply Y-negation (symbol-local Y-up -> schematic Y-down)
+            pin_rel_x = pin_loc[0]
+            pin_rel_y = -pin_loc[1]
+
+            # Apply mirror transforms if available
+            if hasattr(symbol, "mirror"):
+                mirror_val = str(symbol.mirror.value) if hasattr(symbol.mirror, "value") else ""
+                if "x" in mirror_val:
+                    pin_rel_y = -pin_rel_y
+                if "y" in mirror_val:
+                    pin_rel_x = -pin_rel_x
+
+            # Apply rotation
+            rotation_deg = float(symbol_at[2]) if len(symbol_at) > 2 else 0.0
+            rotation_rad = math.radians(rotation_deg)
+            cos_r = math.cos(rotation_rad)
+            sin_r = math.sin(rotation_rad)
+            rotated_x = pin_rel_x * cos_r - pin_rel_y * sin_r
+            rotated_y = -pin_rel_x * sin_r + pin_rel_y * cos_r
+
+            abs_x = symbol_at[0] + rotated_x
+            abs_y = symbol_at[1] + rotated_y
 
             return [abs_x, abs_y]
         except Exception as e:
@@ -680,22 +730,53 @@ class ConnectionManager:
                     }
                     netlist["components"].append(component_info)
 
-            # Gather all nets from labels
+            # Gather all nets from labels (local, global, hierarchical) and power symbols
+            net_names = set()
+
+            # Local labels
             if hasattr(schematic, "label"):
-                net_names = set()
                 for label in schematic.label:
                     if hasattr(label, "value"):
                         net_names.add(label.value)
 
-                # For each net, get connections
-                for net_name in net_names:
-                    connections = ConnectionManager.get_net_connections(
-                        schematic, net_name, schematic_path
+            # Global labels
+            if hasattr(schematic, "global_label"):
+                for label in schematic.global_label:
+                    if hasattr(label, "value"):
+                        net_names.add(label.value)
+
+            # Hierarchical labels
+            if hasattr(schematic, "hierarchical_label"):
+                for label in schematic.hierarchical_label:
+                    if hasattr(label, "value"):
+                        net_names.add(label.value)
+
+            # Power symbols (symbols with lib_id starting with "power:")
+            if hasattr(schematic, "symbol"):
+                for symbol in schematic.symbol:
+                    lib_id = (
+                        symbol.lib_id.value
+                        if hasattr(symbol, "lib_id") and hasattr(symbol.lib_id, "value")
+                        else ""
                     )
-                    if connections:
-                        netlist["nets"].append(
-                            {"name": net_name, "connections": connections}
+                    if lib_id.startswith("power:"):
+                        val = (
+                            symbol.property.Value.value
+                            if hasattr(symbol.property, "Value")
+                            else ""
                         )
+                        if val:
+                            net_names.add(val)
+
+            # For each net, get connections
+            for net_name in net_names:
+                connections = ConnectionManager.get_net_connections(
+                    schematic, net_name, schematic_path
+                )
+                if connections:
+                    netlist["nets"].append(
+                        {"name": net_name, "connections": connections}
+                    )
 
             logger.info(
                 f"Generated netlist with {len(netlist['nets'])} nets and {len(netlist['components'])} components"

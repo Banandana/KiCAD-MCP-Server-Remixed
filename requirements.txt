@@ -7,6 +7,9 @@
 # Schematic manipulation
 kicad-skip>=0.1.0
 
+# S-expression parsing
+sexpdata
+
 # Image processing for board rendering
 Pillow>=9.0.0
 

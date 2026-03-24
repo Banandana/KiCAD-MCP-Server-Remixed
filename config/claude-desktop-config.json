@@ -3,10 +3,10 @@
     "kicad_helper": {
       "command": "node",
       "args": ["dist/index.js"],
-      "cwd": "c:/repo/KiCAD-MCP",
+      "cwd": "/path/to/KiCAD-MCP-Server",
       "env": {
         "NODE_ENV": "production",
-        "PYTHONPATH": "C:/Program Files/KiCad/9.0/lib/python3/dist-packages"
+        "PYTHONPATH": "/path/to/kicad/lib/python3/dist-packages"
       },
       "description": "KiCAD PCB Design Assistant"
     }

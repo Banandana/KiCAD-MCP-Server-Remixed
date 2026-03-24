@@ -17,7 +17,8 @@
     "test:coverage": "pytest tests/ --cov=python --cov-report=html --cov-report=term",
     "lint": "npm run lint:ts && npm run lint:py",
     "lint:ts": "eslint src/ || echo 'ESLint not configured'",
-    "lint:py": "cd python && black . && mypy . && flake8 .",
+    "lint:py": "cd python && black --check . && mypy . && flake8 .",
+    "format:py": "cd python && black .",
     "format": "prettier --write 'src/**/*.ts' && black python/",
     "prepare": "npm run build",
     "pretest": "npm run build"
@@ -34,13 +35,9 @@
   "license": "MIT",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.21.0",
-    "dotenv": "^17.0.0",
-    "express": "^5.1.0",
     "zod": "^3.25.0"
   },
   "devDependencies": {
-    "@cfworker/json-schema": "^4.1.1",
-    "@types/express": "^5.0.5",
     "@types/glob": "^8.1.0",
     "@types/node": "^20.19.0",
     "nodemon": "^3.0.1",

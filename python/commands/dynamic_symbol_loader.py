@@ -168,39 +168,40 @@ class DynamicSymbolLoader:
         """
         Extract a complete symbol block from a library or schematic file by matching
         parentheses depth. Returns the raw text of the symbol definition.
+
+        Works for both multi-line (pretty-printed) and single-line files by using
+        balanced-parenthesis traversal on the raw string.
         """
-        lines = text.split("\n")
-        start = None
-        for i, line in enumerate(lines):
-            stripped = line.strip()
-            # Match exact symbol name (not sub-symbols like Name_0_1)
-            if stripped.startswith(f'(symbol "{symbol_name}"') and not re.match(
-                r'.*_\d+_\d+"', stripped
-            ):
-                start = i
-                break
+        search_pattern = f'(symbol "{symbol_name}"'
+        pos = text.find(search_pattern)
+        while pos != -1:
+            # Check this isn't a sub-symbol (e.g., symbol_name_1_1).
+            # Extract the actual symbol name from this match to verify.
+            name_start = pos + len('(symbol "')
+            name_end = text.find('"', name_start)
+            if name_end != -1:
+                actual_name = text[name_start:name_end]
+                if re.match(
+                    rf'^{re.escape(symbol_name)}_\d+_\d+$', actual_name
+                ):
+                    # This is a sub-symbol, skip it
+                    pos = text.find(search_pattern, pos + 1)
+                    continue
 
-        if start is None:
-            return None
-
-        depth = 0
-        end = None
-        for i in range(start, len(lines)):
-            for ch in lines[i]:
-                if ch == "(":
+            # Use balanced paren counting to find the end of this block
+            depth = 0
+            for i in range(pos, len(text)):
+                if text[i] == '(':
                     depth += 1
-                elif ch == ")":
+                elif text[i] == ')':
                     depth -= 1
                     if depth == 0:
-                        end = i
-                        break
-            if end is not None:
-                break
+                        return text[pos:i + 1]
 
-        if end is None:
-            return None
+            # Unbalanced parens — try next match
+            pos = text.find(search_pattern, pos + 1)
 
-        return "\n".join(lines[start : end + 1])
+        return None
 
     def _iter_top_level_items(self, symbol_block: str) -> list:
         """
