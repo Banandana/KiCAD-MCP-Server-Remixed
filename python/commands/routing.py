@@ -49,9 +49,10 @@ class RoutingCommands:
 
             # Set net class if provided
             if net_class:
-                net_classes = self.board.GetNetClasses()
-                if net_classes.Find(net_class):
-                    net.SetClass(net_classes.Find(net_class))
+                ns = self.board.GetDesignSettings().m_NetSettings
+                if ns.HasNetclass(net_class):
+                    nc = ns.GetNetClassByName(net_class)
+                    net.SetClass(nc)
 
             return {
                 "success": True,
@@ -1038,15 +1039,14 @@ class RoutingCommands:
                     "errorDetails": "name parameter is required",
                 }
 
-            # Get net classes
-            net_classes = self.board.GetNetClasses()
+            # KiCad 9 API: use NET_SETTINGS from DesignSettings
+            ns = self.board.GetDesignSettings().m_NetSettings
 
-            # Create new net class if it doesn't exist
-            if not net_classes.Find(name):
-                netclass = pcbnew.NETCLASS(name)
-                net_classes.Add(netclass)
+            # Create or retrieve netclass
+            if ns.HasNetclass(name):
+                netclass = ns.GetNetClassByName(name)
             else:
-                netclass = net_classes.Find(name)
+                netclass = pcbnew.NETCLASS(name)
 
             # Set properties
             scale = 1000000  # mm to nm
@@ -1059,21 +1059,20 @@ class RoutingCommands:
             if via_drill is not None:
                 netclass.SetViaDrill(int(via_drill * scale))
             if uvia_diameter is not None:
-                netclass.SetMicroViaDiameter(int(uvia_diameter * scale))
+                netclass.SetuViaDiameter(int(uvia_diameter * scale))
             if uvia_drill is not None:
-                netclass.SetMicroViaDrill(int(uvia_drill * scale))
+                netclass.SetuViaDrill(int(uvia_drill * scale))
             if diff_pair_width is not None:
                 netclass.SetDiffPairWidth(int(diff_pair_width * scale))
             if diff_pair_gap is not None:
                 netclass.SetDiffPairGap(int(diff_pair_gap * scale))
 
-            # Add nets to net class
-            netinfo = self.board.GetNetInfo()
-            nets_map = netinfo.NetsByName()
+            # Register the netclass with the board
+            ns.SetNetclass(name, netclass)
+
+            # Assign nets to this class via pattern assignments
             for net_name in nets:
-                if nets_map.has_key(net_name):
-                    net = nets_map[net_name]
-                    net.SetClass(netclass)
+                ns.SetNetclassPatternAssignment(net_name, name)
 
             return {
                 "success": True,
@@ -1084,8 +1083,8 @@ class RoutingCommands:
                     "trackWidth": netclass.GetTrackWidth() / scale,
                     "viaDiameter": netclass.GetViaDiameter() / scale,
                     "viaDrill": netclass.GetViaDrill() / scale,
-                    "uviaDiameter": netclass.GetMicroViaDiameter() / scale,
-                    "uviaDrill": netclass.GetMicroViaDrill() / scale,
+                    "uviaDiameter": netclass.GetuViaDiameter() / scale,
+                    "uviaDrill": netclass.GetuViaDrill() / scale,
                     "diffPairWidth": netclass.GetDiffPairWidth() / scale,
                     "diffPairGap": netclass.GetDiffPairGap() / scale,
                     "nets": nets,
