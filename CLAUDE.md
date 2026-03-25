@@ -277,13 +277,17 @@ When adding or modifying a schematic tool, verify:
 15. [ ] Wire placement tools auto-add junctions at T-junctions (handled by `sexp_writer.add_wire()` / `add_polyline_wire()` / `batch_add_wire`)
 16. [ ] `npm run build` run after TypeScript changes
 17. [ ] Commit and push to `remix` remote
+18. [ ] Board tools use `pcbnew.SaveBoard()` not `board.Save()`
+19. [ ] Board tools call `board.SetModified()` after `board.Remove()`
+20. [ ] Board footprint/drawing iteration uses `Cast_to_FOOTPRINT` / `Cast_to_PCB_SHAPE` for SWIG safety
+21. [ ] Board outline arc endpoints use `round()` not `int()` for trig
 
 ## Code Patterns
 
 ### Adding a new MCP tool
 1. **TypeScript** (`src/tools/<domain>.ts`): Register tool with `server.tool(name, description, zodSchema, handler)`. Handler calls `callKicadScript(command, args)`.
-2. **Python handler** (`python/kicad_interface.py`): Add `_handle_<command>` method to `KiCADInterface`.
-3. **Python dispatch** (`python/kicad_interface.py`): Add `"command_name": self._handle_command_name` to `command_routes` dict (~line 370).
+2. **Python handler**: Either add `_handle_<command>` method to `KiCADInterface` in `kicad_interface.py`, OR add a method to the appropriate domain command class (e.g., `BoardOutlineCommands` in `board/outline.py`, `LibraryCommands` in `library.py`) and add a delegation method in the aggregator class (e.g., `BoardCommands.__init__.py`).
+3. **Python dispatch** (`python/kicad_interface.py`): Add `"command_name": self._handle_command_name` (or `self.board_commands.method_name`) to `command_routes` dict (~line 370).
 4. **Rebuild**: Run `npm run build`.
 
 The `callKicadScript` command string and the `command_routes` key **must match exactly**.
@@ -295,10 +299,17 @@ The `callKicadScript` command string and the `command_routes` key **must match e
 - **kicad-skip** (`from skip import Schematic`): Used for reading/querying existing schematic elements (symbols, properties, wires). Good for reads, avoid for writes that go through `sexpdata.dumps()`.
 - **DynamicSymbolLoader** (`python/commands/dynamic_symbol_loader.py`): Text-based symbol injection from KiCad libraries. Handles `(instances)` blocks, rotation-aware field positions. Uses text manipulation, not sexpdata.
 - **PinLocator** (`python/commands/pin_locator.py`): Returns pin **endpoints** (connectable tip), not body positions. Handles rotation (via KiCad schematic transform, not standard rotation) AND mirror transforms. `rotate_point()` applies the Y-down-aware transform `[[cos,-sin],[-sin,cos]]`. `get_all_symbol_pins()` loads the file once and computes all pins inline (no per-pin re-reads). Pin definition cache is per lib_id and safe to keep. A shared `PinLocator` instance lives on `KiCADInterface` as `self.pin_locator` — handlers use this instead of creating fresh instances, preserving the cache across calls.
+- **swap_schematic_symbol** (`kicad_interface.py`): Changes a component's `(lib_id)` in-place, uses `DynamicSymbolLoader.inject_symbol_into_schematic()` to add the new symbol definition to `lib_symbols`, and removes the old definition if no other instances reference it. Warns if pin counts differ between old and new symbols.
+- **auto_assign_footprints** (`kicad_interface.py`): Scans all placed symbols, matches their `lib_id` against prefix patterns, and updates their Footprint property via `_edit_component_in_content()`. Single read/write cycle.
+- **get_footprint_bounds** (`library.py`): Parses `.kicad_mod` files with regex to extract courtyard, fab layer, and pad bounding boxes. No pcbnew needed — works from library files directly.
 
 ### Board operations
 - Use `pcbnew` SWIG API directly
 - Board must be loaded via `pcbnew.LoadBoard(path)`
+- **Always use `pcbnew.SaveBoard(path, board)`** for saving, NOT `board.Save(path)`. The instance method uses a different code path and lacks flush guarantees. Two callsites were fixed (`sync_schematic_to_board`, `refill_zones`).
+- **Always call `board.SetModified()`** after `board.Remove()` — otherwise the board isn't marked dirty and changes may not persist on next save. Missing from `delete_board_outline` and `delete_component` until recently.
+- **Use `pcbnew.Cast_to_FOOTPRINT(item)`** when iterating `board.GetFootprints()` if items may be stale SWIG proxies. After board state changes (outline delete, save/reload), footprint objects can lose their type info and return as raw `SwigPyObject` without `GetReference()` etc. `Cast_to_FOOTPRINT` re-casts safely. Same applies to `Cast_to_PCB_SHAPE`, `Cast_to_PAD`, etc.
+- **Board outline tools** (`board/outline.py`): `delete_board_outline` identifies the outer outline by grouping Edge.Cuts shapes into connected chains (endpoint matching) and selecting the chain with the largest bounding box. Internal cutouts (mounting holes, USB slots) are preserved by default. Set `deleteAll=true` to nuke everything. `replace_board_outline` chains delete→add but warns explicitly if add fails after delete.
 
 ### Error handling
 - Python commands return `{"success": True/False, "message": "...", ...}`
@@ -375,6 +386,12 @@ These are bugs that were actually encountered and fixed. If you see these sympto
 - **kicad-cli fails with "Failed to load schematic"**: UUIDs were written unquoted `(uuid xxx)` but KiCad 9 requires `(uuid "xxx")`. Fixed in all 13 write sites across `sexp_writer.py`, `schematic.py`, `project.py`, and `kicad_interface.py`.
 - **Global labels fail to load even with quoted UUIDs**: `sexp_writer.add_label` was adding a stray `(uuid ...)` inside the Intersheetrefs property block. KiCad properties don't have UUIDs — only the parent label element does. Fixed by removing the UUID from the property block.
 - **Pin positions wrong at 90°/270° rotation (Y offset inverted)**: The rotation formula used standard CCW rotation (`rot_y = x*sin + y*cos`) on Y-negated coordinates, but Y-negation and rotation don't commute. The correct formula is `rot_y = -x*sin + y*cos`. At 0°/180° both formulas give the same result (sin=0), so the bug only manifested at 90°/270°. Fixed in `PinLocator.rotate_point()` and all 3 inline sites.
+- **create_netclass fails with "'netclasses_map' has no attribute 'Find'"**: KiCad 9 changed the netclass API. Old code used `net_classes.Find(name)` on a `netclasses_map`. Fixed — now uses `NET_SETTINGS` via `board.GetDesignSettings().m_NetSettings` with `HasNetclass()`, `GetNetClassByName()`, `SetNetclass()`. Also `SetMicroViaDiameter` → `SetuViaDiameter`, net assignment via `SetNetclassPatternAssignment()`.
+- **add_mounting_hole crashes with "SwigPyObject has no attribute GetReference"**: After board state changes (outline delete, save/reload), `GetFootprints()` can return raw SWIG proxies that lost type info. Fixed — use `pcbnew.Cast_to_FOOTPRINT(item)` before accessing methods. Same pattern applies to any `board.GetDrawings()` / `board.GetFootprints()` iteration.
+- **Rounded rectangle outline has 1-2nm gaps**: `_add_corner_arc` used `int()` truncation on trig results. `int(radius * cos(angle))` truncates toward zero, while straight edges use exact arithmetic. Fixed — use `round()` instead of `int()`.
+- **delete_board_outline removes internal cutouts**: Was removing ALL Edge.Cuts shapes. Fixed — now groups shapes into connected chains, identifies outer outline by largest bounding box, preserves internal cutouts (mounting holes, USB slots). `deleteAll=true` for old behavior.
+- **board.Save() doesn't persist changes**: Instance method `board.Save()` uses different code path than `pcbnew.SaveBoard()`. Two callsites (sync_schematic_to_board, refill_zones) used `board.Save()` without flush. Fixed — standardized to `pcbnew.SaveBoard()`.
+- **Deleted outline/components not saved**: `board.Remove()` wasn't followed by `board.SetModified()`, so the board wasn't marked dirty. Fixed in `delete_board_outline` and `delete_component`.
 
 ## Important Notes
 
@@ -395,7 +412,9 @@ These are known issues that haven't been fixed yet. Keep them in mind when worki
 - **`batch_connect_to_net` still does N read/write cycles**: Each connection needs fresh pin positions after prior wire/label placements shift content offsets. The other 7 batch handlers have been fixed.
 - **Label bounding box dimensions are estimated**: Uses `0.75mm/char` width and `1.8mm` height based on default KiCad font. Different font sizes or non-ASCII characters will have inaccurate bounding boxes.
 - **`get_schematic_layout` shares geometry code with `check_schematic_overlaps`**: Both use `_parse_schematic_geometry()`, but the overlap logic in `get_schematic_layout` is a partial copy. Changes to overlap detection must be applied in both places.
-- **11 MCP tools are disabled (no Python handler)**: `export_netlist`, `export_position_file`, `export_vrml`, `add_net_class`, `assign_net_to_class`, `set_layer_constraints`, `check_clearance`, `add_zone`, `add_component_annotation`, `group_components`, `replace_component`. Their TS registrations are commented out with TODO markers. Re-enable when Python handlers are implemented.
+- **8 MCP tools are disabled (no Python handler)**: `export_netlist`, `export_position_file`, `export_vrml`, `add_net_class`, `assign_net_to_class`, `set_layer_constraints`, `check_clearance`, `add_zone`. Their TS registrations are commented out with TODO markers in `board.ts`, `design-rules.ts`, and `export.ts`. `add_component_annotation`, `group_components`, `replace_component` are also disabled in `component.ts`. Re-enable when Python handlers are implemented.
+- **SVG import can silently lose data**: `import_svg_logo` writes directly to `.kicad_pcb` bypassing pcbnew, then reloads the board. If reload fails (caught as non-fatal exception), subsequent saves overwrite the file with stale in-memory state, erasing the logo.
+- **SWIG proxy type loss after board mutations**: `GetFootprints()` and `GetDrawings()` can return raw `SwigPyObject` items after `board.Remove()` or save/reload cycles. Always use `pcbnew.Cast_to_FOOTPRINT(item)` / `Cast_to_PCB_SHAPE(item)` when iterating. Only `add_mounting_hole` has the defensive cast — other sites in `component.py`, `routing.py`, `export.py` are still vulnerable.
 - **`router.ts` and `registry.ts` are dead code**: The router pattern was disabled due to hallucinations. ~600 lines compiled but never executed. The imports are commented out in `server.ts`.
 - **Synchronous logger**: `logger.ts` uses `appendFileSync` and `existsSync` on every log message, blocking the Node.js event loop. Should use async write stream.
 - **`wire_manager.py` is a zero-value wrapper**: Every method forwards to `sexp_writer` with no added logic. Could be eliminated.
