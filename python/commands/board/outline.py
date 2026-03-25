@@ -457,12 +457,18 @@ class BoardOutlineCommands:
                 int(pad_diameter * scale) if pad_diameter else diameter_nm + scale
             )  # 1mm larger by default
 
-            # Create footprint for mounting hole with unique reference
-            existing_mh = [
-                fp.GetReference()
-                for fp in self.board.GetFootprints()
-                if fp.GetReference().startswith("MH")
-            ]
+            # Create footprint for mounting hole with unique reference.
+            # Cast to FOOTPRINT to handle stale SWIG proxies that lose
+            # type info after board state changes (e.g. outline delete).
+            existing_mh = []
+            for item in self.board.GetFootprints():
+                try:
+                    fp = pcbnew.Cast_to_FOOTPRINT(item) if not isinstance(item, pcbnew.FOOTPRINT) else item
+                    ref = fp.GetReference()
+                    if ref.startswith("MH"):
+                        existing_mh.append(ref)
+                except Exception:
+                    continue
             next_num = 1
             while f"MH{next_num}" in existing_mh:
                 next_num += 1
