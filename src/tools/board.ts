@@ -189,11 +189,15 @@ export function registerBoardTools(server: McpServer, callKicadScript: CommandFu
   // ------------------------------------------------------
   server.tool(
     "delete_board_outline",
-    "Remove the existing board outline (all shapes on Edge.Cuts layer). Use before add_board_outline to replace an outline.",
-    {},
-    async () => {
+    `Remove the board outline from Edge.Cuts. By default only removes the outer outline
+(the largest connected shape chain), preserving internal cutouts for mounting holes, USB
+slots, etc. Set deleteAll=true to remove ALL Edge.Cuts shapes including internal cutouts.`,
+    {
+      deleteAll: z.boolean().optional().default(false).describe("If true, delete ALL Edge.Cuts shapes including internal cutouts. Default: false (only outer outline)")
+    },
+    async ({ deleteAll }: { deleteAll?: boolean }) => {
       logger.debug("Deleting board outline");
-      const result = await callKicadScript("delete_board_outline", {});
+      const result = await callKicadScript("delete_board_outline", { deleteAll });
       return {
         content: [{
           type: "text" as const,

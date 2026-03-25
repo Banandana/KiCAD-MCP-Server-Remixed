@@ -201,8 +201,132 @@ class BoardOutlineCommands:
                 "errorDetails": str(e),
             }
 
+    def _get_edge_cuts_shapes(self):
+        """Collect all PCB_SHAPE objects on the Edge.Cuts layer."""
+        edge_layer = self.board.GetLayerID("Edge.Cuts")
+        shapes = []
+        for drawing in self.board.GetDrawings():
+            if hasattr(drawing, "GetLayer") and drawing.GetLayer() == edge_layer:
+                shapes.append(drawing)
+        return shapes
+
+    def _shape_endpoints(self, shape):
+        """Return (start, end) as (x, y) tuples in nm for a PCB_SHAPE.
+        For circles, returns None (they are self-contained closed shapes)."""
+        shape_type = shape.GetShape()
+        # Circle = self-contained, no endpoints to chain
+        if shape_type == pcbnew.SHAPE_T_CIRCLE:
+            return None
+        start = shape.GetStart()
+        end = shape.GetEnd()
+        return ((start.x, start.y), (end.x, end.y))
+
+    def _find_connected_chains(self, shapes):
+        """Group Edge.Cuts shapes into connected chains using endpoint matching.
+        Returns list of lists, where each inner list is a group of connected shapes.
+        Circles are each their own group."""
+        # Tolerance for endpoint matching (100nm = 0.0001mm)
+        TOL = 100
+
+        def close(p1, p2):
+            return abs(p1[0] - p2[0]) <= TOL and abs(p1[1] - p2[1]) <= TOL
+
+        groups = []  # list of (set_of_indices, set_of_endpoint_tuples)
+        shape_endpoints = []  # index -> endpoints or None
+
+        for i, s in enumerate(shapes):
+            ep = self._shape_endpoints(s)
+            shape_endpoints.append(ep)
+            if ep is None:
+                # Circle: standalone group
+                groups.append(({i}, set()))
+            else:
+                # Try to attach to an existing group
+                merged = False
+                for g_indices, g_points in groups:
+                    # Check if either endpoint matches any group endpoint
+                    for gp in list(g_points):
+                        if close(ep[0], gp) or close(ep[1], gp):
+                            g_indices.add(i)
+                            g_points.add(ep[0])
+                            g_points.add(ep[1])
+                            merged = True
+                            break
+                    if merged:
+                        break
+                if not merged:
+                    groups.append(({i}, {ep[0], ep[1]}))
+
+        # Merge groups that share endpoints (multi-pass until stable)
+        changed = True
+        while changed:
+            changed = False
+            for i in range(len(groups)):
+                for j in range(i + 1, len(groups)):
+                    gi, gp_i = groups[i]
+                    gj, gp_j = groups[j]
+                    if not gi or not gj:
+                        continue
+                    # Check if any endpoints are close
+                    overlap = False
+                    for pi in gp_i:
+                        for pj in gp_j:
+                            if close(pi, pj):
+                                overlap = True
+                                break
+                        if overlap:
+                            break
+                    if overlap:
+                        gi.update(gj)
+                        gp_i.update(gp_j)
+                        gj.clear()
+                        gp_j.clear()
+                        changed = True
+
+        return [[shapes[i] for i in g_indices] for g_indices, _ in groups if g_indices]
+
+    def _chain_bbox_area(self, chain):
+        """Compute bounding box area (in nm^2) for a list of shapes."""
+        min_x = min_y = float("inf")
+        max_x = max_y = float("-inf")
+        for s in chain:
+            shape_type = s.GetShape()
+            if shape_type == pcbnew.SHAPE_T_CIRCLE:
+                center = s.GetCenter()
+                end = s.GetEnd()
+                r = int(math.sqrt((end.x - center.x) ** 2 + (end.y - center.y) ** 2))
+                min_x = min(min_x, center.x - r)
+                min_y = min(min_y, center.y - r)
+                max_x = max(max_x, center.x + r)
+                max_y = max(max_y, center.y + r)
+            else:
+                start = s.GetStart()
+                end = s.GetEnd()
+                min_x = min(min_x, start.x, end.x)
+                min_y = min(min_y, start.y, end.y)
+                max_x = max(max_x, start.x, end.x)
+                max_y = max(max_y, start.y, end.y)
+                # For arcs, also check the center offset
+                if shape_type == pcbnew.SHAPE_T_ARC:
+                    center = s.GetCenter()
+                    r = int(math.sqrt(
+                        (start.x - center.x) ** 2 + (start.y - center.y) ** 2
+                    ))
+                    min_x = min(min_x, center.x - r)
+                    min_y = min(min_y, center.y - r)
+                    max_x = max(max_x, center.x + r)
+                    max_y = max(max_y, center.y + r)
+        return (max_x - min_x) * (max_y - min_y)
+
     def delete_board_outline(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Remove all shapes from the Edge.Cuts layer (board outline)"""
+        """Remove the board outline from Edge.Cuts.
+
+        By default (deleteAll=false), only removes the outer outline — the connected
+        shape chain with the largest bounding box. Internal cutouts (smaller closed
+        loops for mounting holes, USB slots, etc.) are preserved.
+
+        Set deleteAll=true to remove ALL Edge.Cuts shapes including internal cutouts.
+        """
         try:
             if not self.board:
                 return {
@@ -211,27 +335,44 @@ class BoardOutlineCommands:
                     "errorDetails": "Load or create a board first",
                 }
 
-            edge_layer = self.board.GetLayerID("Edge.Cuts")
-            shapes_to_remove = []
+            delete_all = params.get("deleteAll", False)
+            edge_shapes = self._get_edge_cuts_shapes()
 
-            for drawing in self.board.GetDrawings():
-                if hasattr(drawing, "GetLayer") and drawing.GetLayer() == edge_layer:
-                    shapes_to_remove.append(drawing)
-
-            if not shapes_to_remove:
+            if not edge_shapes:
                 return {
                     "success": True,
                     "message": "No board outline found to delete",
                     "deleted_count": 0,
                 }
 
+            if delete_all:
+                shapes_to_remove = edge_shapes
+            else:
+                # Find connected chains and remove only the largest one (outer outline)
+                chains = self._find_connected_chains(edge_shapes)
+                if not chains:
+                    return {
+                        "success": True,
+                        "message": "No board outline found to delete",
+                        "deleted_count": 0,
+                    }
+                # Pick chain with largest bbox area = outer outline
+                largest = max(chains, key=self._chain_bbox_area)
+                shapes_to_remove = largest
+
             for shape in shapes_to_remove:
                 self.board.Remove(shape)
 
+            preserved = len(edge_shapes) - len(shapes_to_remove)
+            msg = f"Deleted board outline ({len(shapes_to_remove)} shapes removed)"
+            if preserved > 0:
+                msg += f", preserved {preserved} internal cutout shapes"
+
             return {
                 "success": True,
-                "message": f"Deleted board outline ({len(shapes_to_remove)} shapes removed)",
+                "message": msg,
                 "deleted_count": len(shapes_to_remove),
+                "preserved_count": preserved,
             }
 
         except Exception as e:
