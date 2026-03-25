@@ -36,7 +36,7 @@ KiCAD files (.kicad_pcb, .kicad_sch, .kicad_pro)
   - `sexp_writer.py` — Text-based insertion/deletion for .kicad_sch files (wires, labels, junctions, no-connects, wire splitting). All writes use `f.flush()` + `os.fsync()`. Has `_to_content`/`_from_content` variants for all operations including `add_label_to_content`, `add_polyline_wire_to_content`, `split_wire_at_point_in_content`, `delete_no_connect_from_content`. **Wire placement (`add_wire`, `add_polyline_wire`) now auto-detects T-junctions and adds junction dots** via `auto_add_t_junctions()`. Also has `_parse_wire_segments()`, `_parse_existing_junctions()`, and `_point_on_wire_mid()` helpers for T-junction spatial analysis.
   - `net_analysis.py` — Net-level analysis using union-find graph. `build_net_graph()` builds complete pin→net mapping in O(W+L+P) via union-find with spatial-indexed T-junction detection. Query functions: `get_component_nets`, `get_net_components`, `get_pin_net_name`, `export_netlist_summary`, `validate_component_connections`, `find_shorted_nets`, `find_single_pin_nets`.
   - `component.py` — Board-level component operations (via pcbnew)
-  - `routing.py` — Trace routing (via pcbnew)
+  - `routing.py` — Trace routing, via management, netclass creation (via pcbnew). `resize_vias` batch-resizes vias filtered by old drill/diameter.
   - `board.py`, `board/*.py` — Board operations (layers, outline, size, 2D view)
   - `project.py` — Project creation/management
   - `library.py`, `library_schematic.py`, `library_symbol.py` — Library operations
