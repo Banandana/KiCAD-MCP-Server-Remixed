@@ -72,9 +72,18 @@ This remix adds 30+ tools. Here are the highlights:
 **Repair:**
 - `fix_connectivity` — Run KiCad ERC, auto-fix T-junctions, report what's left
 
+**Board outline management:**
+- `delete_board_outline` — Remove all Edge.Cuts shapes (the board outline)
+- `replace_board_outline` — Atomic delete + create: replace the outline in one call
+
+**Symbol and footprint workflow:**
+- `swap_schematic_symbol` — Change a component's symbol (lib_id) while preserving position, wiring, properties, and UUID. Auto-loads the new symbol definition and cleans up the old one
+- `get_footprint_bounds` — Return courtyard, fab layer, and pad bounding boxes for a library footprint. Parses `.kicad_mod` files directly, no board needed
+- `auto_assign_footprints` — Bulk-assign footprints by lib_id prefix mapping (e.g. all `Device:R` get `R_0603_1608Metric`)
+
 ## What's the same
 
-Everything on the PCB/board side is untouched — component placement, trace routing, copper pours, exports, DRC, JLCPCB integration. The TypeScript MCP server infrastructure, Python subprocess lifecycle, and IPC backend are also unchanged (aside from the auto-restart improvement when the Python process crashes).
+Everything else on the PCB/board side is untouched — component placement, trace routing, copper pours, exports, DRC, JLCPCB integration. The TypeScript MCP server infrastructure, Python subprocess lifecycle, and IPC backend are also unchanged (aside from the auto-restart improvement when the Python process crashes).
 
 ## Setup
 

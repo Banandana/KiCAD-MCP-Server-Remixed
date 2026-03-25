@@ -201,6 +201,82 @@ class BoardOutlineCommands:
                 "errorDetails": str(e),
             }
 
+    def delete_board_outline(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Remove all shapes from the Edge.Cuts layer (board outline)"""
+        try:
+            if not self.board:
+                return {
+                    "success": False,
+                    "message": "No board is loaded",
+                    "errorDetails": "Load or create a board first",
+                }
+
+            edge_layer = self.board.GetLayerID("Edge.Cuts")
+            shapes_to_remove = []
+
+            for drawing in self.board.GetDrawings():
+                if hasattr(drawing, "GetLayer") and drawing.GetLayer() == edge_layer:
+                    shapes_to_remove.append(drawing)
+
+            if not shapes_to_remove:
+                return {
+                    "success": True,
+                    "message": "No board outline found to delete",
+                    "deleted_count": 0,
+                }
+
+            for shape in shapes_to_remove:
+                self.board.Remove(shape)
+
+            return {
+                "success": True,
+                "message": f"Deleted board outline ({len(shapes_to_remove)} shapes removed)",
+                "deleted_count": len(shapes_to_remove),
+            }
+
+        except Exception as e:
+            logger.error(f"Error deleting board outline: {str(e)}")
+            return {
+                "success": False,
+                "message": "Failed to delete board outline",
+                "errorDetails": str(e),
+            }
+
+    def replace_board_outline(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Delete existing board outline and create a new one atomically"""
+        try:
+            if not self.board:
+                return {
+                    "success": False,
+                    "message": "No board is loaded",
+                    "errorDetails": "Load or create a board first",
+                }
+
+            # Step 1: Delete existing outline
+            delete_result = self.delete_board_outline({})
+            deleted_count = delete_result.get("deleted_count", 0)
+
+            # Step 2: Create new outline (reuse add_board_outline)
+            add_result = self.add_board_outline(params)
+
+            if not add_result.get("success"):
+                return add_result
+
+            add_result["message"] = (
+                f"Replaced board outline (removed {deleted_count} old shapes, "
+                f"created new {params.get('shape', 'rectangle')})"
+            )
+            add_result["deleted_count"] = deleted_count
+            return add_result
+
+        except Exception as e:
+            logger.error(f"Error replacing board outline: {str(e)}")
+            return {
+                "success": False,
+                "message": "Failed to replace board outline",
+                "errorDetails": str(e),
+            }
+
     def add_mounting_hole(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Add a mounting hole to the PCB"""
         try:

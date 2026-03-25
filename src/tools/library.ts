@@ -5,6 +5,7 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
+import { logger } from "../logger.js";
 
 export function registerLibraryTools(
   server: McpServer,
@@ -189,5 +190,28 @@ export function registerLibraryTools(
         ],
       };
     },
+  );
+
+  // ------------------------------------------------------
+  // Get Footprint Bounds Tool
+  // ------------------------------------------------------
+  server.tool(
+    "get_footprint_bounds",
+    `Return the bounding box of a library footprint (courtyard, fab layer, and pad extents).
+Useful for checking physical dimensions before placing connectors or planning board outlines.
+Does not require a board to be loaded — reads directly from .kicad_mod library files.`,
+    {
+      footprint: z.string().describe("Footprint in 'Library:Footprint' format (e.g. 'Connector_PinHeader_2.54mm:PinHeader_1x04_P2.54mm_Vertical')")
+    },
+    async ({ footprint }: { footprint: string }) => {
+      logger.debug(`Getting footprint bounds: ${footprint}`);
+      const result = await callKicadScript("get_footprint_bounds", { footprint });
+      return {
+        content: [{
+          type: "text" as const,
+          text: JSON.stringify(result)
+        }]
+      };
+    }
   );
 }

@@ -208,6 +208,79 @@ Note: operates on .kicad_sch files only. To modify a PCB footprint use edit_comp
     },
   );
 
+  // ------------------------------------------------------
+  // Swap Schematic Symbol Tool
+  // ------------------------------------------------------
+  server.tool(
+    "swap_schematic_symbol",
+    `Change a component's symbol library reference (lib_id) while preserving its position,
+wiring, properties, and UUID. Use this instead of delete + re-add + rewire when you need
+to switch a component to a different symbol (e.g., WS2812 to WS2812B-2020).
+
+The new symbol definition is automatically loaded from KiCad libraries. If the old symbol
+is no longer used by any other component, its definition is removed from the schematic.
+
+WARNING: If the new symbol has different pins than the old one, existing wires may not
+connect correctly. The tool warns when pin counts differ.`,
+    {
+      schematicPath: z.string().describe("Path to the .kicad_sch file"),
+      reference: z.string().describe("Reference designator of the component to swap (e.g. 'D5')"),
+      newLibId: z.string().describe("New symbol in 'Library:Symbol' format (e.g. 'LED:WS2812B-2020')"),
+    },
+    async (args: { schematicPath: string; reference: string; newLibId: string }) => {
+      const result = await callKicadScript("swap_schematic_symbol", args);
+      if (result.success) {
+        let msg = `Swapped ${args.reference}: ${result.old_lib_id} → ${result.new_lib_id}`;
+        if (result.warning) {
+          msg += `\n⚠️ ${result.warning}`;
+        }
+        return { content: [{ type: "text" as const, text: msg }] };
+      }
+      return {
+        content: [{ type: "text" as const, text: `Failed: ${result.message}` }],
+      };
+    },
+  );
+
+  // ------------------------------------------------------
+  // Auto Assign Footprints Tool
+  // ------------------------------------------------------
+  server.tool(
+    "auto_assign_footprints",
+    `Bulk-assign footprints to schematic components based on symbol library prefix matching.
+Instead of editing footprints one component at a time, provide a mapping of lib_id patterns
+to footprints and all matching components are updated in a single operation.
+
+Example: map "Device:R" to "Resistor_SMD:R_0603_1608Metric" to assign 0603 footprints to
+all resistors, "Device:C" to "Capacitor_SMD:C_0603_1608Metric" for all capacitors, etc.`,
+    {
+      schematicPath: z.string().describe("Path to the .kicad_sch file"),
+      mappings: z.array(z.object({
+        libIdPattern: z.string().describe("lib_id prefix to match (e.g. 'Device:R', 'Device:C')"),
+        footprint: z.string().describe("Footprint to assign (e.g. 'Resistor_SMD:R_0603_1608Metric')"),
+      })).describe("Array of {libIdPattern, footprint} mappings"),
+    },
+    async (args: {
+      schematicPath: string;
+      mappings: Array<{ libIdPattern: string; footprint: string }>;
+    }) => {
+      const result = await callKicadScript("auto_assign_footprints", args);
+      if (result.success) {
+        const lines = [`Assigned footprints to ${result.assigned?.length ?? 0} components:`];
+        for (const a of result.assigned ?? []) {
+          lines.push(`  ${a.reference} → ${a.footprint}`);
+        }
+        if (result.skipped?.length) {
+          lines.push(`Skipped ${result.skipped.length}: ${result.skipped.map((s: any) => s.reference).join(", ")}`);
+        }
+        return { content: [{ type: "text" as const, text: lines.join("\n") }] };
+      }
+      return {
+        content: [{ type: "text" as const, text: `Failed: ${result.message}` }],
+      };
+    },
+  );
+
   // Get component properties and field positions from schematic
   server.tool(
     "get_schematic_component",

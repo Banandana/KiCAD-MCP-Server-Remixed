@@ -55,6 +55,16 @@ class BoardCommands:
         self.outline_commands.board = self.board
         return self.outline_commands.add_board_outline(params)
     
+    def delete_board_outline(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Remove all Edge.Cuts shapes (board outline)"""
+        self.outline_commands.board = self.board
+        return self.outline_commands.delete_board_outline(params)
+
+    def replace_board_outline(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Delete existing outline and create a new one"""
+        self.outline_commands.board = self.board
+        return self.outline_commands.replace_board_outline(params)
+
     def add_mounting_hole(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Add a mounting hole to the PCB"""
         self.outline_commands.board = self.board

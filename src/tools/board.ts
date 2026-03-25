@@ -185,6 +185,64 @@ export function registerBoardTools(server: McpServer, callKicadScript: CommandFu
   );
 
   // ------------------------------------------------------
+  // Delete Board Outline Tool
+  // ------------------------------------------------------
+  server.tool(
+    "delete_board_outline",
+    "Remove the existing board outline (all shapes on Edge.Cuts layer). Use before add_board_outline to replace an outline.",
+    {},
+    async () => {
+      logger.debug("Deleting board outline");
+      const result = await callKicadScript("delete_board_outline", {});
+      return {
+        content: [{
+          type: "text" as const,
+          text: JSON.stringify(result)
+        }]
+      };
+    }
+  );
+
+  // ------------------------------------------------------
+  // Replace Board Outline Tool
+  // ------------------------------------------------------
+  server.tool(
+    "replace_board_outline",
+    "Atomically replace the board outline: deletes all existing Edge.Cuts shapes then creates a new outline. Same parameters as add_board_outline.",
+    {
+      shape: z.enum(["rectangle", "circle", "polygon", "rounded_rectangle"]).describe("Shape of the new outline"),
+      params: z.object({
+        width: z.number().optional().describe("Width of rectangle (mm)"),
+        height: z.number().optional().describe("Height of rectangle (mm)"),
+        cornerRadius: z.number().optional().describe("Corner radius for rounded_rectangle (mm)"),
+        radius: z.number().optional().describe("Radius of circle (mm)"),
+        points: z.array(
+          z.object({
+            x: z.number().describe("X coordinate"),
+            y: z.number().describe("Y coordinate")
+          })
+        ).optional().describe("Points of polygon"),
+        x: z.number().optional().describe("X coordinate of top-left corner (default: 0)"),
+        y: z.number().optional().describe("Y coordinate of top-left corner (default: 0)"),
+        unit: z.enum(["mm", "inch"]).default("mm").describe("Unit of measurement")
+      }).describe("Parameters for the new outline shape")
+    },
+    async ({ shape, params }) => {
+      logger.debug(`Replacing board outline with ${shape}`);
+      const result = await callKicadScript("replace_board_outline", {
+        shape,
+        ...params
+      });
+      return {
+        content: [{
+          type: "text" as const,
+          text: JSON.stringify(result)
+        }]
+      };
+    }
+  );
+
+  // ------------------------------------------------------
   // Add Mounting Hole Tool
   // ------------------------------------------------------
   server.tool(

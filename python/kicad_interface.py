@@ -369,6 +369,8 @@ class KiCADInterface:
             "get_board_2d_view": self.board_commands.get_board_2d_view,
             "get_board_extents": self.board_commands.get_board_extents,
             "add_board_outline": self.board_commands.add_board_outline,
+            "delete_board_outline": self.board_commands.delete_board_outline,
+            "replace_board_outline": self.board_commands.replace_board_outline,
             "add_mounting_hole": self.board_commands.add_mounting_hole,
             "add_text": self.board_commands.add_text,
             "add_board_text": self.board_commands.add_text,  # Alias for TypeScript tool
@@ -416,6 +418,7 @@ class KiCADInterface:
             "search_footprints": self.library_commands.search_footprints,
             "list_library_footprints": self.library_commands.list_library_footprints,
             "get_footprint_info": self.library_commands.get_footprint_info,
+            "get_footprint_bounds": self.library_commands.get_footprint_bounds,
             # Symbol library commands (local KiCad symbol library search)
             "list_symbol_libraries": self.symbol_library_commands.list_symbol_libraries,
             "search_symbols": self.symbol_library_commands.search_symbols,
@@ -436,6 +439,8 @@ class KiCADInterface:
             "add_schematic_component": self._handle_add_schematic_component,
             "delete_schematic_component": self._handle_delete_schematic_component,
             "edit_schematic_component": self._handle_edit_schematic_component,
+            "swap_schematic_symbol": self._handle_swap_schematic_symbol,
+            "auto_assign_footprints": self._handle_auto_assign_footprints,
             "get_schematic_component": self._handle_get_schematic_component,
             "add_schematic_wire": self._handle_add_schematic_wire,
             "add_schematic_connection": self._handle_add_schematic_connection,
@@ -1172,6 +1177,314 @@ class KiCADInterface:
             logger.error(f"Error editing schematic component: {e}")
 
 
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e)}
+
+    def _handle_swap_schematic_symbol(self, params):
+        """Change a component's lib_id (symbol library reference) while preserving
+        position, wiring, properties, and UUID.
+        """
+        logger.info("Swapping schematic symbol")
+        try:
+            from pathlib import Path
+            from commands.dynamic_symbol_loader import DynamicSymbolLoader
+
+            schematic_path = params.get("schematicPath")
+            reference = params.get("reference")
+            new_lib_id = params.get("newLibId")
+
+            if not schematic_path:
+                return {"success": False, "message": "schematicPath is required"}
+            if not reference:
+                return {"success": False, "message": "reference is required"}
+            if not new_lib_id:
+                return {"success": False, "message": "newLibId is required (e.g. 'LED:WS2812B-2020')"}
+
+            if ":" not in new_lib_id:
+                return {
+                    "success": False,
+                    "message": "newLibId must be in 'Library:Symbol' format (e.g. 'LED:WS2812B-2020')",
+                }
+            new_library, new_symbol = new_lib_id.split(":", 1)
+
+            sch_file = Path(schematic_path)
+            if not sch_file.exists():
+                return {"success": False, "message": f"Schematic not found: {schematic_path}"}
+
+            with open(sch_file, "r", encoding="utf-8") as f:
+                content = f.read()
+
+            # --- Find the placed symbol block by Reference ---
+            def find_matching_paren(s, start):
+                depth = 0
+                i = start
+                while i < len(s):
+                    if s[i] == "(":
+                        depth += 1
+                    elif s[i] == ")":
+                        depth -= 1
+                        if depth == 0:
+                            return i
+                    i += 1
+                return -1
+
+            lib_sym_pos = content.find("(lib_symbols")
+            lib_sym_end = find_matching_paren(content, lib_sym_pos) if lib_sym_pos >= 0 else -1
+
+            import re
+            pattern = re.compile(r'\(symbol\s+\(lib_id\s+"([^"]+)"\s*\)')
+            target_start = target_end = -1
+            old_lib_id = None
+            search_start = 0
+
+            while True:
+                m = pattern.search(content, search_start)
+                if not m:
+                    break
+                pos = m.start()
+                if lib_sym_pos >= 0 and lib_sym_pos <= pos <= lib_sym_end:
+                    search_start = lib_sym_end + 1
+                    continue
+                end = find_matching_paren(content, pos)
+                if end < 0:
+                    search_start = pos + 1
+                    continue
+                block = content[pos:end + 1]
+                ref_match = re.search(
+                    r'\(property\s+"Reference"\s+"' + re.escape(reference) + r'"',
+                    block,
+                )
+                if ref_match:
+                    target_start = pos
+                    target_end = end
+                    old_lib_id = m.group(1)
+                    break
+                search_start = end + 1
+
+            if target_start < 0:
+                return {
+                    "success": False,
+                    "message": f"Component '{reference}' not found in schematic",
+                }
+
+            if old_lib_id == new_lib_id:
+                return {
+                    "success": True,
+                    "message": f"Component '{reference}' already uses {new_lib_id}",
+                    "reference": reference,
+                    "lib_id": new_lib_id,
+                }
+
+            # --- Replace lib_id in the placed symbol block ---
+            block = content[target_start:target_end + 1]
+            new_block = block.replace(
+                f'(lib_id "{old_lib_id}")',
+                f'(lib_id "{new_lib_id}")',
+                1,
+            )
+            content = content[:target_start] + new_block + content[target_end + 1:]
+
+            # --- Inject new symbol definition into lib_symbols ---
+            if f'(symbol "{new_lib_id}"' not in content:
+                # Write intermediate content so DynamicSymbolLoader can read it
+                with open(sch_file, "w", encoding="utf-8") as f:
+                    f.write(content)
+                    f.flush()
+                    os.fsync(f.fileno())
+
+                derived_project_path = sch_file.parent
+                loader = DynamicSymbolLoader(project_path=derived_project_path)
+                loader.inject_symbol_into_schematic(sch_file, new_library, new_symbol)
+
+                # Re-read after injection
+                with open(sch_file, "r", encoding="utf-8") as f:
+                    content = f.read()
+
+            # --- Remove old lib_symbol if no other instances reference it ---
+            old_lib_id_escaped = re.escape(old_lib_id)
+            # Re-find lib_symbols bounds (may have shifted from injection)
+            lib_sym_pos = content.find("(lib_symbols")
+            lib_sym_end = find_matching_paren(content, lib_sym_pos) if lib_sym_pos >= 0 else -1
+
+            remaining = 0
+            search_start = 0
+            while True:
+                m2 = re.search(rf'\(lib_id\s+"{old_lib_id_escaped}"\)', content[search_start:])
+                if not m2:
+                    break
+                abs_pos = search_start + m2.start()
+                # Skip matches inside lib_symbols section
+                if lib_sym_pos >= 0 and lib_sym_pos <= abs_pos <= lib_sym_end:
+                    search_start = abs_pos + 1
+                    continue
+                remaining += 1
+                search_start = abs_pos + 1
+
+            if remaining == 0 and lib_sym_pos >= 0:
+                lib_sym_section = content[lib_sym_pos:lib_sym_end + 1]
+                old_sym_pattern = f'(symbol "{old_lib_id}"'
+                old_sym_start = lib_sym_section.find(old_sym_pattern)
+                if old_sym_start >= 0:
+                    old_sym_abs = lib_sym_pos + old_sym_start
+                    old_sym_end = find_matching_paren(content, old_sym_abs)
+                    if old_sym_end > 0:
+                        trim_start = old_sym_abs
+                        while trim_start > lib_sym_pos and content[trim_start - 1] in (" ", "\t"):
+                            trim_start -= 1
+                        if trim_start > lib_sym_pos and content[trim_start - 1] == "\n":
+                            trim_start -= 1
+                        content = content[:trim_start] + content[old_sym_end + 1:]
+
+            # --- Write final result ---
+            with open(sch_file, "w", encoding="utf-8") as f:
+                f.write(content)
+                f.flush()
+                os.fsync(f.fileno())
+
+            # Warn if pin counts differ
+            warning = None
+            try:
+                pins_old = len(self.pin_locator.get_symbol_pins(sch_file, old_lib_id) or {})
+            except Exception:
+                pins_old = -1
+            try:
+                pins_new = len(self.pin_locator.get_symbol_pins(sch_file, new_lib_id) or {})
+            except Exception:
+                pins_new = -1
+            if pins_old >= 0 and pins_new >= 0 and pins_old != pins_new:
+                warning = (
+                    f"Pin count changed: {old_lib_id} had {pins_old} pins, "
+                    f"{new_lib_id} has {pins_new} pins. Check wiring."
+                )
+
+            result = {
+                "success": True,
+                "message": f"Swapped {reference} from {old_lib_id} to {new_lib_id}",
+                "reference": reference,
+                "old_lib_id": old_lib_id,
+                "new_lib_id": new_lib_id,
+            }
+            if warning:
+                result["warning"] = warning
+            return result
+
+        except Exception as e:
+            logger.error(f"Error swapping schematic symbol: {e}")
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e)}
+
+    def _handle_auto_assign_footprints(self, params):
+        """Bulk-assign footprints to schematic components based on lib_id prefix matching.
+        Single read/write cycle.
+        """
+        logger.info("Auto-assigning footprints")
+        try:
+            from pathlib import Path
+
+            schematic_path = params.get("schematicPath")
+            mappings = params.get("mappings", [])
+
+            if not schematic_path:
+                return {"success": False, "message": "schematicPath is required"}
+            if not mappings:
+                return {"success": False, "message": "mappings array is required"}
+
+            sch_file = Path(schematic_path)
+            if not sch_file.exists():
+                return {"success": False, "message": f"Schematic not found: {schematic_path}"}
+
+            with open(sch_file, "r", encoding="utf-8") as f:
+                content = f.read()
+
+            mapping_list = []
+            for mp in mappings:
+                prefix = mp.get("libIdPattern", "")
+                footprint = mp.get("footprint", "")
+                if prefix and footprint:
+                    mapping_list.append((prefix, footprint))
+
+            if not mapping_list:
+                return {"success": False, "message": "No valid mappings provided"}
+
+            import re
+
+            def find_matching_paren(s, start):
+                depth = 0
+                i = start
+                while i < len(s):
+                    if s[i] == "(":
+                        depth += 1
+                    elif s[i] == ")":
+                        depth -= 1
+                        if depth == 0:
+                            return i
+                    i += 1
+                return -1
+
+            lib_sym_pos = content.find("(lib_symbols")
+            lib_sym_end = find_matching_paren(content, lib_sym_pos) if lib_sym_pos >= 0 else -1
+
+            edits_to_apply = []
+            search_start = 0
+            pattern = re.compile(r'\(symbol\s+\(lib_id\s+"([^"]+)"\s*\)')
+            while True:
+                m = pattern.search(content, search_start)
+                if not m:
+                    break
+                pos = m.start()
+                if lib_sym_pos >= 0 and lib_sym_pos <= pos <= lib_sym_end:
+                    search_start = lib_sym_end + 1
+                    continue
+                end = find_matching_paren(content, pos)
+                if end < 0:
+                    search_start = pos + 1
+                    continue
+                block = content[pos:end + 1]
+                lib_id = m.group(1)
+
+                ref_match = re.search(r'\(property\s+"Reference"\s+"([^"]+)"', block)
+                if not ref_match:
+                    search_start = end + 1
+                    continue
+                ref = ref_match.group(1)
+
+                if ref.startswith("_TEMPLATE"):
+                    search_start = end + 1
+                    continue
+
+                for prefix, footprint in mapping_list:
+                    if lib_id.startswith(prefix) or lib_id == prefix:
+                        edits_to_apply.append((ref, footprint))
+                        break
+
+                search_start = end + 1
+
+            assigned = []
+            skipped = []
+            for ref, footprint in edits_to_apply:
+                result = self._edit_component_in_content(
+                    content, ref, new_footprint=footprint,
+                )
+                if result is not None:
+                    content = result
+                    assigned.append({"reference": ref, "footprint": footprint})
+                else:
+                    skipped.append({"reference": ref, "reason": "edit failed"})
+
+            with open(sch_file, "w", encoding="utf-8") as f:
+                f.write(content)
+                f.flush()
+                os.fsync(f.fileno())
+
+            return {
+                "success": True,
+                "message": f"Assigned footprints to {len(assigned)} components ({len(skipped)} skipped)",
+                "assigned": assigned,
+                "skipped": skipped,
+            }
+
+        except Exception as e:
+            logger.error(f"Error in auto_assign_footprints: {e}")
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
 

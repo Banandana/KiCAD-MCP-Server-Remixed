@@ -529,3 +529,131 @@ class LibraryCommands:
                 "message": "Failed to get footprint info",
                 "errorDetails": str(e),
             }
+
+    def get_footprint_bounds(self, params: Dict) -> Dict:
+        """Get bounding box dimensions of a footprint from its .kicad_mod file.
+
+        Returns courtyard, fab layer, and pad extents without needing pcbnew.
+        """
+        import re
+        import math
+
+        try:
+            footprint_spec = params.get("footprint")
+            if not footprint_spec:
+                return {"success": False, "message": "Missing footprint parameter"}
+
+            result = self.library_manager.find_footprint(footprint_spec)
+            if not result:
+                return {
+                    "success": False,
+                    "message": f"Footprint not found: {footprint_spec}",
+                }
+
+            library_path, footprint_name = result
+            fp_file = Path(library_path) / f"{footprint_name}.kicad_mod"
+            if not fp_file.exists():
+                return {
+                    "success": False,
+                    "message": f"Footprint file not found: {fp_file}",
+                }
+
+            with open(fp_file, "r", encoding="utf-8") as f:
+                content = f.read()
+
+            layer_points = {}  # layer_name -> list of (x, y)
+
+            # Lines and rects: (fp_line/fp_rect (start X Y) (end X Y) ... (layer "LAYER"))
+            for m in re.finditer(
+                r'\(fp_(?:line|rect)\s+\(start\s+([\d.e+-]+)\s+([\d.e+-]+)\)\s+'
+                r'\(end\s+([\d.e+-]+)\s+([\d.e+-]+)\).*?\(layer\s+"([^"]+)"\)',
+                content, re.DOTALL
+            ):
+                x1, y1 = float(m.group(1)), float(m.group(2))
+                x2, y2 = float(m.group(3)), float(m.group(4))
+                layer = m.group(5)
+                layer_points.setdefault(layer, []).extend([(x1, y1), (x2, y2)])
+
+            # Circles: (fp_circle (center X Y) (end X Y) ... (layer "LAYER"))
+            for m in re.finditer(
+                r'\(fp_circle\s+\(center\s+([\d.e+-]+)\s+([\d.e+-]+)\)\s+'
+                r'\(end\s+([\d.e+-]+)\s+([\d.e+-]+)\).*?\(layer\s+"([^"]+)"\)',
+                content, re.DOTALL
+            ):
+                cx, cy = float(m.group(1)), float(m.group(2))
+                ex, ey = float(m.group(3)), float(m.group(4))
+                radius = math.sqrt((ex - cx) ** 2 + (ey - cy) ** 2)
+                layer = m.group(5)
+                layer_points.setdefault(layer, []).extend([
+                    (cx - radius, cy - radius), (cx + radius, cy + radius)
+                ])
+
+            # Pads: (pad NUM TYPE SHAPE (at X Y [angle]) (size W H) ... (layers "L1" "L2" ...))
+            for m in re.finditer(
+                r'\(pad\s+\S+\s+\S+\s+\S+\s+\(at\s+([\d.e+-]+)\s+([\d.e+-]+)'
+                r'(?:\s+[\d.e+-]+)?\)\s+\(size\s+([\d.e+-]+)\s+([\d.e+-]+)\)'
+                r'.*?\(layers\s+([^)]+)\)',
+                content, re.DOTALL
+            ):
+                px, py = float(m.group(1)), float(m.group(2))
+                sw, sh = float(m.group(3)), float(m.group(4))
+                layers_str = m.group(5)
+                pad_layers = re.findall(r'"([^"]+)"', layers_str)
+                for pad_layer in pad_layers:
+                    layer_points.setdefault(pad_layer, []).extend([
+                        (px - sw / 2, py - sh / 2), (px + sw / 2, py + sh / 2)
+                    ])
+                layer_points.setdefault("Pads", []).extend([
+                    (px - sw / 2, py - sh / 2), (px + sw / 2, py + sh / 2)
+                ])
+
+            # Compute bounds per layer
+            bounds = {}
+            for layer, points in layer_points.items():
+                if not points:
+                    continue
+                xs = [p[0] for p in points]
+                ys = [p[1] for p in points]
+                bounds[layer] = {
+                    "min_x": round(min(xs), 3),
+                    "min_y": round(min(ys), 3),
+                    "max_x": round(max(xs), 3),
+                    "max_y": round(max(ys), 3),
+                    "width": round(max(xs) - min(xs), 3),
+                    "height": round(max(ys) - min(ys), 3),
+                }
+
+            courtyard = bounds.get("F.CrtYd", bounds.get("B.CrtYd"))
+
+            all_points = [p for pts in layer_points.values() for p in pts]
+            overall = None
+            if all_points:
+                xs = [p[0] for p in all_points]
+                ys = [p[1] for p in all_points]
+                overall = {
+                    "min_x": round(min(xs), 3),
+                    "min_y": round(min(ys), 3),
+                    "max_x": round(max(xs), 3),
+                    "max_y": round(max(ys), 3),
+                    "width": round(max(xs) - min(xs), 3),
+                    "height": round(max(ys) - min(ys), 3),
+                }
+
+            return {
+                "success": True,
+                "footprint": footprint_spec,
+                "courtyard": courtyard,
+                "pads": bounds.get("Pads"),
+                "fab_front": bounds.get("F.Fab"),
+                "fab_back": bounds.get("B.Fab"),
+                "overall": overall,
+                "all_layers": bounds,
+            }
+
+        except Exception as e:
+            logger.error(f"Error getting footprint bounds: {e}")
+            return {
+                "success": False,
+                "message": "Failed to get footprint bounds",
+                "errorDetails": str(e),
+            }
