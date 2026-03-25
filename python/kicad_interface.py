@@ -7013,7 +7013,7 @@ class KiCADInterface:
                     else:
                         unmatched.append(f"{ref}/{pad_num}")
 
-            board.Save(board_path)
+            pcbnew.SaveBoard(board_path, board)
 
             # If board was loaded fresh, update internal reference
             if params.get("boardPath"):
@@ -7442,7 +7442,7 @@ class KiCADInterface:
                     "success": False,
                     "message": "Board has no file path — save first",
                 }
-            self.board.Save(board_path)
+            pcbnew.SaveBoard(board_path, self.board)
 
             zone_count = (
                 self.board.GetAreaCount() if hasattr(self.board, "GetAreaCount") else 0

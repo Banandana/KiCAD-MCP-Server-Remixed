@@ -362,6 +362,7 @@ class BoardOutlineCommands:
 
             for shape in shapes_to_remove:
                 self.board.Remove(shape)
+            self.board.SetModified()
 
             preserved = len(edge_shapes) - len(shapes_to_remove)
             msg = f"Deleted board outline ({len(shapes_to_remove)} shapes removed)"
@@ -401,6 +402,11 @@ class BoardOutlineCommands:
             add_result = self.add_board_outline(params)
 
             if not add_result.get("success"):
+                add_result["message"] = (
+                    f"WARNING: Old outline was deleted ({deleted_count} shapes removed) "
+                    f"but new outline failed: {add_result.get('message', 'unknown error')}. "
+                    f"Board currently has no outline."
+                )
                 return add_result
 
             add_result["message"] = (
@@ -701,11 +707,11 @@ class BoardOutlineCommands:
         arc.SetShape(pcbnew.SHAPE_T_ARC)
         arc.SetCenter(center)
 
-        # Calculate start and end points
-        start_x = center.x + int(radius * math.cos(math.radians(start_angle)))
-        start_y = center.y + int(radius * math.sin(math.radians(start_angle)))
-        end_x = center.x + int(radius * math.cos(math.radians(end_angle)))
-        end_y = center.y + int(radius * math.sin(math.radians(end_angle)))
+        # Calculate start and end points (round, not truncate, to avoid 1nm gaps)
+        start_x = center.x + round(radius * math.cos(math.radians(start_angle)))
+        start_y = center.y + round(radius * math.sin(math.radians(start_angle)))
+        end_x = center.x + round(radius * math.cos(math.radians(end_angle)))
+        end_y = center.y + round(radius * math.sin(math.radians(end_angle)))
 
         arc.SetStart(pcbnew.VECTOR2I(start_x, start_y))
         arc.SetEnd(pcbnew.VECTOR2I(end_x, end_y))

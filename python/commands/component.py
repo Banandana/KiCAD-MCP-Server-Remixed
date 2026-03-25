@@ -305,6 +305,7 @@ class ComponentCommands:
 
             # Remove from board
             self.board.Remove(module)
+            self.board.SetModified()
 
             return {
                 "success": True,
