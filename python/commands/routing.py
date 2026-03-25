@@ -1099,6 +1099,98 @@ class RoutingCommands:
                 "errorDetails": str(e),
             }
 
+    def resize_vias(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Batch resize vias on the board.
+
+        If oldDrill/oldDiameter are provided, only vias matching those sizes are
+        resized. Otherwise ALL vias on the board are resized.
+        """
+        try:
+            if not self.board:
+                return {
+                    "success": False,
+                    "message": "No board is loaded",
+                    "errorDetails": "Load or create a board first",
+                }
+
+            new_drill = params.get("drill")
+            new_diameter = params.get("diameter")
+            old_drill = params.get("oldDrill")
+            old_diameter = params.get("oldDiameter")
+
+            if new_drill is None and new_diameter is None:
+                return {
+                    "success": False,
+                    "message": "At least one of drill or diameter must be provided",
+                }
+
+            scale = 1000000  # mm to nm
+            new_drill_nm = int(new_drill * scale) if new_drill is not None else None
+            new_diameter_nm = int(new_diameter * scale) if new_diameter is not None else None
+            old_drill_nm = int(old_drill * scale) if old_drill is not None else None
+            old_diameter_nm = int(old_diameter * scale) if old_diameter is not None else None
+
+            # Tolerance for matching (500nm = 0.0005mm)
+            TOL = 500
+
+            resized = 0
+            skipped = 0
+            total_vias = 0
+
+            for track in self.board.GetTracks():
+                if track.Type() != pcbnew.PCB_VIA_T:
+                    continue
+
+                via = pcbnew.Cast_to_PCB_VIA(track)
+                total_vias += 1
+
+                # Filter by old size if specified
+                if old_drill_nm is not None:
+                    if abs(via.GetDrill() - old_drill_nm) > TOL:
+                        skipped += 1
+                        continue
+                if old_diameter_nm is not None:
+                    if abs(via.GetWidth() - old_diameter_nm) > TOL:
+                        skipped += 1
+                        continue
+
+                # Apply new sizes
+                if new_drill_nm is not None:
+                    via.SetDrill(new_drill_nm)
+                if new_diameter_nm is not None:
+                    via.SetWidth(new_diameter_nm)
+                resized += 1
+
+            if resized > 0:
+                self.board.SetModified()
+
+            filter_desc = ""
+            if old_drill is not None or old_diameter is not None:
+                parts = []
+                if old_drill is not None:
+                    parts.append(f"drill={old_drill}mm")
+                if old_diameter is not None:
+                    parts.append(f"diameter={old_diameter}mm")
+                filter_desc = f" matching {', '.join(parts)}"
+
+            return {
+                "success": True,
+                "message": f"Resized {resized} of {total_vias} vias{filter_desc}",
+                "resized": resized,
+                "skipped": skipped,
+                "total_vias": total_vias,
+                "new_drill_mm": new_drill,
+                "new_diameter_mm": new_diameter,
+            }
+
+        except Exception as e:
+            logger.error(f"Error resizing vias: {str(e)}")
+            return {
+                "success": False,
+                "message": "Failed to resize vias",
+                "errorDetails": str(e),
+            }
+
     def add_copper_pour(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Add a copper pour (zone) to the PCB"""
         try:

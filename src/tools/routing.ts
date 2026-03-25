@@ -4,6 +4,7 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
+import { logger } from "../logger.js";
 
 export function registerRoutingTools(
   server: McpServer,
@@ -270,6 +271,39 @@ export function registerRoutingTools(
             text: JSON.stringify(result, null, 2),
           },
         ],
+      };
+    },
+  );
+
+  // ------------------------------------------------------
+  // Resize Vias Tool
+  // ------------------------------------------------------
+  server.tool(
+    "resize_vias",
+    `Batch resize vias on the board. If oldDrill/oldDiameter are provided, only vias
+matching those exact sizes are resized. Otherwise ALL vias are resized.
+
+Example: resize all 0.15mm drill / 0.25mm pad vias to 0.2mm drill / 0.45mm pad:
+  resize_vias({ oldDrill: 0.15, oldDiameter: 0.25, drill: 0.2, diameter: 0.45 })`,
+    {
+      drill: z.number().optional().describe("New drill size in mm"),
+      diameter: z.number().optional().describe("New via diameter (pad size) in mm"),
+      oldDrill: z.number().optional().describe("Only resize vias with this drill size (mm). Omit to match all."),
+      oldDiameter: z.number().optional().describe("Only resize vias with this diameter (mm). Omit to match all."),
+    },
+    async (args: { drill?: number; diameter?: number; oldDrill?: number; oldDiameter?: number }) => {
+      logger.debug("Resizing vias");
+      const result = await callKicadScript("resize_vias", args);
+      if (result.success) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: `Resized ${result.resized} of ${result.total_vias} vias → drill=${result.new_drill_mm ?? "unchanged"}mm, diameter=${result.new_diameter_mm ?? "unchanged"}mm`,
+          }],
+        };
+      }
+      return {
+        content: [{ type: "text" as const, text: `Failed: ${result.message}` }],
       };
     },
   );
