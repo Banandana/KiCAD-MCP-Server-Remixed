@@ -604,8 +604,8 @@ The query point must be at a wire endpoint or junction — midpoints of wire seg
 Use get_schematic_pin_locations or list_schematic_wires to obtain exact endpoint coordinates first.`,
     {
       schematicPath: z.string().describe("Path to the schematic file"),
-      x: z.number().describe("X coordinate in mm"),
-      y: z.number().describe("Y coordinate in mm"),
+      x: z.number().describe("X coordinate (mm) — must be at a wire endpoint or junction"),
+      y: z.number().describe("Y coordinate (mm) — must be at a wire endpoint or junction"),
     },
     async (args) => {
       const result = await callKicadScript("get_wire_connections", args);
@@ -969,15 +969,15 @@ Use get_schematic_pin_locations or list_schematic_wires to obtain exact endpoint
   // Delete wire from schematic
   server.tool(
     "delete_schematic_wire",
-    "Remove a wire from the schematic by start and end coordinates.",
+    "Remove a wire from the schematic by start and end coordinates (mm).",
     {
       schematicPath: z.string().describe("Path to the .kicad_sch file"),
       start: z
         .object({ x: z.number(), y: z.number() })
-        .describe("Wire start position"),
+        .describe("Wire start position (mm)"),
       end: z
         .object({ x: z.number(), y: z.number() })
-        .describe("Wire end position"),
+        .describe("Wire end position (mm)"),
     },
     async (args: {
       schematicPath: string;
@@ -1010,12 +1010,12 @@ Use get_schematic_pin_locations or list_schematic_wires to obtain exact endpoint
   // Batch delete wires
   server.tool(
     "batch_delete_schematic_wire",
-    "Delete multiple wires in a single call. Each wire is identified by start and end coordinates.",
+    "Delete multiple wires in a single call. Each wire is identified by start and end coordinates (mm).",
     {
       schematicPath: z.string().describe("Path to the .kicad_sch file"),
       wires: z.array(z.object({
-        start: z.object({ x: z.number(), y: z.number() }).describe("Wire start position"),
-        end: z.object({ x: z.number(), y: z.number() }).describe("Wire end position"),
+        start: z.object({ x: z.number(), y: z.number() }).describe("Wire start position (mm)"),
+        end: z.object({ x: z.number(), y: z.number() }).describe("Wire end position (mm)"),
       })).describe("Array of wires to delete"),
     },
     async (args) => {
@@ -1366,8 +1366,8 @@ Use get_schematic_pin_locations or list_schematic_wires to obtain exact endpoint
     {
       schematicPath: z.string().describe("Path to the schematic file"),
       symbol: z.string().describe("Power symbol name (e.g., 'GND', '+3V3', '+5V', 'VCC', 'VDD')"),
-      position: z.object({ x: z.number(), y: z.number() }).optional().describe("Position on schematic"),
-      orientation: z.number().optional().describe("Rotation angle (0, 90, 180, 270)"),
+      position: z.object({ x: z.number(), y: z.number() }).optional().describe("Position on schematic (mm)"),
+      orientation: z.number().optional().describe("Rotation angle in degrees (0, 90, 180, 270)"),
     },
     async (args) => {
       const result = await callKicadScript("add_power_symbol", {
@@ -1409,7 +1409,7 @@ Use get_schematic_pin_locations or list_schematic_wires to obtain exact endpoint
       moves: z.record(z.string(), z.object({
         x: z.number(),
         y: z.number(),
-      })).describe("Map of reference designator to new position, e.g., {'R1': {x: 100, y: 50}}"),
+      })).describe("Map of reference designator to new position in mm, e.g., {'R1': {x: 100, y: 50}}"),
     },
     async (args) => {
       const result = await callKicadScript("bulk_move_schematic_components", args);
@@ -1438,14 +1438,14 @@ Use get_schematic_pin_locations or list_schematic_wires to obtain exact endpoint
     {
       schematicPath: z.string().describe("Path to the schematic file"),
       bbox: z.object({
-        x1: z.number().describe("Left x coordinate"),
-        y1: z.number().describe("Top y coordinate"),
-        x2: z.number().describe("Right x coordinate"),
-        y2: z.number().describe("Bottom y coordinate"),
-      }).describe("Bounding box defining the region to move"),
+        x1: z.number().describe("Left x coordinate (mm)"),
+        y1: z.number().describe("Top y coordinate (mm)"),
+        x2: z.number().describe("Right x coordinate (mm)"),
+        y2: z.number().describe("Bottom y coordinate (mm)"),
+      }).describe("Bounding box defining the region to move (schematic mm coordinates)"),
       offset: z.object({
-        dx: z.number().describe("X offset to move by"),
-        dy: z.number().describe("Y offset to move by"),
+        dx: z.number().describe("X offset to move by (mm)"),
+        dy: z.number().describe("Y offset to move by (mm)"),
       }).describe("How far to move the region"),
     },
     async (args) => {
@@ -1457,12 +1457,12 @@ Use get_schematic_pin_locations or list_schematic_wires to obtain exact endpoint
   // Add multiple wires in a single call
   server.tool(
     "batch_add_wire",
-    "Add multiple wires in a single call. Each wire is defined by start and end points.",
+    "Add multiple wires in a single call. Each wire is defined by start and end points in mm.",
     {
       schematicPath: z.string().describe("Path to the schematic file"),
       wires: z.array(z.object({
-        start: z.object({ x: z.number(), y: z.number() }),
-        end: z.object({ x: z.number(), y: z.number() }),
+        start: z.object({ x: z.number(), y: z.number() }).describe("Wire start position (mm)"),
+        end: z.object({ x: z.number(), y: z.number() }).describe("Wire end position (mm)"),
       })).describe("Array of wires to add"),
     },
     async (args) => {
@@ -1519,12 +1519,12 @@ Example: { schematicPath: "...", labels: [{ netName: "NC_U9", position: { x: 190
       schematicPath: z.string().describe("Path to the schematic file"),
       labels: z.array(z.object({
         netName: z.string().describe("Label text/net name"),
-        position: z.object({ x: z.number(), y: z.number() }).describe("Current position of the label"),
+        position: z.object({ x: z.number(), y: z.number() }).describe("Current position of the label (mm)"),
       })).describe("Labels to move (identified by name + current position)"),
       offset: z.object({
-        dx: z.number(),
-        dy: z.number(),
-      }).describe("How far to move each label"),
+        dx: z.number().describe("X offset (mm)"),
+        dy: z.number().describe("Y offset (mm)"),
+      }).describe("How far to move each label (mm)"),
     },
     async (args) => {
       const result = await callKicadScript("move_labels_by_offset", args);
@@ -1662,7 +1662,7 @@ Example: { schematicPath: "...", labels: [{ netName: "NC_U9", position: { x: 190
     {
       schematicPath: z.string().describe("Path to the schematic file"),
       text: z.string().describe("Text content"),
-      position: z.object({ x: z.number(), y: z.number() }).describe("Position for the text"),
+      position: z.object({ x: z.number(), y: z.number() }).describe("Position for the text (mm)"),
       size: z.number().optional().describe("Font size in mm (default: 2.54)"),
       angle: z.number().optional().describe("Rotation angle (default: 0)"),
     },
@@ -1968,13 +1968,13 @@ Example: { schematicPath: "...", labels: [{ netName: "NC_U9", position: { x: 190
 
   server.tool(
     "get_schematic_view_region",
-    "Export a cropped region of the schematic as a PNG or SVG image. Coordinates in schematic mm.",
+    "Export a cropped region of the schematic as a PNG or SVG image. All coordinates in schematic mm.",
     {
       schematicPath: z.string().describe("Path to the schematic file"),
-      x1: z.number().describe("Left boundary in mm"),
-      y1: z.number().describe("Top boundary in mm"),
-      x2: z.number().describe("Right boundary in mm"),
-      y2: z.number().describe("Bottom boundary in mm"),
+      x1: z.number().describe("Left boundary (mm)"),
+      y1: z.number().describe("Top boundary (mm)"),
+      x2: z.number().describe("Right boundary (mm)"),
+      y2: z.number().describe("Bottom boundary (mm)"),
       format: z.enum(["png", "svg"]).optional().describe("Output format (default: png)"),
       width: z.number().optional().describe("Output width in pixels (default: 800)"),
       height: z.number().optional().describe("Output height in pixels (default: 600)"),
@@ -1990,7 +1990,7 @@ Example: { schematicPath: "...", labels: [{ netName: "NC_U9", position: { x: 190
     "Detect spatially overlapping symbols, wires, and labels in a schematic using AABB intersection.",
     {
       schematicPath: z.string().describe("Path to the schematic file"),
-      tolerance: z.number().optional().describe("Overlap tolerance in mm (default: 0.5)"),
+      tolerance: z.number().optional().describe("Overlap tolerance in mm (default: 0.5mm)"),
     },
     async (args) => {
       const result = await callKicadScript("find_overlapping_elements", args);
@@ -2000,13 +2000,13 @@ Example: { schematicPath: "...", labels: [{ netName: "NC_U9", position: { x: 190
 
   server.tool(
     "get_elements_in_region",
-    "List all symbols, wires, and labels within a rectangular region of the schematic.",
+    "List all symbols, wires, and labels within a rectangular region of the schematic. Coordinates in mm.",
     {
       schematicPath: z.string().describe("Path to the schematic file"),
-      x1: z.number().describe("Left boundary in mm"),
-      y1: z.number().describe("Top boundary in mm"),
-      x2: z.number().describe("Right boundary in mm"),
-      y2: z.number().describe("Bottom boundary in mm"),
+      x1: z.number().describe("Left boundary (mm)"),
+      y1: z.number().describe("Top boundary (mm)"),
+      x2: z.number().describe("Right boundary (mm)"),
+      y2: z.number().describe("Bottom boundary (mm)"),
     },
     async (args) => {
       const result = await callKicadScript("get_elements_in_region", args);

@@ -25,6 +25,7 @@ export function registerDesignRuleTools(server: McpServer, callKicadScript: Comm
   // ------------------------------------------------------
   server.tool(
     "set_design_rules",
+    "Set global PCB design rules (clearance, track width, via size, etc.). All dimensions in mm.",
     {
       clearance: z.number().optional().describe("Minimum clearance between copper items (mm)"),
       trackWidth: z.number().optional().describe("Default track width (mm)"),
@@ -59,6 +60,7 @@ export function registerDesignRuleTools(server: McpServer, callKicadScript: Comm
   // ------------------------------------------------------
   server.tool(
     "get_design_rules",
+    "Get current PCB design rules (clearance, track width, via size, etc.).",
     {},
     async () => {
       logger.debug('Getting design rules');
@@ -78,6 +80,7 @@ export function registerDesignRuleTools(server: McpServer, callKicadScript: Comm
   // ------------------------------------------------------
   server.tool(
     "run_drc",
+    "Run Design Rule Check on the PCB and return violations.",
     {
       reportPath: z.string().optional().describe("Optional path to save the DRC report")
     },
@@ -241,6 +244,7 @@ export function registerDesignRuleTools(server: McpServer, callKicadScript: Comm
   // ------------------------------------------------------
   server.tool(
     "get_drc_violations",
+    "Get existing DRC violations without re-running the check. Filter by severity.",
     {
       severity: z.enum(["error", "warning", "all"]).optional().describe("Filter violations by severity")
     },

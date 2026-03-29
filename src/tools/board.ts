@@ -25,6 +25,7 @@ export function registerBoardTools(server: McpServer, callKicadScript: CommandFu
   // ------------------------------------------------------
   server.tool(
     "set_board_size",
+    "Set the PCB board dimensions (width and height).",
     {
       width: z.number().describe("Board width"),
       height: z.number().describe("Board height"),
@@ -52,6 +53,7 @@ export function registerBoardTools(server: McpServer, callKicadScript: CommandFu
   // ------------------------------------------------------
   server.tool(
     "add_layer",
+    "Add a new layer to the PCB stackup (copper, technical, or user layer).",
     {
       name: z.string().describe("Layer name"),
       type: z.enum([
@@ -85,6 +87,7 @@ export function registerBoardTools(server: McpServer, callKicadScript: CommandFu
   // ------------------------------------------------------
   server.tool(
     "set_active_layer",
+    "Set the active working layer in the PCB editor.",
     {
       layer: z.string().describe("Layer name to set as active")
     },
@@ -106,6 +109,7 @@ export function registerBoardTools(server: McpServer, callKicadScript: CommandFu
   // ------------------------------------------------------
   server.tool(
     "get_board_info",
+    "Get basic information about the loaded PCB board (layers, dimensions, component count).",
     {},
     async () => {
       logger.debug('Getting board information');
@@ -139,6 +143,7 @@ export function registerBoardTools(server: McpServer, callKicadScript: CommandFu
   // ------------------------------------------------------
   server.tool(
     "get_layer_list",
+    "List all layers in the PCB stackup with their types and visibility.",
     {},
     async () => {
       logger.debug('Getting layer list');
@@ -158,6 +163,7 @@ export function registerBoardTools(server: McpServer, callKicadScript: CommandFu
   // ------------------------------------------------------
   server.tool(
     "add_board_outline",
+    "Add a board outline on the Edge.Cuts layer. Supports rectangle, circle, polygon, and rounded_rectangle shapes.",
     {
       shape: z.enum(["rectangle", "circle", "polygon", "rounded_rectangle"]).describe("Shape of the outline"),
       params: z.object({
@@ -265,6 +271,7 @@ slots, etc. Set deleteAll=true to remove ALL Edge.Cuts shapes including internal
   // ------------------------------------------------------
   server.tool(
     "add_mounting_hole",
+    "Add a mounting hole footprint to the PCB at the specified position.",
     {
       position: z.object({
         x: z.number().describe("X coordinate"),
@@ -296,6 +303,7 @@ slots, etc. Set deleteAll=true to remove ALL Edge.Cuts shapes including internal
   // ------------------------------------------------------
   server.tool(
     "add_board_text",
+    "Add text to the PCB on a specified layer (silkscreen, copper, etc.).",
     {
       text: z.string().describe("Text content"),
       position: z.object({
@@ -375,6 +383,7 @@ slots, etc. Set deleteAll=true to remove ALL Edge.Cuts shapes including internal
   // ------------------------------------------------------
   server.tool(
     "get_board_extents",
+    "Get the bounding box of all board content (components, traces, outline).",
     {
       unit: z.enum(["mm", "inch"]).optional().describe("Unit of measurement for the result")
     },
@@ -396,6 +405,7 @@ slots, etc. Set deleteAll=true to remove ALL Edge.Cuts shapes including internal
   // ------------------------------------------------------
   server.tool(
     "get_board_2d_view",
+    "Render a 2D top-down view of the PCB as a PNG image. Optionally filter by layers.",
     {
       layers: z.array(z.string()).optional().describe("Optional array of layer names to include"),
       width: z.number().optional().describe("Optional width of the image in pixels"),

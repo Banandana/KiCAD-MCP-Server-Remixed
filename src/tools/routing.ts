@@ -38,19 +38,19 @@ export function registerRoutingTools(
     {
       start: z
         .object({
-          x: z.number(),
-          y: z.number(),
-          unit: z.string().optional(),
+          x: z.number().describe("X coordinate"),
+          y: z.number().describe("Y coordinate"),
+          unit: z.string().optional().describe("Unit: 'mm' (default) or 'inch'"),
         })
         .describe("Start position"),
       end: z
         .object({
-          x: z.number(),
-          y: z.number(),
-          unit: z.string().optional(),
+          x: z.number().describe("X coordinate"),
+          y: z.number().describe("Y coordinate"),
+          unit: z.string().optional().describe("Unit: 'mm' (default) or 'inch'"),
         })
         .describe("End position"),
-      layer: z.string().describe("PCB layer"),
+      layer: z.string().describe("PCB layer (e.g., 'F.Cu', 'B.Cu')"),
       width: z.number().describe("Trace width in mm"),
       net: z.string().describe("Net name"),
     },
@@ -74,9 +74,9 @@ export function registerRoutingTools(
     {
       position: z
         .object({
-          x: z.number(),
-          y: z.number(),
-          unit: z.string().optional(),
+          x: z.number().describe("X coordinate"),
+          y: z.number().describe("Y coordinate"),
+          unit: z.string().optional().describe("Unit: 'mm' (default) or 'inch'"),
         })
         .describe("Via position"),
       net: z.string().describe("Net name"),
@@ -257,7 +257,7 @@ export function registerRoutingTools(
     "Create a new net class with custom design rules.",
     {
       name: z.string().describe("Net class name"),
-      traceWidth: z.number().optional().describe("Default trace width in mm"),
+      trackWidth: z.number().optional().describe("Default track width in mm"),
       clearance: z.number().optional().describe("Clearance in mm"),
       viaDiameter: z.number().optional().describe("Via diameter in mm"),
       viaDrill: z.number().optional().describe("Via drill size in mm"),
