@@ -281,6 +281,7 @@ When adding or modifying a schematic tool, verify:
 19. [ ] Board tools call `board.SetModified()` after `board.Remove()`
 20. [ ] Board footprint/drawing iteration uses `Cast_to_FOOTPRINT` / `Cast_to_PCB_SHAPE` for SWIG safety
 21. [ ] Board outline arc endpoints use `round()` not `int()` for trig
+22. [ ] Balanced-paren counting loops are string-aware (skip chars inside `"..."`) — pin names like `PA15(JTDI)` contain literal parens
 
 ## Code Patterns
 
@@ -393,7 +394,8 @@ These are bugs that were actually encountered and fixed. If you see these sympto
 - **delete_board_outline removes internal cutouts**: Was removing ALL Edge.Cuts shapes. Fixed — now groups shapes into connected chains, identifies outer outline by largest bounding box, preserves internal cutouts (mounting holes, USB slots). `deleteAll=true` for old behavior.
 - **board.Save() doesn't persist changes**: Instance method `board.Save()` uses different code path than `pcbnew.SaveBoard()`. Two callsites (sync_schematic_to_board, refill_zones) used `board.Save()` without flush. Fixed — standardized to `pcbnew.SaveBoard()`.
 - **Deleted outline/components not saved**: `board.Remove()` wasn't followed by `board.SetModified()`, so the board wasn't marked dirty. Fixed in `delete_board_outline` and `delete_component`.
-- **kicad-skip fails with "'ParsedValue' object has no attribute 'symbol'"**: `SchematicManager.load_schematic()` (which wraps `skip.Schematic()`) fails on some KiCad 9 schematics — catches the exception and returns `None`, producing unhelpful "Failed to load schematic" errors. Fixed for `list_schematic_components` and `PinLocator` (all 4 methods) by replacing kicad-skip with regex-based `parse_placed_symbols_from_content()`. **~26 other handlers still use `SchematicManager.load_schematic()`** and are vulnerable to the same failure. When a handler fails with "Failed to load schematic", migrate it to use `parse_placed_symbols_from_content()` from `pin_locator.py`.
+- **kicad-skip fails with "'ParsedValue' object has no attribute 'symbol'"**: `SchematicManager.load_schematic()` (which wraps `skip.Schematic()`) fails on some KiCad 9 schematics — catches the exception and returns `None`, producing unhelpful "Failed to load schematic" errors. Fixed for `list_schematic_components`, `batch_get_schematic_pin_locations`, and `PinLocator` (all 4 methods) by replacing kicad-skip with regex-based `parse_placed_symbols_from_content()`. **~24 other handlers still use `SchematicManager.load_schematic()`** and are vulnerable to the same failure. When a handler fails with "Failed to load schematic", migrate it to use `parse_placed_symbols_from_content()` from `pin_locator.py`.
+- **STM32 / JTAG pins with parens in names break paren counting**: Pin names like `PA15(JTDI)` and `PB4(NJTRST)` contain literal `()` inside quoted strings. All balanced-paren counters must be string-aware (skip chars inside `"..."`) or they lose count and fail on large MCU symbols. Fixed in `_extract_symbol_block`, `inject_symbol_into_schematic`, `_iter_top_level_items` (dynamic_symbol_loader.py), `_find_matching_paren` (pin_locator.py), and 5 `find_matching_paren` instances (kicad_interface.py). **When adding new paren-counting loops, always include string skipping.**
 
 ## Important Notes
 
