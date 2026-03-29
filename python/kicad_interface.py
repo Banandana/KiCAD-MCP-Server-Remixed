@@ -3806,7 +3806,12 @@ class KiCADInterface:
             for l in labels:
                 net = l.get("netName")
                 pos = l.get("position")
-                pos_list = [pos.get("x", 0), pos.get("y", 0)] if pos else None
+                if isinstance(pos, list):
+                    pos_list = pos
+                elif isinstance(pos, dict):
+                    pos_list = [pos.get("x", 0), pos.get("y", 0)]
+                else:
+                    pos_list = None
                 result = delete_label_from_content(content, net, pos_list)
                 if result is not None:
                     content = result
@@ -5552,35 +5557,36 @@ class KiCADInterface:
             return {"success": False, "message": str(e)}
 
     def _handle_list_schematic_labels(self, params):
-        """List all net labels and power flags in a schematic, with geometry."""
+        """List all net labels, global labels, hierarchical labels, and power flags
+        in a schematic, with geometry. Uses regex parsing (no kicad-skip)."""
         logger.info("Listing schematic labels")
         try:
-            import math
+            import re
 
             schematic_path = params.get("schematicPath")
             if not schematic_path:
                 return {"success": False, "message": "schematicPath is required"}
 
-            schematic = SchematicManager.load_schematic(schematic_path)
-            if not schematic:
-                return {"success": False, "message": "Failed to load schematic"}
+            from pathlib import Path
+
+            sch_file = Path(schematic_path)
+            if not sch_file.exists():
+                return {"success": False, "message": f"Schematic not found: {schematic_path}"}
+
+            with open(schematic_path, "r", encoding="utf-8") as f:
+                content = f.read()
 
             def _label_geometry(name, lx, ly, angle, label_type):
                 """Compute connectionPoint and boundingBox for a label."""
-                # Compute bounding box from position + angle + text length
                 char_w = 0.75  # mm per char
                 text_len = len(name) * char_w
-                if label_type == "global":
-                    body = 3.0
-                elif label_type == "hierarchical":
+                if label_type in ("global", "hierarchical"):
                     body = 3.0
                 else:
                     body = 0.5
                 total_w = body + text_len
                 total_h = 1.8
 
-                # KiCad renders labels with (at) as top-left of the shape.
-                # Body always extends RIGHT (+x) for horizontal, DOWN (+y) for vertical.
                 norm_angle = int(angle) % 360
                 if norm_angle in (0, 180):
                     x1 = lx
@@ -5593,100 +5599,68 @@ class KiCADInterface:
                     y1 = ly
                     y2 = ly + total_w
 
-                # Connection point: electrical end where wires attach.
-                # 0°: right end. 180°: left end (=at). 90°: bottom. 270°: top (=at).
                 if norm_angle == 0:
                     conn = {"x": round(lx + total_w, 2), "y": ly}
                 elif norm_angle == 90:
                     conn = {"x": lx, "y": round(ly + total_w, 2)}
-                else:  # 180, 270
+                else:
                     conn = {"x": lx, "y": ly}
 
-                corners_x = [x1, x2]
-                corners_y = [y1, y2]
                 bbox = {
-                    "x1": round(min(corners_x), 2),
-                    "y1": round(min(corners_y), 2),
-                    "x2": round(max(corners_x), 2),
-                    "y2": round(max(corners_y), 2),
+                    "x1": round(min(x1, x2), 2),
+                    "y1": round(min(y1, y2), 2),
+                    "x2": round(max(x1, x2), 2),
+                    "y2": round(max(y1, y2), 2),
                 }
                 return conn, bbox
 
             labels = []
 
-            # Regular labels
-            if hasattr(schematic, "label"):
-                for label in schematic.label:
-                    if hasattr(label, "value"):
-                        pos = (
-                            label.at.value
-                            if hasattr(label, "at") and hasattr(label.at, "value")
-                            else [0, 0, 0]
-                        )
-                        lx, ly = float(pos[0]), float(pos[1])
-                        angle = float(pos[2]) if len(pos) > 2 else 0
-                        conn, bbox = _label_geometry(label.value, lx, ly, angle, "net")
-                        labels.append(
-                            {
-                                "name": label.value,
-                                "type": "net",
-                                "position": {"x": lx, "y": ly},
-                                "angle": angle,
-                                "connectionPoint": conn,
-                                "boundingBox": bbox,
-                            }
-                        )
-
-            # Global labels
-            if hasattr(schematic, "global_label"):
-                for label in schematic.global_label:
-                    if hasattr(label, "value"):
-                        pos = (
-                            label.at.value
-                            if hasattr(label, "at") and hasattr(label.at, "value")
-                            else [0, 0, 0]
-                        )
-                        lx, ly = float(pos[0]), float(pos[1])
-                        angle = float(pos[2]) if len(pos) > 2 else 0
-                        conn, bbox = _label_geometry(label.value, lx, ly, angle, "global")
-                        labels.append(
-                            {
-                                "name": label.value,
-                                "type": "global",
-                                "position": {"x": lx, "y": ly},
-                                "angle": angle,
-                                "connectionPoint": conn,
-                                "boundingBox": bbox,
-                            }
-                        )
-
-            # Power symbols (components with power flag)
-            if hasattr(schematic, "symbol"):
-                for symbol in schematic.symbol:
-                    if not hasattr(symbol.property, "Reference"):
-                        continue
-                    ref = symbol.property.Reference.value
-                    if ref.startswith("_TEMPLATE"):
-                        continue
-                    if not ref.startswith("#PWR"):
-                        continue
-                    value = (
-                        symbol.property.Value.value
-                        if hasattr(symbol.property, "Value")
-                        else ref
-                    )
-                    pos = symbol.at.value if hasattr(symbol, "at") else [0, 0, 0]
-                    lx, ly = float(pos[0]), float(pos[1])
-                    angle = float(pos[2]) if len(pos) > 2 else 0
+            # Parse all three label types with regex
+            type_map = {
+                "label": "net",
+                "global_label": "global",
+                "hierarchical_label": "hierarchical",
+            }
+            for lt, display_type in type_map.items():
+                pattern = re.compile(
+                    rf'\({lt}\s+"([^"]*)"'
+                    rf'(?:\s+\(shape\s+[^)]*\))?'
+                    rf'\s+\(at\s+([-\d.e+]+)\s+([-\d.e+]+)\s*([-\d.e+]*)\s*\)'
+                )
+                for m in pattern.finditer(content):
+                    name = m.group(1)
+                    lx = float(m.group(2))
+                    ly = float(m.group(3))
+                    angle = float(m.group(4)) if m.group(4) else 0.0
+                    conn, bbox = _label_geometry(name, lx, ly, angle, display_type)
                     labels.append(
                         {
-                            "name": value,
-                            "type": "power",
+                            "name": name,
+                            "type": display_type,
                             "position": {"x": lx, "y": ly},
                             "angle": angle,
-                            "connectionPoint": {"x": lx, "y": ly},
+                            "connectionPoint": conn,
+                            "boundingBox": bbox,
                         }
                     )
+
+            # Power symbols via regex-based symbol parser
+            from commands.pin_locator import parse_placed_symbols_from_content
+
+            for sym in parse_placed_symbols_from_content(content):
+                ref = sym["reference"]
+                if not ref.startswith("#PWR"):
+                    continue
+                labels.append(
+                    {
+                        "name": sym["value"],
+                        "type": "power",
+                        "position": {"x": sym["x"], "y": sym["y"]},
+                        "angle": sym["rotation"],
+                        "connectionPoint": {"x": sym["x"], "y": sym["y"]},
+                    }
+                )
 
             return {"success": True, "labels": labels, "count": len(labels)}
 
