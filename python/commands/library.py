@@ -539,14 +539,30 @@ class LibraryCommands:
                         library_nickname = nick
                         break
 
+                # Minimal info — always returned even if the parser fails
                 info = {
                     "library": library_nickname,
-                    "footprint": footprint_name,
+                    "name": footprint_name,
                     "full_name": f"{library_nickname}:{footprint_name}",
                     "library_path": library_path,
                 }
 
-                return {"success": True, "footprint_info": info}
+                # Attempt to enrich with parsed .kicad_mod data
+                try:
+                    from parsers.kicad_mod_parser import parse_kicad_mod
+                    from pathlib import Path as _Path
+                    mod_file = str(_Path(library_path) / f"{footprint_name}.kicad_mod")
+                    parsed = parse_kicad_mod(mod_file)
+                    if parsed:
+                        info.update(parsed)
+                        info["name"] = footprint_name
+                        info["library"] = library_nickname
+                        info["full_name"] = f"{library_nickname}:{footprint_name}"
+                        info["library_path"] = library_path
+                except Exception as parse_err:
+                    logger.warning(f"get_footprint_info: parser error ({parse_err}), using minimal info")
+
+                return {"success": True, "info": info}
             else:
                 return {
                     "success": False,
