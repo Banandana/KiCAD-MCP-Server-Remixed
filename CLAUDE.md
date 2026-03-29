@@ -296,9 +296,10 @@ The `callKicadScript` command string and the `command_routes` key **must match e
 - **Text insertion/deletion** (`python/commands/sexp_writer.py`): Preferred method for adding/removing wires, labels, junctions, no-connects, wire splitting, etc. Inserts formatted text before `(sheet_instances` (falls back to before final `)` if `(sheet_instances` is absent), preserving file formatting. Deletion uses balanced-paren block matching with position tolerance. All writes are flushed to disk with `os.fsync()`. Each function has a `_to_content` / `_from_content` variant (e.g., `add_wire_to_content`, `add_label_to_content`, `delete_no_connect_from_content`, `split_wire_at_point_in_content`) that operates on a string instead of a file — use these in batch handlers to avoid N read/write cycles. **Wire placement auto-adds junction dots at T-junctions** via `auto_add_t_junctions()` — no manual junction management needed.
 - **Net analysis** (`python/commands/net_analysis.py`): Union-find based net graph builder. `build_net_graph()` computes complete pin→net mapping in a single O(W+L+P) pass. Used by 7 query tools: `get_component_nets`, `get_net_components`, `get_pin_net_name`, `export_netlist_summary`, `validate_component_connections`, `find_shorted_nets`, `find_single_pin_nets`. The graph detects shorted nets (two named nets accidentally merged) and single-pin nets (broken connections).
 - **Connectivity repair** (`fix_connectivity` tool): Runs kicad-cli ERC as ground truth, parses JSON violations, auto-fixes T-junctions by adding junction dots. Use as final verification — kicad-cli's connectivity engine is independent of MCP's pin math.
-- **kicad-skip** (`from skip import Schematic`): Used for reading/querying existing schematic elements (symbols, properties, wires). Good for reads, avoid for writes that go through `sexpdata.dumps()`.
+- **kicad-skip** (`from skip import Schematic`): Used by ~26 handlers for reading/querying existing schematic elements (symbols, properties, wires). **WARNING: kicad-skip fails on some KiCad 9 schematics** with `AttributeError: 'ParsedValue' object has no attribute 'symbol'`. The `PinLocator` and `list_schematic_components` handler have been migrated to regex-based parsing (see `parse_placed_symbols_from_content()`). Other handlers using `SchematicManager.load_schematic()` are still vulnerable — migrate them to regex parsing when they fail. Avoid for writes that go through `sexpdata.dumps()`.
+- **parse_placed_symbols_from_content** (`python/commands/pin_locator.py`): Regex-based parser for placed `(symbol ...)` blocks in raw `.kicad_sch` text. Returns list of dicts with reference, lib_id, position, rotation, mirror, value, footprint, uuid. Excludes `(lib_symbols)` section and `_TEMPLATE` symbols. **Preferred over kicad-skip** for reading placed symbol data — works on all schematic files including those that trip up kicad-skip. Import: `from commands.pin_locator import parse_placed_symbols_from_content`.
 - **DynamicSymbolLoader** (`python/commands/dynamic_symbol_loader.py`): Text-based symbol injection from KiCad libraries. Handles `(instances)` blocks, rotation-aware field positions. Uses text manipulation, not sexpdata.
-- **PinLocator** (`python/commands/pin_locator.py`): Returns pin **endpoints** (connectable tip), not body positions. Handles rotation (via KiCad schematic transform, not standard rotation) AND mirror transforms. `rotate_point()` applies the Y-down-aware transform `[[cos,-sin],[-sin,cos]]`. `get_all_symbol_pins()` loads the file once and computes all pins inline (no per-pin re-reads). Pin definition cache is per lib_id and safe to keep. A shared `PinLocator` instance lives on `KiCADInterface` as `self.pin_locator` — handlers use this instead of creating fresh instances, preserving the cache across calls.
+- **PinLocator** (`python/commands/pin_locator.py`): Returns pin **endpoints** (connectable tip), not body positions. Handles rotation (via KiCad schematic transform, not standard rotation) AND mirror transforms. `rotate_point()` applies the Y-down-aware transform `[[cos,-sin],[-sin,cos]]`. `get_all_symbol_pins()` reads the file once and computes all pins inline using regex-based parsing (no kicad-skip dependency). Pin definition cache is per lib_id and safe to keep. A shared `PinLocator` instance lives on `KiCADInterface` as `self.pin_locator` — handlers use this instead of creating fresh instances, preserving the cache across calls.
 - **swap_schematic_symbol** (`kicad_interface.py`): Changes a component's `(lib_id)` in-place, uses `DynamicSymbolLoader.inject_symbol_into_schematic()` to add the new symbol definition to `lib_symbols`, and removes the old definition if no other instances reference it. Warns if pin counts differ between old and new symbols.
 - **auto_assign_footprints** (`kicad_interface.py`): Scans all placed symbols, matches their `lib_id` against prefix patterns, and updates their Footprint property via `_edit_component_in_content()`. Single read/write cycle.
 - **get_footprint_bounds** (`library.py`): Parses `.kicad_mod` files with regex to extract courtyard, fab layer, and pad bounding boxes. No pcbnew needed — works from library files directly.
@@ -392,12 +393,126 @@ These are bugs that were actually encountered and fixed. If you see these sympto
 - **delete_board_outline removes internal cutouts**: Was removing ALL Edge.Cuts shapes. Fixed — now groups shapes into connected chains, identifies outer outline by largest bounding box, preserves internal cutouts (mounting holes, USB slots). `deleteAll=true` for old behavior.
 - **board.Save() doesn't persist changes**: Instance method `board.Save()` uses different code path than `pcbnew.SaveBoard()`. Two callsites (sync_schematic_to_board, refill_zones) used `board.Save()` without flush. Fixed — standardized to `pcbnew.SaveBoard()`.
 - **Deleted outline/components not saved**: `board.Remove()` wasn't followed by `board.SetModified()`, so the board wasn't marked dirty. Fixed in `delete_board_outline` and `delete_component`.
+- **kicad-skip fails with "'ParsedValue' object has no attribute 'symbol'"**: `SchematicManager.load_schematic()` (which wraps `skip.Schematic()`) fails on some KiCad 9 schematics — catches the exception and returns `None`, producing unhelpful "Failed to load schematic" errors. Fixed for `list_schematic_components` and `PinLocator` (all 4 methods) by replacing kicad-skip with regex-based `parse_placed_symbols_from_content()`. **~26 other handlers still use `SchematicManager.load_schematic()`** and are vulnerable to the same failure. When a handler fails with "Failed to load schematic", migrate it to use `parse_placed_symbols_from_content()` from `pin_locator.py`.
 
 ## Important Notes
 
 - **stdout is sacred**: The TypeScript server uses STDIO transport. All logging goes to stderr or files. Never `console.log()` in TS or `print()` in Python (except for JSON responses on the protocol channel).
 - **KiCAD 9+ required**: The server targets KiCAD 9.0+ (schema version 20250114).
 - **Cross-platform**: Supports Linux, Windows, macOS. Platform detection in `python/utils/platform_helper.py`.
+
+## KiCAD File Formats
+
+All KiCAD files (except `.kicad_pro`) use S-expression (Lisp-like) text format with balanced parentheses. KiCAD 9 schema versions: `.kicad_sch` = `20250114`, `.kicad_sym` = `20241209`, `.kicad_mod` = `20241229`.
+
+### .kicad_sch (Schematic)
+
+```
+(kicad_sch (version 20250114) (generator "...")
+  (uuid "...")
+  (paper "A4")
+  (lib_symbols
+    (symbol "Device:R" ...
+      (symbol "R_0_1" ... graphics ...)
+      (symbol "R_1_1" ... pins ...)
+    )
+  )
+  ... placed symbols, wires, labels, junctions, no-connects ...
+  (sheet_instances (path "/" (page "1")))
+)
+```
+
+**Placed symbol:**
+```
+(symbol (lib_id "Device:R") (at 100 50 0) (mirror x)
+  (uuid "...")
+  (property "Reference" "R1" (at 105 50 0) (effects (font (size 1.27 1.27))))
+  (property "Value" "10k" (at 100 45 0) (effects (font (size 1.27 1.27))))
+  (property "Footprint" "Resistor_SMD:R_0603_1608Metric" (at 0 0 0) (effects (font (size 1.27 1.27)) (hide yes)))
+  (instances (project "Name" (path "/UUID" (reference "R1") (unit 1))))
+)
+```
+
+**Wire:** `(wire (pts (xy x1 y1) (xy x2 y2)) (stroke (width 0) (type default)) (uuid "..."))`
+- Must be strictly horizontal or vertical. Diagonal wires don't form connections.
+
+**Labels:** Three types — `(label "name" (at x y angle) ...)`, `(global_label "name" (shape bidirectional) (at x y angle) ...)`, `(hierarchical_label "name" (shape output) (at x y angle) ...)`
+- Global/hierarchical have `(shape ...)` between name and `(at)` — regex must account for this.
+- `(justify left)` for 0°/90°, `(justify right)` for 180°/270°.
+- Global/hierarchical include `(property "Intersheetrefs" "${INTERSHEET_REFS}" ...)`.
+
+**Junction:** `(junction (at x y) (diameter 0) (color 0 0 0 0) (uuid "..."))`
+
+**No-connect:** `(no_connect (at x y) (uuid "..."))`
+
+**Power symbols:** Regular symbols with `lib_id "power:GND"` etc. References auto-numbered `#PWR01`, `#PWR02`.
+
+### .kicad_sym (Symbol Library)
+
+```
+(kicad_symbol_lib (version 20241209) (generator "...")
+  (symbol "MySymbol" (pin_numbers hide) (pin_names (offset 0.254)) (in_bom yes) (on_board yes)
+    (property "Reference" "U" (at 0 5 0) ...)
+    (symbol "MySymbol_0_1" ... body graphics ...)
+    (symbol "MySymbol_1_1"
+      (pin input line (at -7.62 2.54 0) (length 2.54)
+        (name "IN+" ...) (number "3" ...))
+    )
+  )
+)
+```
+
+**Pin definition:** `(pin <type> <style> (at x y angle) (length mm) (name "...") (number "..."))`
+- `(at x y angle)` = connectable endpoint (NOT the body). Length extends FROM endpoint TOWARD body.
+- Coordinates are in **symbol-local Y-up space**. Must negate Y for schematic (Y-down) conversion.
+- `angle` = direction FROM endpoint TOWARD body (0=right, 90=up, 180=left, 270=down).
+- Types: `passive`, `input`, `output`, `bidirectional`, `tri_state`, `power_in`, `power_out`, etc.
+- Supports `(extends "ParentSymbol")` for inheritance in library files (must be inlined in schematic `lib_symbols`).
+
+### .kicad_mod (Footprint Library)
+
+```
+(footprint "R_0603_Custom" (version 20241229) (generator "...") (layer "F.Cu")
+  (property "Reference" "REF**" (at 0 -1.27 0) (layer "F.SilkS") (uuid "...") ...)
+  (property "Value" "R_0603_Custom" (at 0 1.27 0) (layer "F.Fab") (uuid "...") ...)
+  (pad "1" smd rect (at -1.45 0) (size 0.9 1.6) (layers "F.Cu" "F.Paste" "F.Mask") (uuid "..."))
+  (pad "2" smd rect (at 1.45 0) (size 0.9 1.6) (layers "F.Cu" "F.Paste" "F.Mask") (uuid "..."))
+  (fp_line (start x y) (end x y) (stroke ...) (layer "F.SilkS") (uuid "..."))
+  (fp_rect (start x y) (end x y) (stroke ...) (fill none) (layer "F.CrtYd") (uuid "..."))
+)
+```
+
+Pad types: `smd` (surface mount), `thru_hole` (plated through-hole), `np_thru_hole` (non-plated). Shapes: `rect`, `circle`, `oval`, `roundrect`.
+
+### .kicad_pro (Project)
+
+**JSON format** (not S-expression):
+```json
+{
+  "board": { "filename": "project.kicad_pcb" },
+  "sheets": [["root", "project.kicad_sch"]]
+}
+```
+
+### .kicad_pcb (Board)
+
+S-expression format but manipulated via `pcbnew` SWIG API, not text. Key elements: layers (F.Cu, B.Cu, Edge.Cuts, etc.), footprints with pads, traces (width, layer, net), vias (diameter, drill), zones/pours, board outline (Edge.Cuts shapes). Coordinates in mm, Y-down.
+
+### Coordinate Systems
+
+| Context | Y direction | Grid | Notes |
+|---------|-------------|------|-------|
+| Schematic space | Y-down | 1.27mm | Component placement, wires, labels |
+| Symbol-local (pin defs) | Y-up | — | Must negate Y for schematic conversion |
+| Board space (pcbnew) | Y-down | 0.1mm typical | All units in mm internally |
+
+### Key Format Rules
+
+- All UUIDs must be quoted: `(uuid "xxx")` — unquoted rejected by kicad-cli.
+- `(hide yes)` goes inside `(effects ...)`, NOT inside `(font ...)`.
+- `(instances)` block required on every placed symbol for annotation.
+- New elements inserted before `(sheet_instances)` (or before final `)` if absent).
+- Never round-trip through `sexpdata.dumps()` — collapses file to single line.
 
 ## Known Technical Debt
 
@@ -419,3 +534,4 @@ These are known issues that haven't been fixed yet. Keep them in mind when worki
 - **Synchronous logger**: `logger.ts` uses `appendFileSync` and `existsSync` on every log message, blocking the Node.js event loop. Should use async write stream.
 - **`wire_manager.py` is a zero-value wrapper**: Every method forwards to `sexp_writer` with no added logic. Could be eliminated.
 - **Duplicated utilities across modules**: `_get_project_name` (in sexp_writer.py and dynamic_symbol_loader.py), `_fmt` coordinate formatter (3 slightly different implementations), mirror attribute parser (5+ locations). Should be extracted to shared utils.
+- **~26 handlers still depend on kicad-skip `SchematicManager.load_schematic()`**: kicad-skip fails on some KiCad 9 schematics. `list_schematic_components` and `PinLocator` have been migrated to regex-based `parse_placed_symbols_from_content()`. Remaining handlers (list_schematic_nets, get_net_connectivity, validate_wire_connections, find_orphan_items, check_schematic_overlaps, get_schematic_layout, annotate_schematic, etc.) should be migrated as they fail. The regex parser is in `pin_locator.py` and can be imported.

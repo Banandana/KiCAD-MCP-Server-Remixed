@@ -7,14 +7,117 @@ Uses S-expression parsing to extract pin data from symbol definitions.
 
 import logging
 import math
+import re
 import tempfile
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict
 import sexpdata
 from sexpdata import Symbol
-from skip import Schematic
 
 logger = logging.getLogger("kicad_interface")
+
+
+def _find_matching_paren(s: str, start: int) -> int:
+    """Find matching closing paren for opening paren at position start."""
+    depth = 0
+    i = start
+    while i < len(s):
+        if s[i] == "(":
+            depth += 1
+        elif s[i] == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return -1
+
+
+def parse_placed_symbols_from_content(content: str) -> list:
+    """
+    Parse all placed (symbol ...) blocks from raw .kicad_sch text.
+
+    Returns list of dicts with: reference, lib_id, x, y, rotation,
+    mirror_x, mirror_y, value, footprint, uuid.
+    Excludes lib_symbols section and _TEMPLATE symbols.
+    """
+    # Find lib_symbols section bounds to exclude
+    lib_sym_start = content.find("(lib_symbols")
+    lib_sym_end = -1
+    if lib_sym_start >= 0:
+        lib_sym_end = _find_matching_paren(content, lib_sym_start)
+
+    results = []
+    sym_pattern = re.compile(r"\(symbol\s+\(lib_id\s+\"")
+
+    for match in sym_pattern.finditer(content):
+        pos = match.start()
+
+        # Skip if inside lib_symbols section
+        if lib_sym_start >= 0 and lib_sym_start <= pos <= lib_sym_end:
+            continue
+
+        # Extract full block using balanced parens
+        end = _find_matching_paren(content, pos)
+        if end < 0:
+            continue
+        block = content[pos : end + 1]
+
+        # Extract lib_id
+        lib_id_m = re.search(r'\(lib_id\s+"([^"]+)"\s*\)', block)
+        lib_id = lib_id_m.group(1) if lib_id_m else ""
+
+        # First (at ...) in block is the symbol position
+        at_m = re.search(
+            r"\(at\s+([-\d.e+]+)\s+([-\d.e+]+)\s*([-\d.e+]*)\s*\)", block
+        )
+        if not at_m:
+            continue
+        x = float(at_m.group(1))
+        y = float(at_m.group(2))
+        rotation = float(at_m.group(3)) if at_m.group(3) else 0.0
+
+        # Extract mirror
+        mirror_m = re.search(r"\(mirror\s+(\w+)\)", block)
+        mirror_val = mirror_m.group(1) if mirror_m else ""
+        mirror_x = "x" in mirror_val
+        mirror_y = "y" in mirror_val
+
+        # Extract reference
+        ref_m = re.search(r'\(property\s+"Reference"\s+"([^"]*)"', block)
+        reference = ref_m.group(1) if ref_m else ""
+
+        # Skip templates
+        if reference.startswith("_TEMPLATE"):
+            continue
+
+        # Extract value
+        val_m = re.search(r'\(property\s+"Value"\s+"([^"]*)"', block)
+        value = val_m.group(1) if val_m else ""
+
+        # Extract footprint
+        fp_m = re.search(r'\(property\s+"Footprint"\s+"([^"]*)"', block)
+        footprint = fp_m.group(1) if fp_m else ""
+
+        # Extract uuid — handle both quoted and unquoted
+        uuid_m = re.search(r'\(uuid\s+"?([^")\s]+)"?\)', block)
+        uuid_val = uuid_m.group(1) if uuid_m else ""
+
+        results.append(
+            {
+                "reference": reference,
+                "lib_id": lib_id,
+                "value": value,
+                "footprint": footprint,
+                "x": x,
+                "y": y,
+                "rotation": rotation,
+                "mirror_x": mirror_x,
+                "mirror_y": mirror_y,
+                "uuid": uuid_val,
+            }
+        )
+
+    return results
 
 
 class PinLocator:
@@ -182,16 +285,24 @@ class PinLocator:
 
         return (rotated_x, rotated_y)
 
+    def _find_symbol_data(
+        self, schematic_path: Path, reference: str
+    ) -> Optional[dict]:
+        """Find a placed symbol by reference using regex parsing (no kicad-skip)."""
+        try:
+            with open(schematic_path, "r", encoding="utf-8") as f:
+                content = f.read()
+            for sym in parse_placed_symbols_from_content(content):
+                if sym["reference"] == reference:
+                    return sym
+        except Exception as e:
+            logger.error(f"Error finding symbol {reference}: {e}")
+        return None
+
     def _get_lib_id(self, schematic_path: Path, symbol_reference: str) -> Optional[str]:
         """Helper: return the lib_id string for a placed symbol"""
-        try:
-            sch = Schematic(str(schematic_path))
-            for symbol in sch.symbol:
-                if symbol.property.Reference.value == symbol_reference:
-                    return symbol.lib_id.value if hasattr(symbol, "lib_id") else None
-        except Exception:
-            pass
-        return None
+        sym_data = self._find_symbol_data(schematic_path, symbol_reference)
+        return sym_data["lib_id"] if sym_data else None
 
     def get_pin_angle(
         self, schematic_path: Path, symbol_reference: str, pin_number: str
@@ -203,21 +314,12 @@ class PinLocator:
         Returns angle in degrees, or None if pin not found.
         """
         try:
-            sch = Schematic(str(schematic_path))
-
-            target_symbol = None
-            for symbol in sch.symbol:
-                if symbol.property.Reference.value == symbol_reference:
-                    target_symbol = symbol
-                    break
-
-            if not target_symbol:
+            sym_data = self._find_symbol_data(schematic_path, symbol_reference)
+            if not sym_data:
                 return None
 
-            symbol_at = target_symbol.at.value
-            symbol_rotation = float(symbol_at[2]) if len(symbol_at) > 2 else 0.0
-
-            lib_id = target_symbol.lib_id.value if hasattr(target_symbol, "lib_id") else None
+            symbol_rotation = sym_data["rotation"]
+            lib_id = sym_data["lib_id"]
             if not lib_id:
                 return None
 
@@ -238,16 +340,8 @@ class PinLocator:
 
             # Apply mirror to angle: mirror_x flips vertically (negate Y),
             # mirror_y flips horizontally (negate X)
-            mirror_x = False
-            mirror_y = False
-            if hasattr(target_symbol, "mirror"):
-                mirror_val = (
-                    str(target_symbol.mirror.value)
-                    if hasattr(target_symbol.mirror, "value")
-                    else str(target_symbol.mirror)
-                )
-                mirror_x = "x" in mirror_val
-                mirror_y = "y" in mirror_val
+            mirror_x = sym_data["mirror_x"]
+            mirror_y = sym_data["mirror_y"]
             if mirror_x:
                 # Flipping Y means angles 90↔270
                 pin_def_angle = (360 - pin_def_angle) % 360
@@ -276,31 +370,18 @@ class PinLocator:
             [x, y] absolute coordinates of the pin, or None if not found
         """
         try:
-            # Load schematic fresh from disk to avoid stale state
-            sch = Schematic(str(schematic_path))
-
-            # Find the symbol instance
-            target_symbol = None
-            for symbol in sch.symbol:
-                ref = symbol.property.Reference.value
-                if ref == symbol_reference:
-                    target_symbol = symbol
-                    break
-
-            if not target_symbol:
+            sym_data = self._find_symbol_data(schematic_path, symbol_reference)
+            if not sym_data:
                 logger.error(f"Symbol {symbol_reference} not found in schematic")
                 return None
 
-            # Get symbol position and rotation
-            symbol_at = target_symbol.at.value
-            symbol_x = float(symbol_at[0])
-            symbol_y = float(symbol_at[1])
-            symbol_rotation = float(symbol_at[2]) if len(symbol_at) > 2 else 0.0
+            symbol_x = sym_data["x"]
+            symbol_y = sym_data["y"]
+            symbol_rotation = sym_data["rotation"]
+            lib_id = sym_data["lib_id"]
+            mirror_x = sym_data["mirror_x"]
+            mirror_y = sym_data["mirror_y"]
 
-            # Get symbol lib_id
-            lib_id = (
-                target_symbol.lib_id.value if hasattr(target_symbol, "lib_id") else None
-            )
             if not lib_id:
                 logger.error(f"Symbol {symbol_reference} has no lib_id")
                 return None
@@ -341,16 +422,6 @@ class PinLocator:
             pin_rel_y = -pin_data["y"]
 
             # Apply mirror transforms (must happen before rotation)
-            mirror_x = False
-            mirror_y = False
-            if hasattr(target_symbol, "mirror"):
-                mirror_val = (
-                    str(target_symbol.mirror.value)
-                    if hasattr(target_symbol.mirror, "value")
-                    else str(target_symbol.mirror)
-                )
-                mirror_x = "x" in mirror_val
-                mirror_y = "y" in mirror_val
             if mirror_x:
                 pin_rel_y = -pin_rel_y
             if mirror_y:
@@ -392,8 +463,8 @@ class PinLocator:
         """
         Get locations of all pins on a symbol instance.
 
-        Loads the schematic ONCE and computes all pin positions inline
-        (no per-pin file re-reads).
+        Reads the schematic ONCE and computes all pin positions inline
+        (no per-pin file re-reads). Uses regex-based parsing (no kicad-skip).
 
         Args:
             schematic_path: Path to .kicad_sch file
@@ -403,23 +474,12 @@ class PinLocator:
             Dictionary mapping pin number -> [x, y] coordinates
         """
         try:
-            # Load schematic ONCE
-            sch = Schematic(str(schematic_path))
-
-            # Find symbol
-            target_symbol = None
-            for symbol in sch.symbol:
-                if symbol.property.Reference.value == symbol_reference:
-                    target_symbol = symbol
-                    break
-
-            if not target_symbol:
+            sym_data = self._find_symbol_data(schematic_path, symbol_reference)
+            if not sym_data:
                 logger.error(f"Symbol {symbol_reference} not found")
                 return {}
 
-            lib_id = (
-                target_symbol.lib_id.value if hasattr(target_symbol, "lib_id") else None
-            )
+            lib_id = sym_data["lib_id"]
             if not lib_id:
                 logger.error(f"Symbol {symbol_reference} has no lib_id")
                 return {}
@@ -429,22 +489,12 @@ class PinLocator:
             if not pins:
                 return {}
 
-            # Get symbol transform (once)
-            symbol_at = target_symbol.at.value
-            symbol_x = float(symbol_at[0])
-            symbol_y = float(symbol_at[1])
-            symbol_rotation = float(symbol_at[2]) if len(symbol_at) > 2 else 0.0
-
-            mirror_x = False
-            mirror_y = False
-            if hasattr(target_symbol, "mirror"):
-                mirror_val = (
-                    str(target_symbol.mirror.value)
-                    if hasattr(target_symbol.mirror, "value")
-                    else str(target_symbol.mirror)
-                )
-                mirror_x = "x" in mirror_val
-                mirror_y = "y" in mirror_val
+            # Get symbol transform
+            symbol_x = sym_data["x"]
+            symbol_y = sym_data["y"]
+            symbol_rotation = sym_data["rotation"]
+            mirror_x = sym_data["mirror_x"]
+            mirror_y = sym_data["mirror_y"]
 
             # Compute all pin positions inline (no per-pin file reads)
             result = {}

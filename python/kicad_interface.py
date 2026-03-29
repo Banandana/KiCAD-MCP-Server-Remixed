@@ -365,6 +365,7 @@ class KiCADInterface:
             "add_layer": self.board_commands.add_layer,
             "set_active_layer": self.board_commands.set_active_layer,
             "get_board_info": self.board_commands.get_board_info,
+            "get_board_summary": self._handle_get_board_summary,
             "get_layer_list": self.board_commands.get_layer_list,
             "get_board_2d_view": self.board_commands.get_board_2d_view,
             "get_board_extents": self.board_commands.get_board_extents,
@@ -399,21 +400,35 @@ class KiCADInterface:
             "copy_routing_pattern": self.routing_commands.copy_routing_pattern,
             "get_nets_list": self.routing_commands.get_nets_list,
             "create_netclass": self.routing_commands.create_netclass,
+            "assign_nets_to_netclass": self.routing_commands.assign_nets_to_netclass,
+            "set_netclass_patterns": self.routing_commands.set_netclass_patterns,
+            "get_netclass_list": self.routing_commands.get_netclass_list,
+            "edit_netclass": self.routing_commands.edit_netclass,
+            "delete_netclass": self.routing_commands.delete_netclass,
+            "get_net_to_netclass_map": self.routing_commands.get_net_to_netclass_map,
             "resize_vias": self.routing_commands.resize_vias,
+            "resize_traces": self.routing_commands.resize_traces,
+            "get_trace_statistics": self.routing_commands.get_trace_statistics,
             "add_copper_pour": self.routing_commands.add_copper_pour,
             "route_differential_pair": self.routing_commands.route_differential_pair,
             "refill_zones": self._handle_refill_zones,
+            "assign_nets_to_layer": self.routing_commands.assign_nets_to_layer,
+            "set_copper_pour_settings": self.routing_commands.set_copper_pour_settings,
+            "get_unrouted_connections": self.routing_commands.get_unrouted_connections,
+            "get_board_statistics": self.routing_commands.get_board_statistics,
             # Design rule commands
             "set_design_rules": self.design_rule_commands.set_design_rules,
             "get_design_rules": self.design_rule_commands.get_design_rules,
             "run_drc": self.design_rule_commands.run_drc,
             "get_drc_violations": self.design_rule_commands.get_drc_violations,
+            "set_board_setup": self.design_rule_commands.set_board_setup,
             # Export commands
             "export_gerber": self.export_commands.export_gerber,
             "export_pdf": self.export_commands.export_pdf,
             "export_svg": self.export_commands.export_svg,
             "export_3d": self.export_commands.export_3d,
             "export_bom": self.export_commands.export_bom,
+            "export_bom_from_schematic": self._handle_export_bom_from_schematic,
             # Library commands (footprint management)
             "list_libraries": self.library_commands.list_libraries,
             "search_footprints": self.library_commands.search_footprints,
@@ -484,6 +499,7 @@ class KiCADInterface:
             "batch_edit_schematic_components": self._handle_batch_edit_schematic_components,
             "batch_delete_schematic_components": self._handle_batch_delete_schematic_components,
             "add_no_connect": self._handle_add_no_connect,
+            "batch_add_no_connect": self._handle_batch_add_no_connect,
             "add_junction": self._handle_add_junction,
             "batch_add_junction": self._handle_batch_add_junction,
             "add_schematic_text": self._handle_add_schematic_text,
@@ -523,6 +539,7 @@ class KiCADInterface:
             "edit_footprint_pad": self._handle_edit_footprint_pad,
             "list_footprint_libraries": self._handle_list_footprint_libraries,
             "register_footprint_library": self._handle_register_footprint_library,
+            "import_footprint_from_file": self._handle_import_footprint_from_file,
             # Symbol creator commands
             "create_symbol": self._handle_create_symbol,
             "delete_symbol": self._handle_delete_symbol,
@@ -1044,6 +1061,12 @@ class KiCADInterface:
         if new_reference is not None:
             block_text = re.sub(
                 r'(\(property\s+"Reference"\s+)"[^"]*"',
+                rf'\1"{new_reference}"',
+                block_text,
+            )
+            # Also update (reference "OLD") in the (instances ...) block
+            block_text = re.sub(
+                r'(\(reference\s+)"' + re.escape(reference) + r'"',
                 rf'\1"{new_reference}"',
                 block_text,
             )
@@ -1574,6 +1597,39 @@ class KiCADInterface:
 
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
+
+    def _handle_batch_add_no_connect(self, params):
+        """Add multiple no-connect flags in one file read/write cycle."""
+        from pathlib import Path
+        from commands.sexp_writer import add_no_connect_to_content, _read_schematic, _write_schematic
+
+        schematic_path = params.get("schematicPath")
+        if not schematic_path:
+            schematic_path = self._get_schematic_path()
+        if not schematic_path:
+            return {"success": False, "message": "No schematic path provided"}
+
+        positions = params.get("positions", [])
+        if not positions:
+            return {"success": False, "message": "No positions provided"}
+
+        path = Path(schematic_path)
+        content = _read_schematic(path)
+
+        added = 0
+        for pos in positions:
+            x = pos.get("x", 0)
+            y = pos.get("y", 0)
+            content = add_no_connect_to_content(content, [x, y])
+            added += 1
+
+        _write_schematic(path, content)
+
+        return {
+            "success": True,
+            "message": f"Added {added} no-connect flags",
+            "added": added,
+        }
 
     def _handle_add_junction(self, params):
         """Add a junction dot at a position (T-connections on wires)."""
@@ -2876,6 +2932,62 @@ class KiCADInterface:
             logger.error(f"register_footprint_library error: {e}")
             return {"success": False, "error": str(e)}
 
+    def _handle_import_footprint_from_file(self, params):
+        """Import a .kicad_mod file into a project-local .pretty library."""
+        import shutil
+        from pathlib import Path
+
+        source = Path(params.get("sourcePath", ""))
+        if not source.exists():
+            return {"success": False, "message": f"Source file not found: {source}"}
+        if source.suffix != ".kicad_mod":
+            return {"success": False, "message": f"Expected .kicad_mod file, got: {source.suffix}"}
+
+        # Determine target library
+        project_path = params.get("projectPath")
+        if not project_path and hasattr(self, 'project_path') and self.project_path:
+            project_path = str(Path(self.project_path).parent)
+        if not project_path and self._current_project_path:
+            project_path = str(self._current_project_path.parent)
+        if not project_path:
+            return {"success": False, "message": "No project path available"}
+
+        lib_name = params.get("libraryName")
+        if not lib_name:
+            lib_name = Path(project_path).stem
+
+        pretty_dir = Path(project_path) / f"{lib_name}.pretty"
+        pretty_dir.mkdir(exist_ok=True)
+
+        # Copy footprint
+        dest = pretty_dir / source.name
+        shutil.copy2(str(source), str(dest))
+
+        # Check if library is registered in fp-lib-table
+        fp_lib_table = Path(project_path) / "fp-lib-table"
+        lib_registered = False
+        if fp_lib_table.exists():
+            content = fp_lib_table.read_text()
+            if f'(name "{lib_name}")' in content:
+                lib_registered = True
+
+        if not lib_registered:
+            entry = f'  (lib (name "{lib_name}")(type "KiCad")(uri "${{KIPRJMOD}}/{lib_name}.pretty")(options "")(descr "Project footprints"))\n'
+            if fp_lib_table.exists():
+                content = fp_lib_table.read_text()
+                content = content.rstrip().rstrip(")")
+                content += "\n" + entry + ")\n"
+            else:
+                content = "(fp_lib_table\n  (version 7)\n" + entry + ")\n"
+            fp_lib_table.write_text(content)
+
+        return {
+            "success": True,
+            "message": f"Imported {source.name} into {lib_name}.pretty",
+            "destination": str(dest),
+            "library_registered": True,
+        }
+
     # ------------------------------------------------------------------ #
     #  Symbol creator handlers                                             #
     # ------------------------------------------------------------------ #
@@ -3119,18 +3231,24 @@ class KiCADInterface:
                 return {"success": False, "message": "Missing required parameters"}
 
             # Use ConnectionManager with power-net awareness
-            success = ConnectionManager.connect_to_net(
+            result = ConnectionManager.connect_to_net(
                 Path(schematic_path), component_ref, pin_name, net_name,
                 label_type=label_type, shape=shape,
             )
 
-            if success:
-                return {
+            if result.get("connected"):
+                response = {
                     "success": True,
                     "message": f"Connected {component_ref}/{pin_name} to net '{net_name}'",
                 }
+                if result.get("power_reference"):
+                    response["power_reference"] = result["power_reference"]
+                if result.get("label_type"):
+                    response["label_type"] = result["label_type"]
+                return response
             else:
-                return {"success": False, "message": "Failed to connect to net"}
+                error = result.get("error", "Failed to connect to net")
+                return {"success": False, "message": error}
         except Exception as e:
             logger.error(f"Error connecting to net: {str(e)}")
 
@@ -5196,7 +5314,7 @@ class KiCADInterface:
         logger.info("Listing schematic components")
         try:
             from pathlib import Path
-            from commands.pin_locator import PinLocator
+            from commands.pin_locator import PinLocator, parse_placed_symbols_from_content
 
             schematic_path = params.get("schematicPath")
             if not schematic_path:
@@ -5209,9 +5327,11 @@ class KiCADInterface:
                     "message": f"Schematic not found: {schematic_path}",
                 }
 
-            schematic = SchematicManager.load_schematic(schematic_path)
-            if not schematic:
-                return {"success": False, "message": "Failed to load schematic"}
+            # Use regex-based parsing instead of kicad-skip (which fails on
+            # some KiCad 9 files with 'ParsedValue' attribute errors)
+            with open(schematic_path, "r", encoding="utf-8") as f:
+                content = f.read()
+            symbols = parse_placed_symbols_from_content(content)
 
             # Optional filters
             filter_params = params.get("filter", {})
@@ -5223,20 +5343,11 @@ class KiCADInterface:
             locator = self.pin_locator
             components = []
 
-            # Pre-cache: parse pin definitions from the schematic file once
-            # (get_symbol_pins reads the file but caches by lib_id, so subsequent
-            # calls for the same lib_id are free)
             import math
 
-            for symbol in schematic.symbol:
-                if not hasattr(symbol.property, "Reference"):
-                    continue
-                ref = symbol.property.Reference.value
-                # Skip template symbols
-                if ref.startswith("_TEMPLATE"):
-                    continue
-
-                lib_id = symbol.lib_id.value if hasattr(symbol, "lib_id") else ""
+            for sym in symbols:
+                ref = sym["reference"]
+                lib_id = sym["lib_id"]
 
                 # Apply filters
                 if lib_id_filter and lib_id_filter not in lib_id:
@@ -5244,31 +5355,18 @@ class KiCADInterface:
                 if ref_prefix_filter and not ref.startswith(ref_prefix_filter):
                     continue
 
-                value = (
-                    symbol.property.Value.value
-                    if hasattr(symbol.property, "Value")
-                    else ""
-                )
-                footprint = (
-                    symbol.property.Footprint.value
-                    if hasattr(symbol.property, "Footprint")
-                    else ""
-                )
-                position = symbol.at.value if hasattr(symbol, "at") else [0, 0, 0]
-                uuid_val = symbol.uuid.value if hasattr(symbol, "uuid") else ""
-
-                sym_x = float(position[0])
-                sym_y = float(position[1])
-                sym_rot = float(position[2]) if len(position) > 2 else 0.0
+                sym_x = sym["x"]
+                sym_y = sym["y"]
+                sym_rot = sym["rotation"]
 
                 comp = {
                     "reference": ref,
                     "libId": lib_id,
-                    "value": value,
-                    "footprint": footprint,
+                    "value": sym["value"],
+                    "footprint": sym["footprint"],
                     "position": {"x": sym_x, "y": sym_y},
                     "rotation": sym_rot,
-                    "uuid": str(uuid_val),
+                    "uuid": sym["uuid"],
                 }
 
                 # Compute pin positions inline using cached pin definitions
@@ -5276,13 +5374,9 @@ class KiCADInterface:
                 try:
                     pins_def = locator.get_symbol_pins(sch_file, lib_id) if lib_id else {}
                     if pins_def:
-                        # Extract mirror transforms
-                        _mirror_x = False
-                        _mirror_y = False
-                        if hasattr(symbol, "mirror"):
-                            _mv = str(symbol.mirror.value) if hasattr(symbol.mirror, 'value') else str(symbol.mirror)
-                            _mirror_x = "x" in _mv
-                            _mirror_y = "y" in _mv
+                        # Mirror transforms from regex-parsed symbol data
+                        _mirror_x = sym["mirror_x"]
+                        _mirror_y = sym["mirror_y"]
                         pin_list = []
                         for pin_num, pin_data in pins_def.items():
                             pin_rel_x = pin_data["x"]
@@ -6618,6 +6712,97 @@ class KiCADInterface:
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
 
+    def _handle_export_bom_from_schematic(self, params):
+        """Generate BOM from schematic file without requiring a loaded board."""
+        import re
+        from pathlib import Path
+        from collections import defaultdict
+
+        schematic_path = params.get("schematicPath")
+        if not schematic_path:
+            return {"success": False, "message": "schematicPath is required"}
+
+        fmt = params.get("format", "json")
+
+        path = Path(schematic_path)
+        if not path.exists():
+            return {"success": False, "message": f"File not found: {schematic_path}"}
+
+        content = path.read_text(encoding="utf-8")
+
+        # Parse placed symbol blocks
+        # Each block: (symbol (lib_id "...") ... (property "Reference" "R1") (property "Value" "10K") ...)
+        symbol_pattern = re.compile(
+            r'\(symbol\s+\(lib_id\s+"([^"]+)"\)(.*?)\n  \)',
+            re.DOTALL
+        )
+        prop_pattern = re.compile(
+            r'\(property\s+"(\w+)"\s+"([^"]*)"'
+        )
+
+        components = []
+        for m in symbol_pattern.finditer(content):
+            lib_id = m.group(1)
+            block = m.group(2)
+            props = dict(prop_pattern.findall(block))
+
+            ref = props.get("Reference", "?")
+            value = props.get("Value", "")
+            footprint = props.get("Footprint", "")
+            mpn = props.get("MPN", props.get("Manufacturer_Part_Number", ""))
+
+            # Skip power symbols and virtual components
+            if ref.startswith("#") or lib_id.startswith("power:"):
+                continue
+
+            components.append({
+                "reference": ref,
+                "value": value,
+                "footprint": footprint,
+                "lib_id": lib_id,
+                "mpn": mpn,
+            })
+
+        # Group by value + footprint
+        groups = defaultdict(list)
+        for c in components:
+            key = (c["value"], c["footprint"])
+            groups[key].append(c)
+
+        bom = []
+        for (value, footprint), comps in sorted(groups.items()):
+            refs = sorted([c["reference"] for c in comps])
+            mpn = comps[0].get("mpn", "")
+            bom.append({
+                "references": refs,
+                "quantity": len(refs),
+                "value": value,
+                "footprint": footprint,
+                "mpn": mpn,
+            })
+
+        if fmt == "csv":
+            lines = ["Reference,Quantity,Value,Footprint,MPN"]
+            for row in bom:
+                refs_str = " ".join(row["references"])
+                lines.append(f'"{refs_str}",{row["quantity"]},"{row["value"]}","{row["footprint"]}","{row["mpn"]}"')
+            return {"success": True, "format": "csv", "csv": "\n".join(lines), "total_components": len(components)}
+
+        if fmt == "mouser":
+            lines = []
+            for row in bom:
+                if row["mpn"]:
+                    lines.append(f'{row["mpn"]}|{row["quantity"]}')
+            return {"success": True, "format": "mouser", "mouser": "\n".join(lines), "total_components": len(components), "lines_with_mpn": len(lines)}
+
+        return {
+            "success": True,
+            "format": "json",
+            "total_components": len(components),
+            "total_groups": len(bom),
+            "bom": bom,
+        }
+
     def _handle_export_netlist_summary(self, params):
         """Dump the complete netlist as simple text: component->pin->net."""
         logger.info("Exporting netlist summary")
@@ -7178,6 +7363,7 @@ class KiCADInterface:
                 return {"success": False, "message": "connections array is required"}
 
             results = {"connected": [], "failed": []}
+            pwr_refs = []
             for conn in connections:
                 ref = conn.get("componentRef")
                 pin = conn.get("pinName")
@@ -7190,14 +7376,17 @@ class KiCADInterface:
                     continue
 
                 try:
-                    success = ConnectionManager.connect_to_net(
+                    result = ConnectionManager.connect_to_net(
                         Path(schematic_path), ref, pin, net,
                         label_type=label_type, shape=shape,
                     )
-                    if success:
+                    if result.get("connected"):
                         results["connected"].append(f"{ref}/{pin} -> {net}")
+                        if result.get("power_reference"):
+                            pwr_refs.append(result["power_reference"])
                     else:
-                        results["failed"].append(f"{ref}/{pin} -> {net}")
+                        error = result.get("error", "unknown")
+                        results["failed"].append(f"{ref}/{pin} -> {net}: {error}")
                 except Exception as e:
                     results["failed"].append(f"{ref}/{pin} -> {net}: {e}")
 
@@ -7208,6 +7397,7 @@ class KiCADInterface:
                 "message": f"Batch connect: {n_ok} connected, {n_fail} failed",
                 "connected": results["connected"],
                 "failed": results["failed"],
+                "power_references": pwr_refs,
             }
         except Exception as e:
             logger.error(f"Error in batch connect_to_net: {str(e)}")
@@ -7285,6 +7475,19 @@ class KiCADInterface:
 
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
+
+    def _handle_get_board_summary(self, params):
+        """Combined board info + design rules + project info in one call."""
+        board_info = self.board_commands.get_board_info({})
+        design_rules = self.design_rule_commands.get_design_rules({})
+        project_info = self.project_commands.get_project_info({})
+
+        return {
+            "success": True,
+            "board": board_info if board_info.get("success") else {"error": board_info.get("message")},
+            "design_rules": design_rules if design_rules.get("success") else {"error": design_rules.get("message")},
+            "project": project_info if project_info.get("success") else {"error": project_info.get("message")},
+        }
 
     def _handle_snapshot_project(self, params):
         """Copy the entire project folder to a snapshot directory for checkpoint/resume."""
