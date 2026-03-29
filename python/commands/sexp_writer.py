@@ -151,10 +151,29 @@ def _read_schematic(path: Path) -> str:
 
 
 def _write_schematic(path: Path, content: str) -> None:
-    with open(path, "w", encoding="utf-8", newline="\n") as f:
-        f.write(content)
-        f.flush()
-        os.fsync(f.fileno())
+    """Write schematic content atomically via temp file + rename.
+
+    Prevents data loss if the write crashes (e.g., wrong content type).
+    """
+    import tempfile
+    if not isinstance(content, str):
+        raise TypeError(f"_write_schematic: content must be str, got {type(content).__name__}")
+    # Write to temp file in same directory (same filesystem for atomic rename)
+    dir_path = path.parent
+    fd, tmp_path = tempfile.mkstemp(dir=str(dir_path), suffix=".tmp", prefix=".kicad_sch_")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, str(path))
+    except Exception:
+        # Clean up temp file on failure, original file is untouched
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def add_wire_to_content(
