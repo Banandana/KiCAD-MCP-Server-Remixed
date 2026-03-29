@@ -530,12 +530,118 @@ def _compute_component_bboxes(all_pins, components):
     return bboxes
 
 
-def rewire_group_orthogonal(schematic_path, components, pin_locator, routing_style="auto"):
+def _route_crosses_any_bbox(segments, bboxes, margin=0.5):
+    """Check if any segment in a route crosses any component bbox."""
+    for sx1, sy1, sx2, sy2 in segments:
+        for ref, bb in bboxes.items():
+            if _segment_crosses_bbox(sx1, sy1, sx2, sy2, *bb, margin=margin):
+                return True
+    return False
+
+
+def _compute_avoiding_route(x1, y1, x2, y2, comp_bboxes, routing_style="auto"):
+    """Compute an orthogonal route that avoids component bodies.
+
+    Tries in order:
+    1. L-shape horizontal-first: (x1,y1)→(x2,y1)→(x2,y2)
+    2. L-shape vertical-first: (x1,y1)→(x1,y2)→(x2,y2)
+    3. U-detour: route around the blocking component(s)
+
+    Returns list of (x1, y1, x2, y2) wire segments.
+    """
+    # Build the two L-route options
+    h_first = [(x1, y1, x2, y1), (x2, y1, x2, y2)]  # horizontal then vertical
+    v_first = [(x1, y1, x1, y2), (x1, y2, x2, y2)]  # vertical then horizontal
+
+    h_crosses = _route_crosses_any_bbox(h_first, comp_bboxes)
+    v_crosses = _route_crosses_any_bbox(v_first, comp_bboxes)
+
+    if routing_style == "horizontal_first":
+        if not h_crosses:
+            return h_first
+        if not v_crosses:
+            return v_first
+    elif routing_style == "vertical_first":
+        if not v_crosses:
+            return v_first
+        if not h_crosses:
+            return h_first
+    else:  # auto
+        if not h_crosses:
+            return h_first
+        if not v_crosses:
+            return v_first
+
+    # Both L-routes cross component bodies — compute a U-shaped detour.
+    # Find the combined bounding box of all blocking components, then route
+    # around the outside.
+    blocking_bbs = []
+    for ref, bb in comp_bboxes.items():
+        # Check if this bbox blocks either L-route
+        for seg in h_first + v_first:
+            if _segment_crosses_bbox(seg[0], seg[1], seg[2], seg[3], *bb):
+                blocking_bbs.append(bb)
+                break
+
+    if not blocking_bbs:
+        # Shouldn't happen, but fall back to h_first
+        return h_first
+
+    # Combined blocking region
+    block_x1 = min(bb[0] for bb in blocking_bbs)
+    block_y1 = min(bb[1] for bb in blocking_bbs)
+    block_x2 = max(bb[2] for bb in blocking_bbs)
+    block_y2 = max(bb[3] for bb in blocking_bbs)
+
+    # Clearance for the detour
+    clearance = 2.54
+
+    # Try 4 detour options: go around top, bottom, left, or right
+    detour_options = []
+
+    # Detour above: go up past block_y1, across, then down
+    wy = block_y1 - clearance
+    above = [(x1, y1, x1, wy), (x1, wy, x2, wy), (x2, wy, x2, y2)]
+    if not _route_crosses_any_bbox(above, comp_bboxes, margin=0.3):
+        detour_options.append(above)
+
+    # Detour below: go down past block_y2, across, then up
+    wy = block_y2 + clearance
+    below = [(x1, y1, x1, wy), (x1, wy, x2, wy), (x2, wy, x2, y2)]
+    if not _route_crosses_any_bbox(below, comp_bboxes, margin=0.3):
+        detour_options.append(below)
+
+    # Detour left: go left past block_x1, down, then right
+    wx = block_x1 - clearance
+    left = [(x1, y1, wx, y1), (wx, y1, wx, y2), (wx, y2, x2, y2)]
+    if not _route_crosses_any_bbox(left, comp_bboxes, margin=0.3):
+        detour_options.append(left)
+
+    # Detour right: go right past block_x2, down, then left
+    wx = block_x2 + clearance
+    right = [(x1, y1, wx, y1), (wx, y1, wx, y2), (wx, y2, x2, y2)]
+    if not _route_crosses_any_bbox(right, comp_bboxes, margin=0.3):
+        detour_options.append(right)
+
+    if detour_options:
+        # Pick the shortest detour (by total wire length)
+        def _route_length(segs):
+            return sum(abs(s[2] - s[0]) + abs(s[3] - s[1]) for s in segs)
+        detour_options.sort(key=_route_length)
+        return detour_options[0]
+
+    # All detours also cross — give up and use horizontal-first L-route.
+    # The validation step will flag the crossings.
+    logger.warning(f"Could not find crossing-free route from ({x1},{y1}) to ({x2},{y2})")
+    return h_first
+
+
+def rewire_group_orthogonal(schematic_path, components, pin_locator, routing_style="auto", include_labeled=False):
     """Delete wires between group components and redraw as orthogonal routes.
 
     Finds all wires that form chains between group pins (including through
-    intermediate junctions). Preserves label-connected wires and wires to
-    external components.
+    intermediate junctions). By default preserves label-connected wires;
+    set include_labeled=True to also rewire intra-group label-mediated connections.
     """
     sch_path = Path(schematic_path)
     content = _read_schematic(sch_path)
@@ -611,14 +717,14 @@ def rewire_group_orthogonal(schematic_path, components, pin_locator, routing_sty
             if _point_in_index(ep[0], ep[1], pin_index):
                 terminals.add(ep)
 
-        # Check if any endpoint touches a label — if so, skip this chain
-        # (label-connected wires should be preserved)
+        # Check if any endpoint touches a label
         touches_label = any(
             (round(ep[0], 2), round(ep[1], 2)) in label_positions
             or any(abs(ep[0] - lp[0]) < 0.1 and abs(ep[1] - lp[1]) < 0.1 for lp in label_positions)
             for ep in all_eps
         )
-        if touches_label:
+        if touches_label and not include_labeled:
+            # Skip label-connected wires unless explicitly included
             continue
 
         # Find which terminals are at group pins
@@ -686,31 +792,14 @@ def rewire_group_orthogonal(schematic_path, components, pin_locator, routing_sty
             new_endpoints.extend([(x1, y1), (x2, y2)])
             added_count += 1
         else:
-            # L-shaped route: choose style
-            style = routing_style
-            if style == "auto":
-                h_first_crosses = any(
-                    _segment_crosses_bbox(x2, y1, x2, y2, *bb)
-                    for ref, bb in comp_bboxes.items()
-                )
-                v_first_crosses = any(
-                    _segment_crosses_bbox(x1, y2, x2, y2, *bb)
-                    for ref, bb in comp_bboxes.items()
-                )
-                if h_first_crosses and not v_first_crosses:
-                    style = "vertical_first"
-                else:
-                    style = "horizontal_first"
-
-            if style == "horizontal_first":
-                content = add_wire_to_content(content, [x1, y1], [x2, y1])
-                content = add_wire_to_content(content, [x2, y1], [x2, y2])
-                new_endpoints.extend([(x1, y1), (x2, y1), (x2, y2)])
-            else:
-                content = add_wire_to_content(content, [x1, y1], [x1, y2])
-                content = add_wire_to_content(content, [x1, y2], [x2, y2])
-                new_endpoints.extend([(x1, y1), (x1, y2), (x2, y2)])
-            added_count += 2
+            # Compute route with avoidance: try L-shapes first, fall back to U-detour
+            route_segments = _compute_avoiding_route(
+                x1, y1, x2, y2, comp_bboxes, routing_style
+            )
+            for seg in route_segments:
+                content = add_wire_to_content(content, [seg[0], seg[1]], [seg[2], seg[3]])
+                new_endpoints.extend([(seg[0], seg[1]), (seg[2], seg[3])])
+            added_count += len(route_segments)
 
     # Step 6: Auto-add T-junction dots at new wire intersections
     content, _junc_count = auto_add_t_junctions(content, new_endpoints)

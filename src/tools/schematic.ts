@@ -2048,10 +2048,11 @@ circuit topology before layout or documentation.`,
 
   server.tool(
     "rewire_group_orthogonal",
-    `Delete all direct wires between listed components and redraw with clean L-shaped orthogonal
-routes. Only affects wires where BOTH endpoints are at pins of listed components — label-connected
-wires and external connections are preserved. Validates result for wire-crossing-symbol collisions.
-Use after move_connected or manual component repositioning to fix diagonal wires.`,
+    `Delete wires between listed components and redraw with clean orthogonal routes that avoid
+crossing component bodies. Tries L-shaped routes first; if both L-options cross a component,
+routes a U-shaped detour around it. By default preserves label-connected wires (inter-section
+connections). Set includeLabeledWires=true to also rewire intra-group connections that go
+through labels (e.g., +5V rail connecting L1 to U11). Validates result for crossing collisions.`,
     {
       schematicPath: z.string().describe("Path to the schematic file"),
       components: z.array(z.string()).describe(
@@ -2062,6 +2063,12 @@ Use after move_connected or manual component repositioning to fix diagonal wires
         .optional()
         .describe(
           "L-route style: horizontal segment first, vertical first, or auto-select to avoid crossing component bodies (default: auto)"
+        ),
+      includeLabeledWires: z
+        .boolean()
+        .optional()
+        .describe(
+          "Also rewire wires that connect through labels (intra-group label-mediated connections). Default: false"
         ),
     },
     async (args) => {

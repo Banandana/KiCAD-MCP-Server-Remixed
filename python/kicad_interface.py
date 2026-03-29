@@ -7959,12 +7959,13 @@ class KiCADInterface:
             schematic_path = params.get("schematicPath")
             components = params.get("components", [])
             routing_style = params.get("routingStyle", "auto")
+            include_labeled = params.get("includeLabeledWires", False)
             if not schematic_path:
                 return {"success": False, "message": "schematicPath is required"}
             if not components or not isinstance(components, list):
                 return {"success": False, "message": "components must be a non-empty array of reference designators"}
 
-            return rewire_group_orthogonal(schematic_path, components, self.pin_locator, routing_style)
+            return rewire_group_orthogonal(schematic_path, components, self.pin_locator, routing_style, include_labeled)
         except Exception as e:
             logger.error(f"Error rewiring group: {e}")
             import traceback
