@@ -457,6 +457,7 @@ class KiCADInterface:
             "edit_schematic_component": self._handle_edit_schematic_component,
             "swap_schematic_symbol": self._handle_swap_schematic_symbol,
             "edit_symbol_pins": self._handle_edit_symbol_pins,
+            "update_symbols_from_library": self._handle_update_symbols_from_library,
             "auto_assign_footprints": self._handle_auto_assign_footprints,
             "get_schematic_component": self._handle_get_schematic_component,
             "add_schematic_wire": self._handle_add_schematic_wire,
@@ -1371,6 +1372,198 @@ class KiCADInterface:
 
         except Exception as e:
             logger.error(f"Error editing symbol pins: {e}")
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e)}
+
+    def _handle_update_symbols_from_library(self, params):
+        """Refresh cached symbol definitions in lib_symbols from their source libraries.
+
+        Equivalent to KiCad's "Update Symbols from Library" GUI command.  Reads each
+        (symbol "Lib:Name" ...) block in lib_symbols, fetches the current definition
+        from the corresponding .kicad_sym library file, and replaces the cached block
+        in-place.  Placed instances are untouched (user properties are stored there,
+        not in lib_symbols).
+        """
+        logger.info("Updating symbols from library")
+        try:
+            import re
+            from pathlib import Path
+            from commands.dynamic_symbol_loader import DynamicSymbolLoader
+
+            schematic_path = params.get("schematicPath")
+            lib_ids_filter = params.get("libIds")  # optional list
+
+            if not schematic_path:
+                return {"success": False, "message": "schematicPath is required"}
+
+            sch_file = Path(schematic_path)
+            if not sch_file.exists():
+                return {"success": False, "message": f"Schematic not found: {schematic_path}"}
+
+            with open(sch_file, "r", encoding="utf-8") as f:
+                content = f.read()
+
+            # Find lib_symbols section bounds (string-aware paren matching)
+            lib_sym_start = content.find("(lib_symbols")
+            if lib_sym_start < 0:
+                return {"success": False, "message": "No lib_symbols section found"}
+
+            depth = 0
+            in_string = False
+            lib_sym_end = lib_sym_start
+            for i in range(lib_sym_start, len(content)):
+                ch = content[i]
+                if in_string:
+                    if ch == '"':
+                        in_string = False
+                elif ch == '"':
+                    in_string = True
+                elif ch == '(':
+                    depth += 1
+                elif ch == ')':
+                    depth -= 1
+                    if depth == 0:
+                        lib_sym_end = i + 1
+                        break
+
+            lib_sym_section = content[lib_sym_start:lib_sym_end]
+
+            # Enumerate all top-level (symbol "Lib:Name" ...) blocks in lib_symbols
+            # These are the cached definitions we want to refresh.
+            sym_pattern = re.compile(r'\(symbol\s+"([^"]+)"')
+            symbols_to_update = []
+            search_pos = 0
+            while True:
+                m = sym_pattern.search(lib_sym_section, search_pos)
+                if not m:
+                    break
+                sym_name = m.group(1)
+                block_start_rel = m.start()
+
+                # Skip sub-symbols (Name_0_1, Name_1_1) — they're children of
+                # a top-level block, not standalone definitions
+                if re.match(r'.*_\d+_\d+$', sym_name):
+                    search_pos = m.end()
+                    continue
+
+                # Must contain ":" to be a library reference
+                if ":" not in sym_name:
+                    search_pos = m.end()
+                    continue
+
+                # Optional filter
+                if lib_ids_filter and sym_name not in lib_ids_filter:
+                    search_pos = m.end()
+                    continue
+
+                # Find end of this symbol block (string-aware paren matching)
+                abs_start = lib_sym_start + block_start_rel
+                blk_depth = 0
+                blk_in_string = False
+                blk_end = abs_start
+                for i in range(abs_start, len(content)):
+                    ch = content[i]
+                    if blk_in_string:
+                        if ch == '"':
+                            blk_in_string = False
+                    elif ch == '"':
+                        blk_in_string = True
+                    elif ch == '(':
+                        blk_depth += 1
+                    elif ch == ')':
+                        blk_depth -= 1
+                        if blk_depth == 0:
+                            blk_end = i + 1
+                            break
+
+                symbols_to_update.append({
+                    "lib_id": sym_name,
+                    "abs_start": abs_start,
+                    "abs_end": blk_end,
+                })
+
+                # Skip past this block for the next search
+                search_pos = blk_end - lib_sym_start
+
+            if not symbols_to_update:
+                msg = "No symbols to update"
+                if lib_ids_filter:
+                    msg += f" (filter: {lib_ids_filter})"
+                return {"success": True, "message": msg, "updated": [], "not_found": [], "unchanged": []}
+
+            # Load fresh definitions from libraries
+            derived_project_path = sch_file.parent
+            loader = DynamicSymbolLoader(project_path=derived_project_path)
+
+            updated = []
+            not_found = []
+            unchanged = []
+            # Collect replacements: (abs_start, abs_end, new_block)
+            replacements = []
+
+            for sym_info in symbols_to_update:
+                lib_id = sym_info["lib_id"]
+                library_name, symbol_name = lib_id.split(":", 1)
+
+                # Invalidate cache to force fresh read from disk
+                cache_key = f"{library_name}:{symbol_name}"
+                loader.symbol_cache.pop(cache_key, None)
+
+                fresh_block = loader.extract_symbol_from_library(library_name, symbol_name)
+                if fresh_block is None:
+                    not_found.append(lib_id)
+                    logger.warning(f"Library symbol not found: {lib_id}")
+                    continue
+
+                # Indent the fresh block to match lib_symbols indentation
+                indented_lines = []
+                for line in fresh_block.split("\n"):
+                    indented_lines.append("    " + line if line.strip() else line)
+                new_block = "\n".join(indented_lines)
+
+                old_block = content[sym_info["abs_start"]:sym_info["abs_end"]]
+
+                # Normalize whitespace for comparison
+                old_normalized = " ".join(old_block.split())
+                new_normalized = " ".join(new_block.split())
+
+                if old_normalized == new_normalized:
+                    unchanged.append(lib_id)
+                    continue
+
+                replacements.append((sym_info["abs_start"], sym_info["abs_end"], new_block))
+                updated.append(lib_id)
+
+            # Apply replacements in reverse order to preserve string offsets
+            for abs_start, abs_end, new_block in sorted(replacements, key=lambda r: r[0], reverse=True):
+                content = content[:abs_start] + new_block + content[abs_end:]
+
+            if replacements:
+                with open(sch_file, "w", encoding="utf-8") as f:
+                    f.write(content)
+                    f.flush()
+                    os.fsync(f.fileno())
+
+            # Invalidate pin locator cache for updated symbols
+            if updated and hasattr(self, 'pin_locator'):
+                for lib_id in updated:
+                    self.pin_locator.pin_cache.pop(lib_id, None)
+
+            total = len(updated) + len(not_found) + len(unchanged)
+            msg = f"Processed {total} symbols: {len(updated)} updated, {len(unchanged)} unchanged, {len(not_found)} not found"
+            if not_found:
+                msg += f"\nNot found: {', '.join(not_found)}"
+
+            return {
+                "success": True,
+                "message": msg,
+                "updated": updated,
+                "unchanged": unchanged,
+                "not_found": not_found,
+            }
+
+        except Exception as e:
+            logger.error(f"Error updating symbols from library: {e}")
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
 

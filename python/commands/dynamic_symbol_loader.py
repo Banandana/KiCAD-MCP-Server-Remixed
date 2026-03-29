@@ -503,6 +503,113 @@ class DynamicSymbolLoader:
             return match.group(1)
         return str(uuid.uuid4())
 
+    def _get_instances_path(self, schematic_path: Path) -> str:
+        """Build the correct hierarchical (instances) path for a schematic.
+
+        For the root schematic:   /{root_uuid}
+        For a sub-sheet:          /{root_uuid}/{sheet_instance_uuid}
+
+        KiCad uses the sheet instance UUID (from the (sheet ...) block in the
+        parent) to build annotation paths, NOT the sub-sheet file's own UUID.
+        """
+        # Find the project root schematic from .kicad_pro
+        project_dir = schematic_path.parent
+        pro_files = list(project_dir.glob("*.kicad_pro"))
+        if not pro_files:
+            # Fallback: treat as root
+            with open(schematic_path, "r", encoding="utf-8") as f:
+                content = f.read()
+            return "/" + self._get_root_uuid(content)
+
+        import json
+        pro_file = pro_files[0]
+        try:
+            with open(pro_file, "r", encoding="utf-8") as f:
+                project_data = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            with open(schematic_path, "r", encoding="utf-8") as f:
+                content = f.read()
+            return "/" + self._get_root_uuid(content)
+
+        # Determine root schematic filename
+        root_sch_name = None
+        sheets = project_data.get("sheets", [])
+        if sheets and isinstance(sheets[0], list) and len(sheets[0]) >= 2:
+            root_sch_name = sheets[0][1]
+        if not root_sch_name:
+            root_sch_name = pro_file.stem + ".kicad_sch"
+
+        root_sch_path = project_dir / root_sch_name
+
+        # If the target IS the root schematic, use simple path
+        if schematic_path.resolve() == root_sch_path.resolve():
+            with open(schematic_path, "r", encoding="utf-8") as f:
+                content = f.read()
+            return "/" + self._get_root_uuid(content)
+
+        # Target is a sub-sheet — search root for the (sheet ...) block that
+        # references this file and extract the sheet instance UUID
+        if not root_sch_path.exists():
+            with open(schematic_path, "r", encoding="utf-8") as f:
+                content = f.read()
+            return "/" + self._get_root_uuid(content)
+
+        with open(root_sch_path, "r", encoding="utf-8") as f:
+            root_content = f.read()
+
+        root_uuid = self._get_root_uuid(root_content)
+        target_filename = schematic_path.name
+
+        # Search for (sheet ...) blocks whose Sheetfile property matches
+        sheet_pattern = re.compile(r'\(sheet\s')
+        for m in sheet_pattern.finditer(root_content):
+            sheet_start = m.start()
+            # Find the matching close paren (string-aware)
+            depth = 0
+            in_string = False
+            i = sheet_start
+            while i < len(root_content):
+                ch = root_content[i]
+                if in_string:
+                    if ch == '"':
+                        in_string = False
+                elif ch == '"':
+                    in_string = True
+                elif ch == '(':
+                    depth += 1
+                elif ch == ')':
+                    depth -= 1
+                    if depth == 0:
+                        break
+                i += 1
+            sheet_block = root_content[sheet_start:i + 1]
+
+            # Check if this sheet references our target file
+            file_match = re.search(
+                r'\(property\s+"Sheetfile"\s+"([^"]+)"', sheet_block
+            )
+            if not file_match or file_match.group(1) != target_filename:
+                continue
+
+            # Found it — extract the sheet's UUID
+            uuid_match = re.search(r'\(uuid\s+"?([^"\)\s]+)"?\)', sheet_block)
+            if uuid_match:
+                sheet_uuid = uuid_match.group(1)
+                logger.info(
+                    f"Sub-sheet {target_filename}: instances path "
+                    f"/{root_uuid}/{sheet_uuid}"
+                )
+                return f"/{root_uuid}/{sheet_uuid}"
+
+        # Sheet reference not found in root — fall back to root-only path
+        logger.warning(
+            f"Could not find (sheet) reference for {target_filename} in "
+            f"{root_sch_name}; using root-only instances path"
+        )
+        with open(schematic_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        return "/" + self._get_root_uuid(content)
+
     def create_component_instance(
         self,
         schematic_path: Path,
@@ -551,9 +658,9 @@ class DynamicSymbolLoader:
         with open(schematic_path, "r", encoding="utf-8") as f:
             content = f.read()
 
-        # Get project name and root UUID for the instances block
+        # Get project name and hierarchical path for the instances block
         project_name = self._get_project_name(schematic_path)
-        root_uuid = self._get_root_uuid(content)
+        instances_path = self._get_instances_path(schematic_path)
 
         def _c(v):
             """Format coordinate: strip trailing zeros (82.0 → 82, 148.604 → 148.604)"""
@@ -577,7 +684,7 @@ class DynamicSymbolLoader:
       (effects (font (size 1.27 1.27)) (hide yes))
     )
     (instances (project "{project_name}"
-      (path "/{root_uuid}" (reference "{reference}") (unit 1))
+      (path "{instances_path}" (reference "{reference}") (unit 1))
     ))
   )"""
 
@@ -586,7 +693,10 @@ class DynamicSymbolLoader:
         insert_marker = "(sheet_instances"
         insert_at = content.rfind(insert_marker)
         if insert_at == -1:
-            raise ValueError("Could not find insertion point in schematic")
+            # Fallback: insert before final closing paren (matches sexp_writer behavior)
+            insert_at = content.rfind(")")
+            if insert_at == -1:
+                raise ValueError("Could not find insertion point in schematic")
 
         content = content[:insert_at] + instance_block + "\n  " + content[insert_at:]
 

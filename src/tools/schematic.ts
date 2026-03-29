@@ -284,6 +284,44 @@ unspecified, power_in, power_out, open_collector, open_emitter, no_connect`,
   );
 
   // ------------------------------------------------------
+  // Update Symbols from Library Tool
+  // ------------------------------------------------------
+  server.tool(
+    "update_symbols_from_library",
+    `Refresh cached symbol definitions in the schematic's lib_symbols section from their
+source KiCad library files. Equivalent to KiCad's "Update Symbols from Library" GUI command.
+
+Use this to fix "Symbol doesn't match copy in library" ERC errors. Each placed symbol's
+cached definition is replaced with the current version from the .kicad_sym library file.
+Placed instances (position, wiring, user properties) are NOT affected — only the shared
+definition in lib_symbols is updated.
+
+Optionally pass libIds to update only specific symbols instead of all.`,
+    {
+      schematicPath: z.string().describe("Path to the .kicad_sch file"),
+      libIds: z.array(z.string()).optional().describe(
+        "Optional list of specific lib_ids to update (e.g. ['Device:R', 'power:GND']). If omitted, all symbols are updated."
+      ),
+    },
+    async (args: { schematicPath: string; libIds?: string[] }) => {
+      const result = await callKicadScript("update_symbols_from_library", args);
+      if (result.success) {
+        let msg = result.message;
+        if (result.updated && result.updated.length > 0) {
+          msg += "\n\nUpdated:\n" + result.updated.map((s: string) => `  ${s}`).join("\n");
+        }
+        if (result.not_found && result.not_found.length > 0) {
+          msg += "\n\nNot found in libraries:\n" + result.not_found.map((s: string) => `  ${s}`).join("\n");
+        }
+        return { content: [{ type: "text" as const, text: msg }] };
+      }
+      return {
+        content: [{ type: "text" as const, text: `Failed: ${result.message}` }],
+      };
+    },
+  );
+
+  // ------------------------------------------------------
   // Auto Assign Footprints Tool
   // ------------------------------------------------------
   server.tool(

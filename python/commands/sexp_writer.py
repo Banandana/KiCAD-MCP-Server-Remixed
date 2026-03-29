@@ -588,11 +588,18 @@ def delete_label_from_content(
     for m in label_pattern.finditer(content):
         block_start = m.start()
         depth = 0
+        in_string = False
         i = block_start
         while i < len(content):
-            if content[i] == '(':
+            ch = content[i]
+            if in_string:
+                if ch == '"':
+                    in_string = False
+            elif ch == '"':
+                in_string = True
+            elif ch == '(':
                 depth += 1
-            elif content[i] == ')':
+            elif ch == ')':
                 depth -= 1
                 if depth == 0:
                     block_end = i + 1
