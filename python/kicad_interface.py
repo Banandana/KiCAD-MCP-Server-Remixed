@@ -6266,57 +6266,47 @@ class KiCADInterface:
             # (far endpoints have labels/junctions we should also move)
             label_junction_move_points = wire_far_endpoints - old_pin_positions
 
-            # 4. Collect all edits (position, old_text, new_text)
-            edits = []  # [(start_pos, end_pos, new_text)]
+            # 4. Collect ALL replacements on the same content string (single read/write cycle).
+            # No kicad-skip — all text-based to avoid file reformatting issues.
+            from commands.sexp_writer import _fmt
 
-            # 4a. Move the component symbol block — find (symbol (lib_id ...) ... (property "Reference" "U1" ...) ... (at X Y R))
-            # Use kicad-skip via SchematicManager for the component move
-            schematic = SchematicManager.load_schematic(schematic_path)
-            if not schematic:
-                return {"success": False, "message": "Failed to load schematic"}
+            # Skip lib_symbols section for placed symbol search
+            lib_sym_start = content.find("(lib_symbols")
+            lib_sym_end = _find_block_end_str_aware(content, lib_sym_start) if lib_sym_start >= 0 else -1
 
-            for symbol in schematic.symbol:
-                if not hasattr(symbol.property, "Reference"):
+            # 4a. Move the component symbol block via text replacement
+            sym_pat = re.compile(r'\(symbol\s+\(lib_id\s+"([^"]*)"')
+            for sm in sym_pat.finditer(content):
+                pos = sm.start()
+                if lib_sym_start >= 0 and lib_sym_start <= pos < lib_sym_end:
                     continue
-                if symbol.property.Reference.value == reference:
-                    old_pos = list(symbol.at.value)
-                    rotation = float(old_pos[2]) if len(old_pos) > 2 else 0
-                    new_x = float(old_pos[0]) + dx
-                    new_y = float(old_pos[1]) + dy
-                    symbol.at.value = [new_x, new_y, rotation]
-
-                    # Move property fields
-                    for prop_name in ["Reference", "Value", "Footprint", "Datasheet"]:
-                        if hasattr(symbol.property, prop_name):
-                            prop = getattr(symbol.property, prop_name)
-                            if hasattr(prop, "at") and hasattr(prop.at, "value"):
-                                try:
-                                    pp = list(prop.at.value)
-                                    pp[0] = float(pp[0]) + dx
-                                    pp[1] = float(pp[1]) + dy
-                                    prop.at.value = pp
-                                except (TypeError, IndexError):
-                                    pass
-
-                    moved_items["component"] = True
-                    break
+                end = _find_block_end_str_aware(content, pos)
+                block = content[pos:end]
+                # Check if this symbol has the target reference
+                ref_m = re.search(r'\(property\s+"Reference"\s+"([^"]*)"', block)
+                if not ref_m or ref_m.group(1) != reference:
+                    continue
+                # Shift all (at ...) positions in this symbol block
+                def _shift_comp_at(match, _dx=dx, _dy=dy):
+                    ax = float(match.group(1)) + _dx
+                    ay = float(match.group(2)) + _dy
+                    rest = match.group(3)
+                    return f"(at {_fmt(ax)} {_fmt(ay)}{rest}"
+                new_block = re.sub(
+                    r'\(at\s+([\d.e+-]+)\s+([\d.e+-]+)([\s\d.e+-]*\))',
+                    _shift_comp_at, block
+                )
+                replacements = [(pos, end, new_block)]
+                moved_items["component"] = True
+                break
 
             if not moved_items["component"]:
                 return {"success": False, "message": f"Component {reference} not found"}
-
-            # Save the component move via kicad-skip
-            SchematicManager.save_schematic(schematic, schematic_path)
-
-            # Re-read content after component move
-            with open(schematic_path, "r", encoding="utf-8") as f:
-                content = f.read()
 
             # 4b. Move wire endpoints touching old pin positions
             # For stub wires (one end at pin, other end at label/junction),
             # translate BOTH endpoints so the whole stub moves with the component.
             # For longer wires to other components, only move the pin-touching end (stretch).
-            replacements = []
-            from commands.sexp_writer import _fmt
             for wm in wire_pat.finditer(content):
                 block_end = _find_block_end_str_aware(content, wm.start())
                 block = content[wm.start():block_end]
@@ -6414,11 +6404,7 @@ class KiCADInterface:
             # 4e. Move power symbols (#PWR) at connected points
             # Power symbols sit at pin endpoints or wire far endpoints
             all_connected = old_pin_positions | wire_far_endpoints
-            # Skip lib_symbols section
-            lib_sym_start = content.find("(lib_symbols")
-            lib_sym_end = _find_block_end_str_aware(content, lib_sym_start) if lib_sym_start >= 0 else -1
-
-            sym_pat = re.compile(r'\(symbol\s+\(lib_id\s+"([^"]*)"')
+            # Re-use lib_sym_start/lib_sym_end and sym_pat from step 4a
             for m in sym_pat.finditer(content):
                 pos = m.start()
                 if lib_sym_start >= 0 and lib_sym_start <= pos < lib_sym_end:
