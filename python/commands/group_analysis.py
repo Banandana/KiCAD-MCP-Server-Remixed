@@ -531,9 +531,11 @@ def _compute_component_bboxes(all_pins, components):
 
 
 def rewire_group_orthogonal(schematic_path, components, pin_locator, routing_style="auto"):
-    """Delete direct wires between group components and redraw as orthogonal routes.
+    """Delete wires between group components and redraw as orthogonal routes.
 
-    Preserves label-connected wires. Only rewires direct pin-to-pin connections.
+    Finds all wires that form chains between group pins (including through
+    intermediate junctions). Preserves label-connected wires and wires to
+    external components.
     """
     sch_path = Path(schematic_path)
     content = _read_schematic(sch_path)
@@ -549,24 +551,100 @@ def rewire_group_orthogonal(schematic_path, components, pin_locator, routing_sty
     pin_index = _build_pin_index(all_pins)
     comp_bboxes = _compute_component_bboxes(all_pins, component_set)
 
-    # Step 2: Find wires where BOTH endpoints are at group pin positions
+    # Step 2: Find wires that connect group pins (directly or through junctions).
+    # Use union-find to chain wire segments, then check if both terminal
+    # endpoints of each chain are at group pins.
     wire_blocks = _parse_wire_blocks(content)
-    wires_to_delete = []  # (block_start, block_end)
-    connected_pairs = set()  # frozenset of ((ref,pin), (ref,pin))
 
-    for x1, y1, x2, y2, bstart, bend in wire_blocks:
-        match_a = _point_in_index(x1, y1, pin_index)
-        match_b = _point_in_index(x2, y2, pin_index)
-        if match_a and match_b:
-            # Both endpoints at group pins — this is a direct internal wire
-            wires_to_delete.append((bstart, bend))
-            pair = frozenset([match_a, match_b])
-            connected_pairs.add(pair)
+    # Also parse labels — wire endpoints at label positions should NOT be
+    # considered as internal chain points (labels carry connectivity externally)
+    all_labels = _parse_labels(content)
+    label_positions = set()
+    for lx, ly, _name, _lt in all_labels:
+        label_positions.add((round(lx, 2), round(ly, 2)))
+
+    # Build union-find over wire endpoint connectivity
+    wire_uf = _UnionFind()
+    endpoint_to_wires = {}  # snapped endpoint -> list of wire indices
+
+    for i, (x1, y1, x2, y2, _bs, _be) in enumerate(wire_blocks):
+        ep1 = (round(x1, 2), round(y1, 2))
+        ep2 = (round(x2, 2), round(y2, 2))
+        wire_uf.union(ep1, ep2)
+        endpoint_to_wires.setdefault(ep1, []).append(i)
+        endpoint_to_wires.setdefault(ep2, []).append(i)
+
+    # Group wires into chains by their union-find root
+    root_to_wires = {}  # uf root -> set of wire indices
+    root_to_endpoints = {}  # uf root -> set of all endpoints in the chain
+    for i, (x1, y1, x2, y2, _bs, _be) in enumerate(wire_blocks):
+        ep1 = (round(x1, 2), round(y1, 2))
+        root = wire_uf.find(ep1)
+        root_to_wires.setdefault(root, set()).add(i)
+        root_to_endpoints.setdefault(root, set()).add(ep1)
+        root_to_endpoints.setdefault(root, set()).add((round(x2, 2), round(y2, 2)))
+
+    # For each chain, find terminal endpoints (endpoints that appear in only one wire)
+    # A chain connecting two pins: pin_A → wire → junction → wire → pin_B
+    # Terminal endpoints are pin_A and pin_B
+    wires_to_delete = []
+    connected_pairs = set()
+
+    for root, wire_indices in root_to_wires.items():
+        all_eps = root_to_endpoints[root]
+
+        # Count how many wires touch each endpoint
+        ep_wire_count = {}
+        for wi in wire_indices:
+            x1, y1, x2, y2, _bs, _be = wire_blocks[wi]
+            ep1 = (round(x1, 2), round(y1, 2))
+            ep2 = (round(x2, 2), round(y2, 2))
+            ep_wire_count[ep1] = ep_wire_count.get(ep1, 0) + 1
+            ep_wire_count[ep2] = ep_wire_count.get(ep2, 0) + 1
+
+        # Terminal endpoints: appear in exactly 1 wire in this chain
+        # OR are at a pin position (pins are always terminals)
+        terminals = set()
+        for ep, count in ep_wire_count.items():
+            if count == 1:
+                terminals.add(ep)
+            if _point_in_index(ep[0], ep[1], pin_index):
+                terminals.add(ep)
+
+        # Check if any endpoint touches a label — if so, skip this chain
+        # (label-connected wires should be preserved)
+        touches_label = any(
+            (round(ep[0], 2), round(ep[1], 2)) in label_positions
+            or any(abs(ep[0] - lp[0]) < 0.1 and abs(ep[1] - lp[1]) < 0.1 for lp in label_positions)
+            for ep in all_eps
+        )
+        if touches_label:
+            continue
+
+        # Find which terminals are at group pins
+        pin_terminals = []
+        for ep in terminals:
+            match = _point_in_index(ep[0], ep[1], pin_index)
+            if match:
+                pin_terminals.append((ep, match))
+
+        # If 2+ terminals are at group pins, this chain connects group components
+        if len(pin_terminals) >= 2:
+            # Delete all wires in this chain
+            for wi in wire_indices:
+                _, _, _, _, bstart, bend = wire_blocks[wi]
+                wires_to_delete.append((bstart, bend))
+
+            # Record connected pin pairs (all combinations for multi-terminal chains)
+            for i_pt in range(len(pin_terminals)):
+                for j_pt in range(i_pt + 1, len(pin_terminals)):
+                    pair = frozenset([pin_terminals[i_pt][1], pin_terminals[j_pt][1]])
+                    connected_pairs.add(pair)
 
     if not wires_to_delete:
         return {
             "success": True,
-            "message": "No direct pin-to-pin wires found between group components",
+            "message": "No internal wires found between group components (wires may connect through labels instead)",
             "deletedWires": 0,
             "addedWires": 0,
             "pinPairsRewired": 0,
