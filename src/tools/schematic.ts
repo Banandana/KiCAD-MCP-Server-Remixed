@@ -1471,7 +1471,12 @@ all resistors, "Device:C" to "Capacitor_SMD:C_0603_1608Metric" for all capacitor
   // Delete multiple wires and/or labels in a single call
   server.tool(
     "batch_delete",
-    "Delete multiple wires and/or labels in a single call.",
+    `Delete multiple wires and/or labels in a single call.
+
+IMPORTANT: Items must be inside the 'wires' and/or 'labels' arrays, NOT at the top level.
+Labels of all types (net, global, hierarchical) are matched — no 'type' field needed.
+
+Example: { schematicPath: "...", labels: [{ netName: "NC_U9", position: { x: 190.5, y: 607.06 } }] }`,
     {
       schematicPath: z.string().describe("Path to the schematic file"),
       wires: z.array(z.object({
@@ -1479,9 +1484,9 @@ all resistors, "Device:C" to "Capacitor_SMD:C_0603_1608Metric" for all capacitor
         end: z.object({ x: z.number(), y: z.number() }),
       })).optional().describe("Array of wires to delete (matched by start/end coordinates)"),
       labels: z.array(z.object({
-        netName: z.string(),
-        position: z.object({ x: z.number(), y: z.number() }).optional(),
-      })).optional().describe("Array of labels to delete (matched by name and optionally position)"),
+        netName: z.string().describe("Label text / net name to match (e.g. 'NC_U9', 'GND')"),
+        position: z.object({ x: z.number(), y: z.number() }).optional().describe("Position to disambiguate if multiple labels share the same name"),
+      })).optional().describe("Array of labels to delete. Matches all label types (net, global_label, hierarchical_label)."),
     },
     async (args) => {
       const result = await callKicadScript("batch_delete", args);

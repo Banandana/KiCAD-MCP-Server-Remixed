@@ -4129,11 +4129,24 @@ class KiCADInterface:
             )
 
             schematic_path = params.get("schematicPath")
-            wires = params.get("wires", [])
-            labels = params.get("labels", [])
+            wires = params.get("wires") or []
+            labels = params.get("labels") or []
 
             if not schematic_path:
                 return {"success": False, "message": "schematicPath is required"}
+            if not wires and not labels:
+                # Detect common mistake: parameters at top level instead of in arrays
+                hint = ""
+                if params.get("netName") or params.get("position") or params.get("type"):
+                    hint = (
+                        ". It looks like you passed netName/position/type at the top level — "
+                        "they must be inside the 'labels' array: "
+                        '{labels: [{netName: "...", position: {x, y}}]}'
+                    )
+                return {
+                    "success": False,
+                    "message": f"No items to delete — 'wires' and 'labels' arrays are both empty{hint}",
+                }
 
             content = _read_schematic(Path(schematic_path))
             deleted_wires = 0
