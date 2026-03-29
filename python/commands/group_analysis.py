@@ -728,63 +728,259 @@ def compute_group_layout(schematic_path, components, pin_locator, anchor=None, c
     }
 
 
-def apply_group_layout(schematic_path, positions, pin_locator, kicad_interface, rewire=True, routing_style="auto"):
-    """Apply computed layout positions using move_connected, then optionally rewire.
+def _find_block_end_str_aware(s, start):
+    """Find end of balanced paren block starting at s[start]='('.
+    String-aware: skips parens inside quoted strings."""
+    depth = 0
+    i = start
+    in_str = False
+    while i < len(s):
+        ch = s[i]
+        if in_str:
+            if ch == '\\':
+                i += 2
+                continue
+            elif ch == '"':
+                in_str = False
+        else:
+            if ch == '"':
+                in_str = True
+            elif ch == '(':
+                depth += 1
+            elif ch == ')':
+                depth -= 1
+                if depth == 0:
+                    return i + 1
+        i += 1
+    return len(s)
 
-    Uses move_connected for each component so wires, labels, power symbols,
-    and no-connects move with their components (preserving connectivity).
-    Then rewire_group_orthogonal cleans up stretched wires into orthogonal routes.
+
+def apply_group_layout(schematic_path, positions, pin_locator, kicad_interface=None, rewire=True, routing_style="auto"):
+    """Apply layout positions atomically: move all components + their attached elements in one pass.
+
+    For each component, computes its (dx, dy) offset. Then in a single content pass:
+    1. Moves all component (symbol) blocks to new positions
+    2. For each wire, checks which group pins its endpoints touch:
+       - Both endpoints at group pins → delete (rewire will recreate)
+       - One endpoint at a group pin → shift that endpoint by the pin's component delta
+       - Neither endpoint at group pins → leave untouched
+    3. Shifts labels, power symbols, no-connects at old pin positions by their component's delta
+    4. Writes once, then optionally rewires
     """
-    # Compute offsets from current positions
-    content = _read_schematic(Path(schematic_path))
+    import os
+    sch_path = Path(schematic_path)
+    content = _read_schematic(sch_path)
+
+    # Get current symbol positions
     symbols = parse_placed_symbols_from_content(content)
-    current_positions = {}
+    current_pos = {}
     for sym in symbols:
         ref = sym.get("reference", "")
         if ref in positions:
-            current_positions[ref] = {"x": sym.get("x", 0), "y": sym.get("y", 0)}
+            current_pos[ref] = {"x": sym.get("x", 0), "y": sym.get("y", 0)}
 
-    moved = []
-    failed = []
-
-    # Move each component using move_connected (preserves wire connectivity)
+    # Compute per-component deltas
+    deltas = {}  # ref -> (dx, dy)
     for ref, new_pos in positions.items():
-        cur = current_positions.get(ref)
+        cur = current_pos.get(ref)
         if not cur:
-            failed.append(f"{ref}: not found in schematic")
             continue
-
         dx = new_pos["x"] - cur["x"]
         dy = new_pos["y"] - cur["y"]
+        if abs(dx) > 0.01 or abs(dy) > 0.01:
+            deltas[ref] = (dx, dy)
 
-        if abs(dx) < 0.01 and abs(dy) < 0.01:
-            moved.append(ref)  # already in position
+    if not deltas:
+        return {"success": True, "movedComponents": [], "movedCount": 0,
+                "message": "All components already in position"}
+
+    # Get OLD pin positions for all group components (before move)
+    component_set = set(positions.keys())
+    all_pins = _compute_pin_endpoints_from_content(
+        content, component_set, pin_locator, schematic_path
+    )
+
+    # Build: pin_position -> (ref, pin_num, delta)
+    # So we can match wire endpoints to components and know which delta to apply
+    pin_to_comp = {}  # (round_x, round_y) -> (ref, dx, dy)
+    eps = 0.5
+    for ref, pn, _name, px, py, _v, _l in all_pins:
+        dx, dy = deltas.get(ref, (0, 0))
+        key = (round(px, 2), round(py, 2))
+        pin_to_comp[key] = (ref, dx, dy)
+
+    def _match_pin(x, y):
+        """Find which component's pin is at (x, y), return (ref, dx, dy) or None."""
+        for ddx in (-eps, 0, eps):
+            for ddy in (-eps, 0, eps):
+                key = (round(x + ddx, 2), round(y + ddy, 2))
+                if key in pin_to_comp:
+                    return pin_to_comp[key]
+        return None
+
+    # Skip lib_symbols section
+    lib_sym_start = content.find("(lib_symbols")
+    lib_sym_end = _find_block_end_str_aware(content, lib_sym_start) if lib_sym_start >= 0 else -1
+
+    replacements = []
+    moved_components = []
+
+    # 1. Move component (symbol) blocks
+    sym_pat = re.compile(r'\(symbol\s+\(lib_id\s+"([^"]*)"')
+    for sm in sym_pat.finditer(content):
+        pos = sm.start()
+        if lib_sym_start >= 0 and lib_sym_start <= pos < lib_sym_end:
+            continue
+        end = _find_block_end_str_aware(content, pos)
+        block = content[pos:end]
+
+        ref_m = re.search(r'\(property\s+"Reference"\s+"([^"]*)"', block)
+        if not ref_m:
+            continue
+        ref = ref_m.group(1)
+
+        lib_id = sm.group(1)
+
+        # Move group components
+        if ref in deltas:
+            dx, dy = deltas[ref]
+            def _shift_at(match, _dx=dx, _dy=dy):
+                ax = float(match.group(1)) + _dx
+                ay = float(match.group(2)) + _dy
+                rest = match.group(3)
+                return f"(at {_fmt(ax)} {_fmt(ay)}{rest}"
+            new_block = re.sub(
+                r'\(at\s+([\d.e+-]+)\s+([\d.e+-]+)([\s\d.e+-]*\))',
+                _shift_at, block
+            )
+            replacements.append((pos, end, new_block))
+            moved_components.append(ref)
+        # Move power symbols at group pin positions
+        elif lib_id.startswith("power:"):
+            at_m = re.search(r'\(at\s+([\d.e+-]+)\s+([\d.e+-]+)', block)
+            if at_m:
+                sx, sy = float(at_m.group(1)), float(at_m.group(2))
+                match = _match_pin(sx, sy)
+                if match:
+                    _, dx, dy = match
+                    if abs(dx) > 0.01 or abs(dy) > 0.01:
+                        def _shift_pwr(m, _dx=dx, _dy=dy):
+                            ax = float(m.group(1)) + _dx
+                            ay = float(m.group(2)) + _dy
+                            rest = m.group(3)
+                            return f"(at {_fmt(ax)} {_fmt(ay)}{rest}"
+                        new_block = re.sub(
+                            r'\(at\s+([\d.e+-]+)\s+([\d.e+-]+)([\s\d.e+-]*\))',
+                            _shift_pwr, block
+                        )
+                        replacements.append((pos, end, new_block))
+
+    # 2. Handle wires: delete internal, stretch external
+    wire_pat = re.compile(r'\(wire\b')
+    xy_pat = re.compile(r'\(xy\s+([\d.e+-]+)\s+([\d.e+-]+)\)')
+    for wm in wire_pat.finditer(content):
+        wpos = wm.start()
+        wend = _find_block_end_str_aware(content, wpos)
+        block = content[wpos:wend]
+        xys = xy_pat.findall(block)
+        if len(xys) < 2:
             continue
 
-        # Call move_connected via the KiCADInterface handler
-        move_result = kicad_interface._handle_move_connected({
-            "schematicPath": schematic_path,
-            "reference": ref,
-            "offset": {"x": dx, "y": dy},
-        })
+        x1, y1 = float(xys[0][0]), float(xys[0][1])
+        x2, y2 = float(xys[-1][0]), float(xys[-1][1])
+        match_a = _match_pin(x1, y1)
+        match_b = _match_pin(x2, y2)
 
-        if move_result.get("success"):
-            moved.append(ref)
-            logger.info(f"Moved {ref} by ({dx:.2f}, {dy:.2f})")
-        else:
-            failed.append(f"{ref}: {move_result.get('message', 'unknown error')}")
-            logger.warning(f"Failed to move {ref}: {move_result.get('message')}")
+        if match_a and match_b:
+            # Both endpoints at group pins — delete (rewire will recreate)
+            # Include trailing whitespace
+            trail_end = wend
+            while trail_end < len(content) and content[trail_end] in (" ", "\t", "\n", "\r"):
+                trail_end += 1
+            replacements.append((wpos, trail_end, ""))
+        elif match_a:
+            # First endpoint at a group pin — shift it
+            _, dx, dy = match_a
+            if abs(dx) > 0.01 or abs(dy) > 0.01:
+                new_block = block.replace(
+                    f"(xy {xys[0][0]} {xys[0][1]})",
+                    f"(xy {_fmt(x1 + dx)} {_fmt(y1 + dy)})",
+                    1
+                )
+                replacements.append((wpos, wend, new_block))
+        elif match_b:
+            # Second endpoint at a group pin — shift it
+            _, dx, dy = match_b
+            if abs(dx) > 0.01 or abs(dy) > 0.01:
+                # Replace last occurrence
+                rev = block[::-1]
+                old_xy = f"(xy {xys[-1][0]} {xys[-1][1]})"
+                new_xy = f"(xy {_fmt(x2 + dx)} {_fmt(y2 + dy)})"
+                rev_old = old_xy[::-1]
+                rev_new = new_xy[::-1]
+                new_block = rev.replace(rev_old, rev_new, 1)[::-1]
+                replacements.append((wpos, wend, new_block))
+
+    # 3. Move labels at old pin positions
+    for lt in ["label", "global_label", "hierarchical_label"]:
+        lp = re.compile(
+            rf'\({lt}\s+"([^"]*)"(?:\s+\(shape\s+[^)]*\))?\s+\(at\s+([\d.e+-]+)\s+([\d.e+-]+)'
+        )
+        for m in lp.finditer(content):
+            lx, ly = float(m.group(2)), float(m.group(3))
+            match = _match_pin(lx, ly)
+            if match:
+                _, dx, dy = match
+                if abs(dx) > 0.01 or abs(dy) > 0.01:
+                    lpos = m.start()
+                    lend = _find_block_end_str_aware(content, lpos)
+                    block = content[lpos:lend]
+                    def _shift_label(m2, _dx=dx, _dy=dy):
+                        ax = float(m2.group(1)) + _dx
+                        ay = float(m2.group(2)) + _dy
+                        rest = m2.group(3)
+                        return f"(at {_fmt(ax)} {_fmt(ay)}{rest}"
+                    new_block = re.sub(
+                        r'\(at\s+([\d.e+-]+)\s+([\d.e+-]+)([\s\d.e+-]*\))',
+                        _shift_label, block
+                    )
+                    replacements.append((lpos, lend, new_block))
+
+    # 4. Move junctions and no-connects at old pin positions
+    for elem_type in ["junction", "no_connect"]:
+        ep = re.compile(rf'\({elem_type}\s+\(at\s+([\d.e+-]+)\s+([\d.e+-]+)\)')
+        for m in ep.finditer(content):
+            ex, ey = float(m.group(1)), float(m.group(2))
+            match = _match_pin(ex, ey)
+            if match:
+                _, dx, dy = match
+                if abs(dx) > 0.01 or abs(dy) > 0.01:
+                    epos = m.start()
+                    eend = _find_block_end_str_aware(content, epos)
+                    block = content[epos:eend]
+                    new_block = re.sub(
+                        r'\(at\s+([\d.e+-]+)\s+([\d.e+-]+)\)',
+                        lambda m2: f"(at {_fmt(float(m2.group(1)) + dx)} {_fmt(float(m2.group(2)) + dy)})",
+                        block
+                    )
+                    replacements.append((epos, eend, new_block))
+
+    # Apply all replacements in reverse position order (single pass)
+    replacements.sort(key=lambda r: r[0], reverse=True)
+    for start, end, new_text in replacements:
+        content = content[:start] + new_text + content[end:]
+
+    _write_schematic(sch_path, content)
 
     result = {
-        "success": len(failed) == 0,
-        "movedComponents": moved,
-        "movedCount": len(moved),
-        "failedComponents": failed,
-        "message": f"Moved {len(moved)}/{len(positions)} components" + (f", {len(failed)} failed" if failed else ""),
+        "success": True,
+        "movedComponents": moved_components,
+        "movedCount": len(moved_components),
+        "message": f"Moved {len(moved_components)} components atomically",
     }
 
     # Optionally rewire
-    if rewire and moved:
+    if rewire and moved_components:
         all_refs = list(positions.keys())
         rewire_result = rewire_group_orthogonal(
             schematic_path, all_refs, pin_locator, routing_style
