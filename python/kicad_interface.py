@@ -890,11 +890,18 @@ class KiCADInterface:
 
         def find_matching_paren(s, start):
             depth = 0
+            in_string = False
             i = start
             while i < len(s):
-                if s[i] == "(":
+                ch = s[i]
+                if in_string:
+                    if ch == '"':
+                        in_string = False
+                elif ch == '"':
+                    in_string = True
+                elif ch == "(":
                     depth += 1
-                elif s[i] == ")":
+                elif ch == ")":
                     depth -= 1
                     if depth == 0:
                         return i
@@ -1004,11 +1011,18 @@ class KiCADInterface:
 
         def find_matching_paren(s, start):
             depth = 0
+            in_string = False
             i = start
             while i < len(s):
-                if s[i] == "(":
+                ch = s[i]
+                if in_string:
+                    if ch == '"':
+                        in_string = False
+                elif ch == '"':
+                    in_string = True
+                elif ch == "(":
                     depth += 1
-                elif s[i] == ")":
+                elif ch == ")":
                     depth -= 1
                     if depth == 0:
                         return i
@@ -1241,11 +1255,18 @@ class KiCADInterface:
             # --- Find the placed symbol block by Reference ---
             def find_matching_paren(s, start):
                 depth = 0
+                in_string = False
                 i = start
                 while i < len(s):
-                    if s[i] == "(":
+                    ch = s[i]
+                    if in_string:
+                        if ch == '"':
+                            in_string = False
+                    elif ch == '"':
+                        in_string = True
+                    elif ch == "(":
                         depth += 1
-                    elif s[i] == ")":
+                    elif ch == ")":
                         depth -= 1
                         if depth == 0:
                             return i
@@ -1434,11 +1455,18 @@ class KiCADInterface:
 
             def find_matching_paren(s, start):
                 depth = 0
+                in_string = False
                 i = start
                 while i < len(s):
-                    if s[i] == "(":
+                    ch = s[i]
+                    if in_string:
+                        if ch == '"':
+                            in_string = False
+                    elif ch == '"':
+                        in_string = True
+                    elif ch == "(":
                         depth += 1
-                    elif s[i] == ")":
+                    elif ch == ")":
                         depth -= 1
                         if depth == 0:
                             return i
@@ -2692,11 +2720,18 @@ class KiCADInterface:
 
             def find_matching_paren(s, start):
                 depth = 0
+                in_string = False
                 i = start
                 while i < len(s):
-                    if s[i] == "(":
+                    ch = s[i]
+                    if in_string:
+                        if ch == '"':
+                            in_string = False
+                    elif ch == '"':
+                        in_string = True
+                    elif ch == "(":
                         depth += 1
-                    elif s[i] == ")":
+                    elif ch == ")":
                         depth -= 1
                         if depth == 0:
                             return i

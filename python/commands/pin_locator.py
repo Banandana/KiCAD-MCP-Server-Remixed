@@ -18,13 +18,24 @@ logger = logging.getLogger("kicad_interface")
 
 
 def _find_matching_paren(s: str, start: int) -> int:
-    """Find matching closing paren for opening paren at position start."""
+    """Find matching closing paren for opening paren at position start.
+
+    String-aware: skips characters inside quoted strings so that pin names
+    like "PA15(JTDI)" don't throw off the depth counter.
+    """
     depth = 0
+    in_string = False
     i = start
     while i < len(s):
-        if s[i] == "(":
+        ch = s[i]
+        if in_string:
+            if ch == '"':
+                in_string = False
+        elif ch == '"':
+            in_string = True
+        elif ch == "(":
             depth += 1
-        elif s[i] == ")":
+        elif ch == ")":
             depth -= 1
             if depth == 0:
                 return i

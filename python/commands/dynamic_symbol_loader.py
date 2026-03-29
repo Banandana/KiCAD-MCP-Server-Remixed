@@ -188,12 +188,23 @@ class DynamicSymbolLoader:
                     pos = text.find(search_pattern, pos + 1)
                     continue
 
-            # Use balanced paren counting to find the end of this block
+            # Use balanced paren counting to find the end of this block.
+            # Skip characters inside quoted strings so that pin names like
+            # "PA15(JTDI)" don't throw off the depth counter.
             depth = 0
+            in_string = False
             for i in range(pos, len(text)):
-                if text[i] == '(':
+                ch = text[i]
+                if in_string:
+                    if ch == '"':
+                        in_string = False
+                    # Skip all other characters inside strings
+                    continue
+                if ch == '"':
+                    in_string = True
+                elif ch == '(':
                     depth += 1
-                elif text[i] == ')':
+                elif ch == ')':
                     depth -= 1
                     if depth == 0:
                         return text[pos:i + 1]
@@ -231,11 +242,18 @@ class DynamicSymbolLoader:
                 continue
 
             # Collect a balanced s-expression starting here
+            # String-aware: skip parens inside quoted strings
             depth = 0
+            in_string = False
             item_start = i
             while i < n:
                 for ch in lines[i]:
-                    if ch == "(":
+                    if in_string:
+                        if ch == '"':
+                            in_string = False
+                    elif ch == '"':
+                        in_string = True
+                    elif ch == "(":
                         depth += 1
                     elif ch == ")":
                         depth -= 1
@@ -419,11 +437,18 @@ class DynamicSymbolLoader:
             raise ValueError("No lib_symbols section found in schematic")
 
         depth = 0
+        in_string = False
         lib_sym_end = lib_sym_start
         for i in range(lib_sym_start, len(content)):
-            if content[i] == "(":
+            ch = content[i]
+            if in_string:
+                if ch == '"':
+                    in_string = False
+            elif ch == '"':
+                in_string = True
+            elif ch == "(":
                 depth += 1
-            elif content[i] == ")":
+            elif ch == ")":
                 depth -= 1
                 if depth == 0:
                     lib_sym_end = i
