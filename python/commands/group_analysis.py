@@ -728,129 +728,59 @@ def compute_group_layout(schematic_path, components, pin_locator, anchor=None, c
     }
 
 
-def apply_group_layout(schematic_path, positions, pin_locator, rewire=True, routing_style="auto"):
-    """Apply computed layout positions and optionally rewire.
+def apply_group_layout(schematic_path, positions, pin_locator, kicad_interface, rewire=True, routing_style="auto"):
+    """Apply computed layout positions using move_connected, then optionally rewire.
 
-    Moves components to new positions via text-based replacement,
-    then optionally calls rewire_group_orthogonal.
+    Uses move_connected for each component so wires, labels, power symbols,
+    and no-connects move with their components (preserving connectivity).
+    Then rewire_group_orthogonal cleans up stretched wires into orthogonal routes.
     """
-    sch_path = Path(schematic_path)
-    content = _read_schematic(sch_path)
-
-    # Find and move each component's (at ...) block
+    # Compute offsets from current positions
+    content = _read_schematic(Path(schematic_path))
     symbols = parse_placed_symbols_from_content(content)
-    lib_sym_start = content.find("(lib_symbols")
-    if lib_sym_start >= 0:
-        # Find end of lib_symbols to skip it
-        depth = 0
-        i = lib_sym_start
-        in_str = False
-        while i < len(content):
-            ch = content[i]
-            if in_str:
-                if ch == '\\':
-                    i += 2
-                    continue
-                elif ch == '"':
-                    in_str = False
-            else:
-                if ch == '"':
-                    in_str = True
-                elif ch == '(':
-                    depth += 1
-                elif ch == ')':
-                    depth -= 1
-                    if depth == 0:
-                        break
-            i += 1
-        lib_sym_end = i + 1
-    else:
-        lib_sym_end = -1
+    current_positions = {}
+    for sym in symbols:
+        ref = sym.get("reference", "")
+        if ref in positions:
+            current_positions[ref] = {"x": sym.get("x", 0), "y": sym.get("y", 0)}
 
-    sym_pat = re.compile(r'\(symbol\s+\(lib_id\s+"([^"]*)"')
-    replacements = []
     moved = []
+    failed = []
 
-    for sm in sym_pat.finditer(content):
-        pos = sm.start()
-        if lib_sym_start >= 0 and lib_sym_start <= pos < lib_sym_end:
+    # Move each component using move_connected (preserves wire connectivity)
+    for ref, new_pos in positions.items():
+        cur = current_positions.get(ref)
+        if not cur:
+            failed.append(f"{ref}: not found in schematic")
             continue
 
-        # Find block end (string-aware)
-        depth = 0
-        i = pos
-        in_str = False
-        while i < len(content):
-            ch = content[i]
-            if in_str:
-                if ch == '\\':
-                    i += 2
-                    continue
-                elif ch == '"':
-                    in_str = False
-            else:
-                if ch == '"':
-                    in_str = True
-                elif ch == '(':
-                    depth += 1
-                elif ch == ')':
-                    depth -= 1
-                    if depth == 0:
-                        break
-            i += 1
-        end = i + 1
-        block = content[pos:end]
-
-        # Get reference
-        ref_m = re.search(r'\(property\s+"Reference"\s+"([^"]*)"', block)
-        if not ref_m:
-            continue
-        ref = ref_m.group(1)
-        if ref not in positions:
-            continue
-
-        new_pos = positions[ref]
-        new_x = new_pos["x"]
-        new_y = new_pos["y"]
-
-        # Get current position to compute delta for field shifts
-        at_m = re.search(r'\(at\s+([\d.e+-]+)\s+([\d.e+-]+)', block)
-        if not at_m:
-            continue
-        old_x = float(at_m.group(1))
-        old_y = float(at_m.group(2))
-        dx = new_x - old_x
-        dy = new_y - old_y
+        dx = new_pos["x"] - cur["x"]
+        dy = new_pos["y"] - cur["y"]
 
         if abs(dx) < 0.01 and abs(dy) < 0.01:
-            continue  # Already in position
+            moved.append(ref)  # already in position
+            continue
 
-        # Shift all (at ...) in this symbol block by (dx, dy)
-        def _shift_at(match, _dx=dx, _dy=dy):
-            ax = float(match.group(1)) + _dx
-            ay = float(match.group(2)) + _dy
-            rest = match.group(3)
-            return f"(at {_fmt(ax)} {_fmt(ay)}{rest}"
+        # Call move_connected via the KiCADInterface handler
+        move_result = kicad_interface._handle_move_connected({
+            "schematicPath": schematic_path,
+            "reference": ref,
+            "offset": {"x": dx, "y": dy},
+        })
 
-        new_block = re.sub(
-            r'\(at\s+([\d.e+-]+)\s+([\d.e+-]+)([\s\d.e+-]*\))',
-            _shift_at, block
-        )
-        replacements.append((pos, end, new_block))
-        moved.append(ref)
-
-    # Apply in reverse order
-    replacements.sort(key=lambda r: r[0], reverse=True)
-    for start, end, new_text in replacements:
-        content = content[:start] + new_text + content[end:]
-
-    _write_schematic(sch_path, content)
+        if move_result.get("success"):
+            moved.append(ref)
+            logger.info(f"Moved {ref} by ({dx:.2f}, {dy:.2f})")
+        else:
+            failed.append(f"{ref}: {move_result.get('message', 'unknown error')}")
+            logger.warning(f"Failed to move {ref}: {move_result.get('message')}")
 
     result = {
-        "success": True,
+        "success": len(failed) == 0,
         "movedComponents": moved,
         "movedCount": len(moved),
-        "message": f"Moved {len(moved)} components to new positions",
+        "failedComponents": failed,
+        "message": f"Moved {len(moved)}/{len(positions)} components" + (f", {len(failed)} failed" if failed else ""),
     }
 
     # Optionally rewire

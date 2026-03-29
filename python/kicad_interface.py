@@ -7989,7 +7989,7 @@ class KiCADInterface:
             if not positions:
                 return {"success": False, "message": "positions dict is required"}
 
-            return apply_group_layout(schematic_path, positions, self.pin_locator, rewire, routing_style)
+            return apply_group_layout(schematic_path, positions, self.pin_locator, self, rewire, routing_style)
         except Exception as e:
             logger.error(f"Error applying group layout: {e}")
             import traceback
