@@ -3863,15 +3863,28 @@ class KiCADInterface:
                 return x1 <= x <= x2 and y1 <= y <= y2
 
             def find_block_end(s, start):
-                """Find end of balanced paren block starting at s[start]='('."""
+                """Find end of balanced paren block starting at s[start]='('.
+                String-aware: skips parens inside quoted strings."""
                 depth = 0
                 i = start
+                in_string = False
                 while i < len(s):
-                    if s[i] == "(": depth += 1
-                    elif s[i] == ")":
-                        depth -= 1
-                        if depth == 0:
-                            return i + 1
+                    ch = s[i]
+                    if in_string:
+                        if ch == '\\':
+                            i += 2
+                            continue
+                        elif ch == '"':
+                            in_string = False
+                    else:
+                        if ch == '"':
+                            in_string = True
+                        elif ch == '(':
+                            depth += 1
+                        elif ch == ')':
+                            depth -= 1
+                            if depth == 0:
+                                return i + 1
                     i += 1
                 return len(s)
 
@@ -3955,13 +3968,49 @@ class KiCADInterface:
                         rest = match.group(3)
                         return f"(at {ax} {ay}{rest}"
 
-                    # Only shift the FIRST (at ...) in the label block (the label position)
+                    # Shift ALL (at ...) in the label block (label position + property positions)
                     new_block = re.sub(
                         r'\(at\s+([\d.e+-]+)\s+([\d.e+-]+)([\s\d.e+-]*\))',
-                        _shift_at_label, block, count=1
+                        _shift_at_label, block
                     )
                     replacements.append((pos, end, new_block))
                     moved["labels"] += 1
+
+            # --- Collect junction replacements ---
+            junction_pat = re.compile(r'\(junction\s+\(at\s+([\d.e+-]+)\s+([\d.e+-]+)\)')
+            for m in junction_pat.finditer(content):
+                jx, jy = float(m.group(1)), float(m.group(2))
+                if not in_bbox(jx, jy):
+                    continue
+                pos = m.start()
+                end = find_block_end(content, pos)
+                block = content[pos:end]
+                new_block = re.sub(
+                    r'\(at\s+([\d.e+-]+)\s+([\d.e+-]+)\)',
+                    lambda match: f"(at {float(match.group(1)) + dx} {float(match.group(2)) + dy})",
+                    block
+                )
+                replacements.append((pos, end, new_block))
+                moved.setdefault("junctions", 0)
+                moved["junctions"] += 1
+
+            # --- Collect no-connect replacements ---
+            nc_pat = re.compile(r'\(no_connect\s+\(at\s+([\d.e+-]+)\s+([\d.e+-]+)\)')
+            for m in nc_pat.finditer(content):
+                nx, ny = float(m.group(1)), float(m.group(2))
+                if not in_bbox(nx, ny):
+                    continue
+                pos = m.start()
+                end = find_block_end(content, pos)
+                block = content[pos:end]
+                new_block = re.sub(
+                    r'\(at\s+([\d.e+-]+)\s+([\d.e+-]+)\)',
+                    lambda match: f"(at {float(match.group(1)) + dx} {float(match.group(2)) + dy})",
+                    block
+                )
+                replacements.append((pos, end, new_block))
+                moved.setdefault("no_connects", 0)
+                moved["no_connects"] += 1
 
             # Apply all replacements in REVERSE order so positions stay valid
             replacements.sort(key=lambda r: r[0], reverse=True)
@@ -3973,7 +4022,7 @@ class KiCADInterface:
                 f.flush()
                 os.fsync(f.fileno())
 
-            total = moved["components"] + moved["wires"] + moved["labels"]
+            total = sum(moved.values())
             return {
                 "success": True,
                 "message": f"Moved {total} items (dx={dx}, dy={dy})",
@@ -6151,7 +6200,7 @@ class KiCADInterface:
                 content = f.read()
 
             eps = 0.5
-            moved_items = {"component": False, "wire_endpoints": 0, "labels": 0, "junctions": 0}
+            moved_items = {"component": False, "wire_endpoints": 0, "labels": 0, "junctions": 0, "power_symbols": 0, "no_connects": 0}
 
             # Build list of (old_point, new_point) for pin moves
             pin_moves = []
@@ -6164,22 +6213,36 @@ class KiCADInterface:
             wire_pat = re.compile(r'\(wire\b')
             xy_pat = re.compile(r'\(xy\s+([\d.e+-]+)\s+([\d.e+-]+)\)')
 
+            def _find_block_end_str_aware(s, start):
+                """Find end of balanced paren block, skipping parens inside strings."""
+                depth = 0
+                i = start
+                in_str = False
+                while i < len(s):
+                    ch = s[i]
+                    if in_str:
+                        if ch == '\\':
+                            i += 2
+                            continue
+                        elif ch == '"':
+                            in_str = False
+                    else:
+                        if ch == '"':
+                            in_str = True
+                        elif ch == '(':
+                            depth += 1
+                        elif ch == ')':
+                            depth -= 1
+                            if depth == 0:
+                                return i + 1
+                    i += 1
+                return len(s)
+
             connected_points = set(old_pin_positions)
             # Also trace one hop through wires to find labels/junctions
             all_wires_parsed = []
             for wm in wire_pat.finditer(content):
-                depth = 0
-                i = wm.start()
-                block_end = i
-                while i < len(content):
-                    if content[i] == '(':
-                        depth += 1
-                    elif content[i] == ')':
-                        depth -= 1
-                        if depth == 0:
-                            block_end = i + 1
-                            break
-                    i += 1
+                block_end = _find_block_end_str_aware(content, wm.start())
                 block = content[wm.start():block_end]
                 xys = xy_pat.findall(block)
                 if len(xys) >= 2:
@@ -6251,18 +6314,7 @@ class KiCADInterface:
             # Collect replacements in reverse order
             replacements = []
             for wm in wire_pat.finditer(content):
-                depth = 0
-                i = wm.start()
-                block_end = i
-                while i < len(content):
-                    if content[i] == '(':
-                        depth += 1
-                    elif content[i] == ')':
-                        depth -= 1
-                        if depth == 0:
-                            block_end = i + 1
-                            break
-                    i += 1
+                block_end = _find_block_end_str_aware(content, wm.start())
                 block = content[wm.start():block_end]
 
                 new_block = block
@@ -6312,6 +6364,63 @@ class KiCADInterface:
                         replacements.append((at_pos, at_pos + len(old_at), new_at))
                         moved_items["junctions"] += 1
 
+            # 4e. Move power symbols (#PWR) at connected points
+            # Power symbols sit at pin endpoints or wire far endpoints
+            all_connected = old_pin_positions | wire_far_endpoints
+            # Skip lib_symbols section
+            lib_sym_start = content.find("(lib_symbols")
+            lib_sym_end = _find_block_end_str_aware(content, lib_sym_start) if lib_sym_start >= 0 else -1
+
+            sym_pat = re.compile(r'\(symbol\s+\(lib_id\s+"([^"]*)"')
+            for m in sym_pat.finditer(content):
+                pos = m.start()
+                if lib_sym_start >= 0 and lib_sym_start <= pos < lib_sym_end:
+                    continue
+                lib_id = m.group(1)
+                # Only move power symbols (lib_id starts with "power:")
+                if not lib_id.startswith("power:"):
+                    continue
+                end = _find_block_end_str_aware(content, pos)
+                block = content[pos:end]
+                # Get symbol position (first (at ...))
+                at_m = re.search(r'\(at\s+([\d.e+-]+)\s+([\d.e+-]+)', block)
+                if not at_m:
+                    continue
+                sx, sy = float(at_m.group(1)), float(at_m.group(2))
+                if not any(abs(sx - cp[0]) < eps and abs(sy - cp[1]) < eps for cp in all_connected):
+                    continue
+                # Shift all (at ...) in this symbol block (position + fields)
+                from commands.sexp_writer import _fmt
+                def _shift_sym_at(match, _dx=dx, _dy=dy):
+                    ax = float(match.group(1)) + _dx
+                    ay = float(match.group(2)) + _dy
+                    rest = match.group(3)
+                    return f"(at {_fmt(ax)} {_fmt(ay)}{rest}"
+                new_block = re.sub(
+                    r'\(at\s+([\d.e+-]+)\s+([\d.e+-]+)([\s\d.e+-]*\))',
+                    _shift_sym_at, block
+                )
+                replacements.append((pos, end, new_block))
+                moved_items["power_symbols"] += 1
+
+            # 4f. Move no-connects at connected points
+            nc_pat = re.compile(r'\(no_connect\s+\(at\s+([\d.e+-]+)\s+([\d.e+-]+)\)')
+            for m in nc_pat.finditer(content):
+                nx, ny = float(m.group(1)), float(m.group(2))
+                if not any(abs(nx - cp[0]) < eps and abs(ny - cp[1]) < eps for cp in all_connected):
+                    continue
+                from commands.sexp_writer import _fmt
+                nc_pos = m.start()
+                nc_end = _find_block_end_str_aware(content, nc_pos)
+                nc_block = content[nc_pos:nc_end]
+                new_nc = re.sub(
+                    r'\(at\s+([\d.e+-]+)\s+([\d.e+-]+)\)',
+                    lambda match: f"(at {_fmt(float(match.group(1)) + dx)} {_fmt(float(match.group(2)) + dy)})",
+                    nc_block
+                )
+                replacements.append((nc_pos, nc_end, new_nc))
+                moved_items["no_connects"] += 1
+
             # Apply all replacements in reverse order
             replacements.sort(key=lambda r: r[0], reverse=True)
             for start, end, new_text in replacements:
@@ -6322,7 +6431,7 @@ class KiCADInterface:
                 f.flush()
                 os.fsync(f.fileno())
 
-            total = moved_items["wire_endpoints"] + moved_items["labels"] + moved_items["junctions"]
+            total = sum(v for k, v in moved_items.items() if k != "component")
             return {
                 "success": True,
                 "message": f"Moved {reference} by ({dx}, {dy}) with {total} connected items",
