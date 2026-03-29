@@ -307,12 +307,12 @@ class ConnectionManager:
             shape: For global_label: "input", "output", "bidirectional", "passive"
 
         Returns:
-            True if successful, False otherwise
+            dict with "connected" (bool), optionally "power_reference" or "label_type"
         """
         try:
             if not WIRE_MANAGER_AVAILABLE:
                 logger.error("WireManager/PinLocator not available")
-                return False
+                return {"connected": False, "error": "WireManager/PinLocator not available"}
 
             # Create a fresh PinLocator each time to avoid stale cache
             locator = PinLocator()
@@ -321,7 +321,7 @@ class ConnectionManager:
             pin_loc = locator.get_pin_location(schematic_path, component_ref, pin_name)
             if not pin_loc:
                 logger.error(f"Could not locate pin {component_ref}/{pin_name}")
-                return False
+                return {"connected": False, "error": f"Could not locate pin {component_ref}/{pin_name}"}
 
             # Add a small wire stub from the pin endpoint
             # (2.54mm = 0.1 inch, standard grid spacing)
@@ -356,7 +356,7 @@ class ConnectionManager:
             wire_success = WireManager.add_wire(schematic_path, pin_loc, stub_end)
             if not wire_success:
                 logger.error("Failed to create wire stub for net connection")
-                return False
+                return {"connected": False, "error": "Failed to create wire stub"}
 
             # Determine what to place at the stub end
             is_power = ConnectionManager._is_power_net(net_name)
@@ -387,7 +387,7 @@ class ConnectionManager:
                         project_path=schematic_path.parent,
                     )
                     logger.info(f"Placed power symbol {net_name} for {component_ref}/{pin_name}")
-                    return True
+                    return {"connected": True, "power_reference": pwr_ref}
                 except Exception as power_err:
                     logger.warning(f"Power symbol placement failed ({power_err}), falling back to label")
 
@@ -400,16 +400,16 @@ class ConnectionManager:
             )
             if not label_success:
                 logger.error(f"Failed to add net label '{net_name}'")
-                return False
+                return {"connected": False, "error": f"Failed to add net label '{net_name}'"}
 
             logger.info(f"Connected {component_ref}/{pin_name} to net '{net_name}' ({effective_label_type})")
-            return True
+            return {"connected": True, "label_type": effective_label_type}
 
         except Exception as e:
             logger.error(f"Error connecting to net: {e}")
             import traceback
             logger.error(traceback.format_exc())
-            return False
+            return {"connected": False, "error": str(e)}
 
     @staticmethod
     def connect_passthrough(
@@ -460,7 +460,7 @@ class ConnectionManager:
                 ok_src = ConnectionManager.connect_to_net(
                     schematic_path, source_ref, pin_num, net_name
                 )
-                if not ok_src:
+                if not ok_src.get("connected"):
                     failed.append(f"{source_ref}/{pin_num}")
                     continue
 
@@ -468,7 +468,7 @@ class ConnectionManager:
                     ok_tgt = ConnectionManager.connect_to_net(
                         schematic_path, target_ref, pin_num, net_name
                     )
-                    if not ok_tgt:
+                    if not ok_tgt.get("connected"):
                         failed.append(f"{target_ref}/{pin_num}")
                         continue
                 else:

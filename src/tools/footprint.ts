@@ -234,4 +234,20 @@ export function registerFootprintTools(
       };
     },
   );
+
+  // ── import_footprint_from_file ────────────────────────────────────────── //
+  server.tool(
+    "import_footprint_from_file",
+    `Import a .kicad_mod footprint file into a project-local footprint library.
+Copies the file into the .pretty directory and registers the library if needed.`,
+    {
+      sourcePath: z.string().describe("Path to the .kicad_mod file to import"),
+      libraryName: z.string().optional().describe("Target library name (default: project name). Will create <name>.pretty if needed."),
+      projectPath: z.string().optional().describe("Project directory (default: current project)"),
+    },
+    async (args) => {
+      const result = await callKicadScript("import_footprint_from_file", args);
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    },
+  );
 }

@@ -199,6 +199,15 @@ class DesignRuleCommands:
 
             # Get the board file path
             board_file = self.board.GetFileName()
+
+            # Auto-save board before DRC — DRC runs kicad-cli which reads from disk
+            if board_file:
+                try:
+                    self.board.Save(board_file)
+                    logger.info(f"Auto-saved board to {board_file} before DRC")
+                except Exception as save_err:
+                    logger.warning(f"Could not auto-save board before DRC: {save_err}")
+
             if not board_file or not os.path.exists(board_file):
                 return {
                     "success": False,
@@ -409,6 +418,65 @@ class DesignRuleCommands:
                     return path
 
         return None
+
+    def set_board_setup(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Set board-level manufacturing parameters (mask, silk, paste)."""
+        try:
+            if not self.board:
+                return {"success": False, "message": "No board is loaded"}
+
+            ds = self.board.GetDesignSettings()
+            scale = 1000000
+            changes = []
+
+            mask_exp = params.get("solderMaskExpansion")
+            if mask_exp is not None:
+                ds.m_SolderMaskExpansion = int(mask_exp * scale)
+                changes.append(f"solderMaskExpansion={mask_exp}mm")
+
+            mask_min = params.get("solderMaskMinWidth")
+            if mask_min is not None:
+                ds.m_SolderMaskMinWidth = int(mask_min * scale)
+                changes.append(f"solderMaskMinWidth={mask_min}mm")
+
+            paste_margin = params.get("solderPasteMargin")
+            if paste_margin is not None:
+                ds.m_SolderPasteMargin = int(paste_margin * scale)
+                changes.append(f"solderPasteMargin={paste_margin}mm")
+
+            paste_ratio = params.get("solderPasteMarginRatio")
+            if paste_ratio is not None:
+                ds.m_SolderPasteMarginRatio = paste_ratio
+                changes.append(f"solderPasteMarginRatio={paste_ratio}")
+
+            silk_clearance = params.get("silkscreenClearance")
+            if silk_clearance is not None:
+                ds.m_SilkClearance = int(silk_clearance * scale)
+                changes.append(f"silkscreenClearance={silk_clearance}mm")
+
+            silk_min = params.get("silkscreenMinLineWidth")
+            if silk_min is not None:
+                try:
+                    ds.m_MinSilkTextHeight = int(silk_min * scale)
+                    ds.m_MinSilkTextThickness = int(silk_min * scale)
+                    changes.append(f"silkscreenMinLineWidth={silk_min}mm")
+                except AttributeError:
+                    logger.warning("m_MinSilkTextHeight/m_MinSilkTextThickness not available in this KiCAD version")
+                    changes.append(f"silkscreenMinLineWidth={silk_min}mm (attribute not available — skipped)")
+
+            if not changes:
+                return {"success": False, "message": "No parameters provided"}
+
+            self.board.SetModified()
+
+            return {
+                "success": True,
+                "message": f"Updated board setup: {', '.join(changes)}",
+                "changes": changes,
+            }
+        except Exception as e:
+            logger.error(f"Error setting board setup: {e}")
+            return {"success": False, "message": str(e)}
 
     def get_drc_violations(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """

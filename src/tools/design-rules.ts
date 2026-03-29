@@ -257,5 +257,26 @@ export function registerDesignRuleTools(server: McpServer, callKicadScript: Comm
     }
   );
 
+  // ------------------------------------------------------
+  // Set Board Setup Tool
+  // ------------------------------------------------------
+  server.tool(
+    "set_board_setup",
+    `Set board-level manufacturing parameters: solder mask, silkscreen, and paste settings.
+All dimensions in mm.`,
+    {
+      solderMaskExpansion: z.number().optional().describe("Solder mask expansion per side (mm). JLCPCB typical: 0.05"),
+      solderMaskMinWidth: z.number().optional().describe("Minimum solder mask dam width (mm). JLCPCB min: 0.1"),
+      solderPasteMargin: z.number().optional().describe("Solder paste margin (mm)"),
+      solderPasteMarginRatio: z.number().optional().describe("Solder paste margin as ratio (e.g., -0.1 for 10% shrink). No unit conversion."),
+      silkscreenClearance: z.number().optional().describe("Silkscreen-to-pad clearance (mm)"),
+      silkscreenMinLineWidth: z.number().optional().describe("Minimum silkscreen line width (mm). JLCPCB standard: 0.15"),
+    },
+    async (args) => {
+      const result = await callKicadScript("set_board_setup", args);
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    },
+  );
+
   logger.info('Design rule tools registered');
 }

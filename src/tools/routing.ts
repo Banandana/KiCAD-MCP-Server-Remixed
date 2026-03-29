@@ -275,6 +275,83 @@ export function registerRoutingTools(
     },
   );
 
+  server.tool(
+    "assign_nets_to_netclass",
+    `Assign one or more nets to a named netclass. The netclass must already exist.
+Example: assign_nets_to_netclass({ netclass: "Power_12V", nets: ["+12V_IN", "12V_BUCK_IN"] })`,
+    {
+      netclass: z.string().describe("Name of the target netclass (must exist)"),
+      nets: z.array(z.string()).describe("Array of net names to assign to this netclass"),
+    },
+    async (args) => {
+      const result = await callKicadScript("assign_nets_to_netclass", args);
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    },
+  );
+
+  server.tool(
+    "get_netclass_list",
+    "Query all existing netclasses with their settings (trace width, clearance, via size) and assigned nets/patterns.",
+    {},
+    async () => {
+      const result = await callKicadScript("get_netclass_list", {});
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    },
+  );
+
+  server.tool(
+    "edit_netclass",
+    "Modify an existing netclass's properties (trace width, clearance, via size, etc.).",
+    {
+      name: z.string().describe("Netclass name to modify"),
+      trackWidth: z.number().optional().describe("New trace width in mm"),
+      clearance: z.number().optional().describe("New clearance in mm"),
+      viaDiameter: z.number().optional().describe("New via diameter in mm"),
+      viaDrill: z.number().optional().describe("New via drill in mm"),
+    },
+    async (args) => {
+      const result = await callKicadScript("edit_netclass", args);
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    },
+  );
+
+  server.tool(
+    "delete_netclass",
+    "Remove a netclass. Nets assigned to it revert to Default class. Cannot delete 'Default'.",
+    {
+      name: z.string().describe("Netclass name to delete"),
+    },
+    async (args) => {
+      const result = await callKicadScript("delete_netclass", args);
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    },
+  );
+
+  server.tool(
+    "get_net_to_netclass_map",
+    "Quick dump of which nets are in which netclass. Faster than parsing the full nets list.",
+    {},
+    async () => {
+      const result = await callKicadScript("get_net_to_netclass_map", {});
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    },
+  );
+
+  server.tool(
+    "set_netclass_patterns",
+    `Set pattern-based netclass assignment rules. Patterns use wildcards (*) to match
+multiple nets. E.g., "+12V*" matches +12V_IN, +12V_FILT, etc.
+Example: set_netclass_patterns({ netclass: "Power_12V", patterns: ["+12V*", "VIN_*"] })`,
+    {
+      netclass: z.string().describe("Name of the target netclass (must exist)"),
+      patterns: z.array(z.string()).describe("Array of net name patterns (supports * wildcard)"),
+    },
+    async (args) => {
+      const result = await callKicadScript("set_netclass_patterns", args);
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    },
+  );
+
   // ------------------------------------------------------
   // Resize Vias Tool
   // ------------------------------------------------------
@@ -305,6 +382,54 @@ Example: resize all 0.15mm drill / 0.25mm pad vias to 0.2mm drill / 0.45mm pad:
       return {
         content: [{ type: "text" as const, text: `Failed: ${result.message}` }],
       };
+    },
+  );
+
+  server.tool(
+  "resize_traces",
+  `Batch resize traces on the board. If oldWidth is provided, only traces matching
+that exact width are resized. Otherwise ALL traces are resized. Use minWidth to only
+resize traces below a threshold (e.g., bring all sub-5mil traces up to 5mil).
+
+Example: resize all 4mil traces to 5mil:
+  resize_traces({ oldWidth: 0.1016, width: 0.127 })
+Example: resize all traces below 5mil to 5mil:
+  resize_traces({ minWidth: 0.127, width: 0.127 })`,
+  {
+    width: z.number().describe("New trace width in mm"),
+    oldWidth: z.number().optional().describe("Only resize traces with this exact width (mm). Omit to match all."),
+    minWidth: z.number().optional().describe("Only resize traces below this width (mm). Cannot combine with oldWidth."),
+    net: z.string().optional().describe("Only resize traces on this net name. Omit for all nets."),
+  },
+  async (args) => {
+    logger.debug("Resizing traces");
+    const result = await callKicadScript("resize_traces", args);
+    if (result.success) {
+      return {
+        content: [{
+          type: "text" as const,
+          text: `Resized ${result.resized} of ${result.total_traces} traces → width=${result.new_width_mm}mm`,
+        }],
+      };
+    }
+    return {
+      content: [{ type: "text" as const, text: `Failed: ${result.message}` }],
+    };
+  },
+);
+
+  server.tool(
+    "get_trace_statistics",
+    `Get trace width and via drill size distribution for the board. Returns counts
+grouped by width/drill size, sorted by count descending. Use to identify DRC
+violations (e.g., traces below manufacturer minimum).`,
+    {
+      belowWidth: z.number().optional().describe("If set, only count traces below this width (mm). Useful for finding DRC violations."),
+    },
+    async (args) => {
+      logger.debug("Getting trace statistics");
+      const result = await callKicadScript("get_trace_statistics", args);
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
     },
   );
 
@@ -380,6 +505,63 @@ Example: resize all 0.15mm drill / 0.25mm pad vias to 0.2mm drill / 0.45mm pad:
       return {
         content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
       };
+    },
+  );
+
+  server.tool(
+    "assign_nets_to_layer",
+    `Move all existing traces for specified nets to a target layer. Useful for 2-layer
+boards to organize power on B.Cu and signals on F.Cu.
+Note: This moves EXISTING traces only. Future routing must be done on the correct layer manually.`,
+    {
+      layer: z.string().describe("Target layer name: 'F.Cu' or 'B.Cu'"),
+      nets: z.array(z.string()).describe("Array of net names to move to this layer"),
+    },
+    async (args) => {
+      const result = await callKicadScript("assign_nets_to_layer", args);
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    },
+  );
+
+  server.tool(
+    "set_copper_pour_settings",
+    `Configure fill settings for a copper pour zone. Identify the zone by net name.
+If multiple zones exist on the same net, all are modified.`,
+    {
+      net: z.string().describe("Net name of the copper pour zone (e.g., 'GND')"),
+      clearance: z.number().optional().describe("Zone clearance in mm"),
+      minWidth: z.number().optional().describe("Minimum copper width in zone fill (mm)"),
+      thermalReliefGap: z.number().optional().describe("Thermal relief gap (mm)"),
+      thermalReliefSpokeWidth: z.number().optional().describe("Thermal relief spoke width (mm)"),
+      priority: z.number().optional().describe("Zone fill priority (0 = lowest)"),
+    },
+    async (args) => {
+      const result = await callKicadScript("set_copper_pour_settings", args);
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    },
+  );
+
+  server.tool(
+    "get_unrouted_connections",
+    `List all unrouted connections (ratsnest). Returns pad pairs that need traces.
+Essential for tracking routing progress.`,
+    {
+      net: z.string().optional().describe("Filter by net name. Omit for all nets."),
+      limit: z.number().optional().describe("Maximum entries to return (default: 100)"),
+    },
+    async (args) => {
+      const result = await callKicadScript("get_unrouted_connections", args);
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    },
+  );
+
+  server.tool(
+    "get_board_statistics",
+    "Get board routing statistics: routed vs unrouted count, total trace length by layer, via count by type.",
+    {},
+    async () => {
+      const result = await callKicadScript("get_board_statistics", {});
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
     },
   );
 

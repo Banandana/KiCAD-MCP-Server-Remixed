@@ -121,6 +121,20 @@ export function registerBoardTools(server: McpServer, callKicadScript: CommandFu
   );
 
   // ------------------------------------------------------
+  // Get Board Summary Tool
+  // ------------------------------------------------------
+  server.tool(
+    "get_board_summary",
+    "Get combined board info, design rules, and project info in a single call. Saves multiple round-trips when establishing baseline state.",
+    {},
+    async () => {
+      logger.debug("Getting board summary");
+      const result = await callKicadScript("get_board_summary", {});
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    },
+  );
+
+  // ------------------------------------------------------
   // Get Layer List Tool
   // ------------------------------------------------------
   server.tool(

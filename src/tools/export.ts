@@ -175,6 +175,24 @@ export function registerExportTools(server: McpServer, callKicadScript: CommandF
     }
   );
 
+  // ------------------------------------------------------
+  // Export BOM from Schematic Tool
+  // ------------------------------------------------------
+  server.tool(
+    "export_bom_from_schematic",
+    `Generate a BOM (Bill of Materials) directly from the schematic file, without
+requiring a loaded PCB board. Groups components by value and footprint. Outputs
+JSON with reference list, quantity, value, and footprint for each group.`,
+    {
+      schematicPath: z.string().describe("Path to the schematic file"),
+      format: z.enum(["json", "csv", "mouser"]).optional().describe("Output format: json (default), csv, or mouser (part_number|qty pipe-delimited)"),
+    },
+    async (args) => {
+      const result = await callKicadScript("export_bom_from_schematic", args);
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    },
+  );
+
   // TODO: Python handler not implemented - uncomment when added to command_routes
   // // ------------------------------------------------------
   // // Export Netlist Tool
