@@ -37,7 +37,7 @@ KiCAD files (.kicad_pcb, .kicad_sch, .kicad_pro)
   - `net_analysis.py` — Net-level analysis using union-find graph. `build_net_graph()` builds complete pin→net mapping in O(W+L+P) via union-find with spatial-indexed T-junction detection. Query functions: `get_component_nets`, `get_net_components`, `get_pin_net_name`, `export_netlist_summary`, `validate_component_connections`, `find_shorted_nets`, `find_single_pin_nets`.
   - `wire_connectivity.py` — Exact IU-based wire connectivity tracing. Converts mm→integer units (10,000 IU/mm) for O(1) dict lookups. BFS flood-fill follows wire adjacency + net labels + power symbols. Used by `get_wire_connections` tool.
   - `schematic_analysis.py` — Read-only schematic analysis (908 lines). 4 tools: `find_overlapping_elements` (AABB intersection), `get_elements_in_region` (spatial query), `find_wires_crossing_symbols` (routing mistake detection with real symbol graphics), `get_schematic_view_region` (cropped SVG/PNG export).
-  - `group_analysis.py` — Group-level analysis, layout, and rewiring. `analyze_schematic_group` classifies component roles by tracing nets. `compute_group_layout` positions passives around IC following conventions (decoupling caps below, series elements on connected side, feedback dividers stacked). `apply_group_layout` moves components via text replacement + optional rewire. `rewire_group_orthogonal` redraws wires as orthogonal routes with U-detour avoidance. All content-based (no kicad-skip).
+  - `group_analysis.py` — Group-level analysis, layout, and rewiring (~900 lines). 4 tools, all content-based (no kicad-skip). See "Group layout tools" section below for detailed architecture and debugging guidance.
   - `component.py` — Board-level component operations (via pcbnew). `move_component` supports optional `layer` param for flipping between F.Cu/B.Cu.
   - `routing.py` — Trace routing, via management, netclass creation (via pcbnew). `resize_vias` batch-resizes vias filtered by old drill/diameter. `create_netclass` writes to both SWIG board and `.kicad_pro` for KiCad 9 compatibility.
   - `board.py`, `board/*.py` — Board operations (layers, outline, size, 2D view)
@@ -296,6 +296,10 @@ When adding or modifying a schematic tool, verify:
 25. [ ] TS tool registration uses 4-arg form `server.tool(name, description, schema, handler)` — the description string is required for AI clients to understand the tool's purpose
 26. [ ] All coordinate/dimension params include unit in `.describe()` (e.g., "Position (mm)", "Clearance in mm")
 27. [ ] TS param names match Python `params.get("paramName")` keys exactly — mismatches cause silent data loss
+28. [ ] `add_wire_to_content` called with `([x1,y1], [x2,y2])` not `(x1, y1, x2, y2)` — wrong form causes `'float' object is not subscriptable`
+29. [ ] `auto_add_t_junctions` return value unpacked as `(content, count)` not assigned directly to `content`
+30. [ ] Group layout tools use exact pin coordinates, never `_snap_grid` — components may be off-grid from prior moves
+31. [ ] Atomic operations (apply_group_layout, rewire_group_orthogonal) never delete+recreate what they can shift in place — deletion of shared elements between group and non-group components causes dropped connections
 
 ## Code Patterns
 
@@ -326,6 +330,69 @@ Both `move_region` (~line 3835) and `move_connected` (~line 6157) are implemente
 - **`move_region`**: Block-select-and-move. Moves all items (components, wires, labels, junctions, no-connects) within a bounding box by (dx, dy). Each element type has its own regex-based collection loop. Component blocks shift ALL `(at ...)` positions (symbol + field positions). Wire blocks shift `(xy ...)` coordinates. All edits are collected as `(start, end, new_text)` tuples, sorted reverse by position, then applied.
 - **`move_connected`**: Move-with-smart-stretching. Moves a single component by reference, translates stub wires (pin→label) fully, stretches longer wires to other components. Single read/write cycle, all text-based (no kicad-skip). **Two-pass replacement**: Pass 1 collects and applies component/wire/junction/power/no-connect replacements. Pass 2 finds and shifts labels on the already-modified content (avoids label block ranges interacting with other block ranges). Labels are matched against `all_connected = old_pin_positions | wire_far_endpoints` — includes both pin positions AND wire stub far ends. Steps: (1) get old pin positions via `PinLocator`, (2) trace wires one hop to find far endpoints, (3) collect component block replacement (text-based `(at ...)` shift), wire endpoint shifts, junctions, power symbols, no-connects — apply in reverse, (4) separate label pass on modified content, (5) write once with flush+fsync.
 - **Both handlers require string-aware paren counting** to correctly skip `(lib_symbols)` — pin names like `PA15(JTDI)` contain literal parens that break naive counters, causing `lib_sym_end` to overshoot and placed symbols to be skipped. The local `_find_block_end_str_aware()` / `find_block_end()` helpers handle this.
+
+### Group layout tools (`python/commands/group_analysis.py`)
+
+Four tools for analyzing and laying out circuit groups. All are content-based (no kicad-skip). The intended workflow is: `analyze_schematic_group` → `compute_group_layout` → `apply_group_layout` (which auto-calls `rewire_group_orthogonal`).
+
+- **`analyze_schematic_group`**: Read-only. Given a list of component refs, builds a content-based net graph (reimplements `build_net_graph` without kicad-skip via `_compute_pin_endpoints_from_content` + `_build_group_net_graph`), then classifies roles:
+  - `primary_ic` — component with most pins
+  - `decoupling_cap` — 2-pin cap: one pin on IC net or power rail, other on GND
+  - `bootstrap_cap` — 2-pin cap connecting two IC pins
+  - `feedback_top/bottom` — resistor divider pair sharing a midpoint net connected to IC FB pin
+  - `pullup/pulldown` — resistor from IC pin to power/GND
+  - `series_element` — passive connecting two non-GND nets (inductor, series R)
+  - `test_point` — single-pin or TP-prefixed component
+  - Also identifies: `rails` (input/output/ground nets), `interSectionLabels` (global/hierarchical labels on group nets)
+
+- **`compute_group_layout`**: Read-only. Calls `analyze_schematic_group` internally, then computes target positions:
+  - IC at `anchor` (or stays in place if no anchor)
+  - IC pin classification: `_get_ic_pin_sides` groups pins as left/right/top/bottom relative to IC center
+  - Decoupling caps: horizontal row below IC, centered, `capSpacing` apart (default 5.08mm)
+  - Series elements: placed on the side of their connected IC pin, `seriesOffset` from IC body (default 10.16mm)
+  - Feedback dividers: vertically stacked on output (right) side
+  - Pullup/pulldown: near their connected IC pin side
+  - Test points: at group edges, `testPointOffset` from IC (default 15.24mm)
+  - All spacing configurable via `constraints` parameter
+  - Returns `positions` dict (ref → {x, y}) ready for `apply_group_layout`
+
+- **`apply_group_layout`**: Destructive. Moves components + all attached elements in a **single atomic content pass**:
+  1. Computes per-component (dx, dy) from current → target position
+  2. Gets old pin positions for all group components via `_compute_pin_endpoints_from_content`
+  3. Builds `pin_to_comp` index: maps pin positions → (ref, dx, dy)
+  4. Single pass collects replacements:
+     - **Component blocks**: shift all `(at ...)` by the component's delta
+     - **Power symbols**: if `(at)` matches a group pin, shift by that pin's component delta
+     - **Wires**: for each endpoint, if it matches a group pin, shift by that component's delta. **Never deletes wires** — only stretches. Internal wires become diagonal; rewire cleans them up. External wires (to non-group components) have only their group-side endpoint shifted, preserving the connection.
+     - **Labels**: if `(at)` matches a group pin, shift by that component's delta
+     - **Junctions, no-connects**: same pin-matching shift logic
+  5. All replacements applied in reverse position order on one content string
+  6. Writes once via `_write_schematic` (atomic temp-file-then-rename)
+  7. Optionally calls `rewire_group_orthogonal` to clean up stretched wires
+
+- **`rewire_group_orthogonal`**: Destructive. Deletes wires between group pins and redraws as orthogonal routes:
+  1. Gets pin positions via `_compute_pin_endpoints_from_content`
+  2. Finds wire chains using union-find: groups wire segments into chains by shared endpoints
+  3. For each chain, finds terminal endpoints and checks if 2+ are at group pins
+  4. Chains touching label positions are skipped by default (set `includeLabeledWires=true` to include them)
+  5. Deletes identified internal wires, records connected pin pairs
+  6. For each pin pair, computes route via `_compute_avoiding_route`:
+     - Tries both L-shaped routes (horizontal-first, vertical-first)
+     - Checks ALL segments against ALL component bboxes
+     - If both L-routes cross, tries 4 U-shaped detours (above/below/left/right with 2.54mm clearance)
+     - Picks shortest crossing-free detour; falls back to L-route if all cross
+  7. Uses exact pin coordinates (no grid snapping) — components may be off-grid from prior moves
+  8. Auto-adds T-junction dots via `auto_add_t_junctions`
+  9. Validates with `find_wires_crossing_symbols`
+
+**Debugging group layout issues:**
+- **ERC errors after apply_group_layout**: Check `~/.kicad-mcp/logs/kicad_interface.log` for `_match_pin` failures. The pin matching uses 0.5mm tolerance on rounded coordinates — off-grid components from prior moves can cause mismatches. Run `kicad-cli sch erc` as ground truth.
+- **Wires to non-group components disconnected**: `apply_group_layout` should stretch (not delete) any wire with only one endpoint at a group pin. If wires are being deleted, check if the other endpoint is accidentally within 0.5mm of a group pin.
+- **rewire finds 0 wires to delete**: Wire chains between group pins may all go through labels. Use `includeLabeledWires=true` to include them. Or the wires may be multi-segment chains through junctions — the union-find logic should handle this but check `_parse_wire_blocks` output.
+- **Route avoidance creates crossings**: Component bboxes are estimated from pin positions + 1.5mm margin. If the actual symbol body is larger, the bbox underestimates and routes clip the body. Consider increasing margin in `_compute_component_bboxes`.
+- **`add_wire_to_content` signature**: Takes `(content, start_point=[x,y], end_point=[x,y])`, NOT `(content, x1, y1, x2, y2)`.
+- **`auto_add_t_junctions` returns tuple**: Returns `(content, count)`, NOT just `content`. Always unpack.
+- **`_write_schematic` is atomic**: Uses temp file + `os.replace()`. If content is wrong type, raises `TypeError` before touching any files. Original file is never truncated.
 
 ### Board operations
 - Use `pcbnew` SWIG API directly
@@ -426,6 +493,12 @@ These are bugs that were actually encountered and fixed. If you see these sympto
 - **Deleted outline/components not saved**: `board.Remove()` wasn't followed by `board.SetModified()`, so the board wasn't marked dirty. Fixed in `delete_board_outline` and `delete_component`.
 - **kicad-skip fails with "'ParsedValue' object has no attribute 'symbol'"**: `SchematicManager.load_schematic()` (which wraps `skip.Schematic()`) fails on some KiCad 9 schematics — catches the exception and returns `None`, producing unhelpful "Failed to load schematic" errors. Fixed for `list_schematic_components`, `batch_get_schematic_pin_locations`, and `PinLocator` (all 4 methods) by replacing kicad-skip with regex-based `parse_placed_symbols_from_content()`. **~24 other handlers still use `SchematicManager.load_schematic()`** and are vulnerable to the same failure. When a handler fails with "Failed to load schematic", migrate it to use `parse_placed_symbols_from_content()` from `pin_locator.py`.
 - **STM32 / JTAG pins with parens in names break paren counting**: Pin names like `PA15(JTDI)` and `PB4(NJTRST)` contain literal `()` inside quoted strings. All balanced-paren counters must be string-aware (skip chars inside `"..."`) or they lose count and fail on large MCU symbols. Fixed in `_extract_symbol_block`, `inject_symbol_into_schematic`, `_iter_top_level_items` (dynamic_symbol_loader.py), `_find_matching_paren` (pin_locator.py), and 5 `find_matching_paren` instances (kicad_interface.py). **When adding new paren-counting loops, always include string skipping.**
+- **add_wire_to_content called with wrong args**: Signature is `(content, start_point=[x,y], end_point=[x,y])`, NOT `(content, x1, y1, x2, y2)`. Passing 4 floats causes `'float' object is not subscriptable`.
+- **auto_add_t_junctions returns tuple not string**: Returns `(content, count)`. Assigning directly to `content` then passing to `_write_schematic` causes `write() argument must be str, not tuple`. Always unpack: `content, _count = auto_add_t_junctions(...)`.
+- **_write_schematic truncated schematic to 0 bytes**: Old implementation opened with `"w"` (truncating immediately) then crashed on wrong content type. Fixed — now uses atomic temp-file-then-rename with type guard. Original file is never touched on failure.
+- **apply_group_layout sequential move_connected broke shared wires**: Moving component A stretched a shared wire, then component B couldn't find it at old position. Fixed — now uses single atomic content pass with per-component deltas instead of sequential move_connected calls.
+- **apply_group_layout deleted wires to non-group components**: Wires with both endpoints matching group pins were deleted, but junction points near group pins caused false matches. Fixed — wires are now stretched (endpoints shifted), never deleted. Internal diagonal wires are cleaned up by rewire afterward.
+- **rewire_group_orthogonal wire endpoints at wrong coordinates**: Grid-snapping (`_snap_grid`) moved wire endpoints to 1.27mm grid while pins were at off-grid positions from prior moves. Fixed — uses exact pin coordinates from PinLocator, no grid snapping.
 
 ## Important Notes
 
@@ -569,3 +642,7 @@ These are known issues that haven't been fixed yet. Keep them in mind when worki
 - **~23 handlers still depend on kicad-skip `SchematicManager.load_schematic()`**: kicad-skip fails on some KiCad 9 schematics. `list_schematic_components`, `PinLocator`, `move_connected`, and `get_wire_connections` have been migrated away from kicad-skip. Remaining handlers (list_schematic_nets, get_net_connectivity, validate_wire_connections, find_orphan_items, check_schematic_overlaps, get_schematic_layout, annotate_schematic, etc.) should be migrated as they fail. The regex parser is in `pin_locator.py` and can be imported.
 - **`get_wire_connections` requires kicad-skip for initial load**: `wire_connectivity.py` uses exact IU matching internally but its entry point still receives a `schematic` object loaded via `SchematicManager.load_schematic()`. Should be migrated to direct file parsing.
 - **`schematic_analysis.py` uses sexpdata**: The upstream schematic analysis module uses `sexpdata` for S-expression parsing. This works but may have edge cases with KiCad 9+ files. The module handles symbol bounding boxes via real graphics parsing which is architecturally superior to pin-only estimation.
+- **`apply_group_layout` pin matching tolerance may be too loose/tight**: Uses 0.5mm tolerance with `round(x, 2)` keys. In dense schematics, unrelated wire endpoints can accidentally match group pins. In off-grid schematics, legitimate endpoints can be missed. The tolerance should match what `move_connected` uses (also 0.5mm) but this is a known fragility.
+- **`rewire_group_orthogonal` only handles direct pin-to-pin wire chains**: Wires that connect group components through labels (e.g., +5V rail label connecting L1 to U11) are skipped by default. The `includeLabeledWires` option catches these but also catches inter-section labels that should be preserved. Needs smarter classification: intra-group labels (both sides connect to group components only) vs inter-section labels (one side connects outside the group).
+- **Component bbox estimation uses pin positions + 1.5mm margin**: The `_compute_component_bboxes` function in `group_analysis.py` approximates component body size from pin extremes. ICs with large bodies relative to pin spacing (e.g., QFN packages) will have underestimated bboxes, causing route avoidance to fail. Should use `schematic_analysis.py`'s real graphics parsing for accurate bboxes.
+- **`compute_group_layout` role-to-side mapping requires IC pin names**: The layout algorithm maps passives to IC sides based on which IC pin they connect to. If the analysis returns a net name instead of a `"U10/VIN"` formatted pin reference (e.g., when the connection goes through labels instead of direct wires), the side classification defaults to "right". This can cluster all passives on one side.
