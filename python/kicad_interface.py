@@ -6262,9 +6262,9 @@ class KiCADInterface:
                 if p2_at_pin:
                     wire_far_endpoints.add(p1)
 
-            # Points to move = pin positions + far endpoints of wires touching pins
-            # (far endpoints have labels/junctions we should also move)
-            label_junction_move_points = wire_far_endpoints - old_pin_positions
+            # All connected points: pin positions + far endpoints of wires touching pins
+            # Labels, junctions, power symbols, no-connects at any of these should move
+            all_connected = old_pin_positions | wire_far_endpoints
 
             # 4. Collect ALL replacements on the same content string (single read/write cycle).
             # No kicad-skip — all text-based to avoid file reformatting issues.
@@ -6318,8 +6318,8 @@ class KiCADInterface:
                 wp2 = (float(xys[-1][0]), float(xys[-1][1]))
                 p1_at_pin = any(abs(wp1[0] - px) < eps and abs(wp1[1] - py) < eps for px, py in old_pin_positions)
                 p2_at_pin = any(abs(wp2[0] - px) < eps and abs(wp2[1] - py) < eps for px, py in old_pin_positions)
-                p1_at_label = any(abs(wp1[0] - fp[0]) < eps and abs(wp1[1] - fp[1]) < eps for fp in label_junction_move_points)
-                p2_at_label = any(abs(wp2[0] - fp[0]) < eps and abs(wp2[1] - fp[1]) < eps for fp in label_junction_move_points)
+                p1_at_label = any(abs(wp1[0] - fp[0]) < eps and abs(wp1[1] - fp[1]) < eps for fp in all_connected)
+                p2_at_label = any(abs(wp2[0] - fp[0]) < eps and abs(wp2[1] - fp[1]) < eps for fp in all_connected)
 
                 new_block = block
                 modified = False
@@ -6360,36 +6360,11 @@ class KiCADInterface:
                 if modified:
                     replacements.append((wm.start(), block_end, new_block))
 
-            # 4c. Move labels at far endpoints of connected wires
-            # Replace the entire label block (shifting ALL (at ...) positions
-            # including Intersheetrefs property) to avoid content.find mismatches
-            for lt in ["label", "global_label", "hierarchical_label"]:
-                lp = re.compile(
-                    rf'\({lt}\s+"([^"]*)"(?:\s+\(shape\s+[^)]*\))?\s+\(at\s+([\d.e+-]+)\s+([\d.e+-]+)'
-                )
-                for m in lp.finditer(content):
-                    lx, ly = float(m.group(2)), float(m.group(3))
-                    if any(abs(lx - fp[0]) < eps and abs(ly - fp[1]) < eps for fp in label_junction_move_points):
-                        pos = m.start()
-                        end = _find_block_end_str_aware(content, pos)
-                        block = content[pos:end]
-                        def _shift_label_at(match, _dx=dx, _dy=dy):
-                            ax = float(match.group(1)) + _dx
-                            ay = float(match.group(2)) + _dy
-                            rest = match.group(3)
-                            return f"(at {_fmt(ax)} {_fmt(ay)}{rest}"
-                        new_block = re.sub(
-                            r'\(at\s+([\d.e+-]+)\s+([\d.e+-]+)([\s\d.e+-]*\))',
-                            _shift_label_at, block
-                        )
-                        replacements.append((pos, end, new_block))
-                        moved_items["labels"] += 1
-
-            # 4d. Move junctions at far endpoints
+            # 4c. Collect junctions at far endpoints (same pass as other replacements)
             junc_pat = re.compile(r'\(junction\s+\(at\s+([\d.e+-]+)\s+([\d.e+-]+)\)')
             for m in junc_pat.finditer(content):
                 jx, jy = float(m.group(1)), float(m.group(2))
-                if any(abs(jx - fp[0]) < eps and abs(jy - fp[1]) < eps for fp in label_junction_move_points):
+                if any(abs(jx - fp[0]) < eps and abs(jy - fp[1]) < eps for fp in all_connected):
                     pos = m.start()
                     end = _find_block_end_str_aware(content, pos)
                     block = content[pos:end]
@@ -6401,29 +6376,23 @@ class KiCADInterface:
                     replacements.append((pos, end, new_block))
                     moved_items["junctions"] += 1
 
-            # 4e. Move power symbols (#PWR) at connected points
-            # Power symbols sit at pin endpoints or wire far endpoints
-            all_connected = old_pin_positions | wire_far_endpoints
-            # Re-use lib_sym_start/lib_sym_end and sym_pat from step 4a
+            # 4d. Move power symbols (#PWR) at connected points
+            # Re-use all_connected, lib_sym_start/lib_sym_end, and sym_pat from above
             for m in sym_pat.finditer(content):
                 pos = m.start()
                 if lib_sym_start >= 0 and lib_sym_start <= pos < lib_sym_end:
                     continue
                 lib_id = m.group(1)
-                # Only move power symbols (lib_id starts with "power:")
                 if not lib_id.startswith("power:"):
                     continue
                 end = _find_block_end_str_aware(content, pos)
                 block = content[pos:end]
-                # Get symbol position (first (at ...))
                 at_m = re.search(r'\(at\s+([\d.e+-]+)\s+([\d.e+-]+)', block)
                 if not at_m:
                     continue
                 sx, sy = float(at_m.group(1)), float(at_m.group(2))
                 if not any(abs(sx - cp[0]) < eps and abs(sy - cp[1]) < eps for cp in all_connected):
                     continue
-                # Shift all (at ...) in this symbol block (position + fields)
-                from commands.sexp_writer import _fmt
                 def _shift_sym_at(match, _dx=dx, _dy=dy):
                     ax = float(match.group(1)) + _dx
                     ay = float(match.group(2)) + _dy
@@ -6436,13 +6405,12 @@ class KiCADInterface:
                 replacements.append((pos, end, new_block))
                 moved_items["power_symbols"] += 1
 
-            # 4f. Move no-connects at connected points
+            # 4e. Move no-connects at connected points
             nc_pat = re.compile(r'\(no_connect\s+\(at\s+([\d.e+-]+)\s+([\d.e+-]+)\)')
             for m in nc_pat.finditer(content):
                 nx, ny = float(m.group(1)), float(m.group(2))
                 if not any(abs(nx - cp[0]) < eps and abs(ny - cp[1]) < eps for cp in all_connected):
                     continue
-                from commands.sexp_writer import _fmt
                 nc_pos = m.start()
                 nc_end = _find_block_end_str_aware(content, nc_pos)
                 nc_block = content[nc_pos:nc_end]
@@ -6454,9 +6422,40 @@ class KiCADInterface:
                 replacements.append((nc_pos, nc_end, new_nc))
                 moved_items["no_connects"] += 1
 
-            # Apply all replacements in reverse order
+            # Apply component/wire/junction/power/no-connect replacements in reverse order
             replacements.sort(key=lambda r: r[0], reverse=True)
             for start, end, new_text in replacements:
+                content = content[:start] + new_text + content[end:]
+
+            # 4f. Move labels in a SEPARATE pass on the already-modified content.
+            # Labels are processed after all other replacements to avoid any
+            # interaction between label block ranges and component/wire block ranges.
+            label_replacements = []
+            for lt in ["label", "global_label", "hierarchical_label"]:
+                lp = re.compile(
+                    rf'\({lt}\s+"([^"]*)"(?:\s+\(shape\s+[^)]*\))?\s+\(at\s+([\d.e+-]+)\s+([\d.e+-]+)'
+                )
+                for m in lp.finditer(content):
+                    lx, ly = float(m.group(2)), float(m.group(3))
+                    if any(abs(lx - fp[0]) < eps and abs(ly - fp[1]) < eps for fp in all_connected):
+                        pos = m.start()
+                        end = _find_block_end_str_aware(content, pos)
+                        block = content[pos:end]
+                        def _shift_label_at(match, _dx=dx, _dy=dy):
+                            ax = float(match.group(1)) + _dx
+                            ay = float(match.group(2)) + _dy
+                            rest = match.group(3)
+                            return f"(at {_fmt(ax)} {_fmt(ay)}{rest}"
+                        new_block = re.sub(
+                            r'\(at\s+([\d.e+-]+)\s+([\d.e+-]+)([\s\d.e+-]*\))',
+                            _shift_label_at, block
+                        )
+                        label_replacements.append((pos, end, new_block))
+                        moved_items["labels"] += 1
+
+            # Apply label replacements in reverse order on the modified content
+            label_replacements.sort(key=lambda r: r[0], reverse=True)
+            for start, end, new_text in label_replacements:
                 content = content[:start] + new_text + content[end:]
 
             with open(schematic_path, "w", encoding="utf-8", newline="\n") as f:
