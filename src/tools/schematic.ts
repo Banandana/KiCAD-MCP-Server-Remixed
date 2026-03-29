@@ -1963,4 +1963,66 @@ Example: { schematicPath: "...", labels: [{ netName: "NC_U9", position: { x: 190
       };
     }
   );
+
+  // ── Schematic analysis tools ──────────────────────────────────────
+
+  server.tool(
+    "get_schematic_view_region",
+    "Export a cropped region of the schematic as a PNG or SVG image. Coordinates in schematic mm.",
+    {
+      schematicPath: z.string().describe("Path to the schematic file"),
+      x1: z.number().describe("Left boundary in mm"),
+      y1: z.number().describe("Top boundary in mm"),
+      x2: z.number().describe("Right boundary in mm"),
+      y2: z.number().describe("Bottom boundary in mm"),
+      format: z.enum(["png", "svg"]).optional().describe("Output format (default: png)"),
+      width: z.number().optional().describe("Output width in pixels (default: 800)"),
+      height: z.number().optional().describe("Output height in pixels (default: 600)"),
+    },
+    async (args) => {
+      const result = await callKicadScript("get_schematic_view_region", args);
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    },
+  );
+
+  server.tool(
+    "find_overlapping_elements",
+    "Detect spatially overlapping symbols, wires, and labels in a schematic using AABB intersection.",
+    {
+      schematicPath: z.string().describe("Path to the schematic file"),
+      tolerance: z.number().optional().describe("Overlap tolerance in mm (default: 0.5)"),
+    },
+    async (args) => {
+      const result = await callKicadScript("find_overlapping_elements", args);
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    },
+  );
+
+  server.tool(
+    "get_elements_in_region",
+    "List all symbols, wires, and labels within a rectangular region of the schematic.",
+    {
+      schematicPath: z.string().describe("Path to the schematic file"),
+      x1: z.number().describe("Left boundary in mm"),
+      y1: z.number().describe("Top boundary in mm"),
+      x2: z.number().describe("Right boundary in mm"),
+      y2: z.number().describe("Bottom boundary in mm"),
+    },
+    async (args) => {
+      const result = await callKicadScript("get_elements_in_region", args);
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    },
+  );
+
+  server.tool(
+    "find_wires_crossing_symbols",
+    "Find wires that cross over component symbol bodies (routing mistakes). Uses real symbol graphics for accurate bounding boxes.",
+    {
+      schematicPath: z.string().describe("Path to the schematic file"),
+    },
+    async (args) => {
+      const result = await callKicadScript("find_wires_crossing_symbols", args);
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    },
+  );
 }
