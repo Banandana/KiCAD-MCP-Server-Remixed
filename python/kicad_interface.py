@@ -493,6 +493,8 @@ class KiCADInterface:
             "find_overlapping_elements": self._handle_find_overlapping_elements,
             "get_elements_in_region": self._handle_get_elements_in_region,
             "find_wires_crossing_symbols": self._handle_find_wires_crossing_symbols,
+            "analyze_schematic_group": self._handle_analyze_schematic_group,
+            "rewire_group_orthogonal": self._handle_rewire_group_orthogonal,
             # New batch/power tools
             "add_power_symbol": self._handle_add_power_symbol,
             "batch_connect_to_net": self._handle_batch_connect_to_net,
@@ -7924,6 +7926,47 @@ class KiCADInterface:
             return {"success": True, "collisions": result, "count": len(result), "message": f"Found {len(result)} wire(s) crossing symbols"}
         except Exception as e:
             logger.error(f"Error checking wire collisions: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e)}
+
+    def _handle_analyze_schematic_group(self, params):
+        """Analyze a group of components and classify their roles."""
+        logger.info("Analyzing schematic group")
+        try:
+            from commands.group_analysis import analyze_schematic_group
+
+            schematic_path = params.get("schematicPath")
+            components = params.get("components", [])
+            if not schematic_path:
+                return {"success": False, "message": "schematicPath is required"}
+            if not components or not isinstance(components, list):
+                return {"success": False, "message": "components must be a non-empty array of reference designators"}
+
+            return analyze_schematic_group(schematic_path, components, self.pin_locator)
+        except Exception as e:
+            logger.error(f"Error analyzing schematic group: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e)}
+
+    def _handle_rewire_group_orthogonal(self, params):
+        """Delete diagonal wires between group components and redraw orthogonally."""
+        logger.info("Rewiring group orthogonally")
+        try:
+            from commands.group_analysis import rewire_group_orthogonal
+
+            schematic_path = params.get("schematicPath")
+            components = params.get("components", [])
+            routing_style = params.get("routingStyle", "auto")
+            if not schematic_path:
+                return {"success": False, "message": "schematicPath is required"}
+            if not components or not isinstance(components, list):
+                return {"success": False, "message": "components must be a non-empty array of reference designators"}
+
+            return rewire_group_orthogonal(schematic_path, components, self.pin_locator, routing_style)
+        except Exception as e:
+            logger.error(f"Error rewiring group: {e}")
             import traceback
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}

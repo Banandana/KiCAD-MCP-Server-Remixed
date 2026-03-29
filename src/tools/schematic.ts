@@ -2025,4 +2025,48 @@ Example: { schematicPath: "...", labels: [{ netName: "NC_U9", position: { x: 190
       return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
     },
   );
+
+  // ── Group analysis and rewiring ───────────────────────────────────
+
+  server.tool(
+    "analyze_schematic_group",
+    `Analyze a group of components: identify the primary IC, classify each component's role
+(decoupling cap, bypass cap, bootstrap cap, feedback divider, series element, pullup/pulldown,
+test point), identify power rails, and list inter-section labels. Useful for understanding
+circuit topology before layout or documentation.`,
+    {
+      schematicPath: z.string().describe("Path to the schematic file"),
+      components: z.array(z.string()).describe(
+        'List of component references to analyze (e.g., ["U1", "C1", "C2", "R1", "R2", "L1"])'
+      ),
+    },
+    async (args) => {
+      const result = await callKicadScript("analyze_schematic_group", args);
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    },
+  );
+
+  server.tool(
+    "rewire_group_orthogonal",
+    `Delete all direct wires between listed components and redraw with clean L-shaped orthogonal
+routes. Only affects wires where BOTH endpoints are at pins of listed components — label-connected
+wires and external connections are preserved. Validates result for wire-crossing-symbol collisions.
+Use after move_connected or manual component repositioning to fix diagonal wires.`,
+    {
+      schematicPath: z.string().describe("Path to the schematic file"),
+      components: z.array(z.string()).describe(
+        'List of component references to rewire (e.g., ["U1", "C1", "R1", "R2"])'
+      ),
+      routingStyle: z
+        .enum(["horizontal_first", "vertical_first", "auto"])
+        .optional()
+        .describe(
+          "L-route style: horizontal segment first, vertical first, or auto-select to avoid crossing component bodies (default: auto)"
+        ),
+    },
+    async (args) => {
+      const result = await callKicadScript("rewire_group_orthogonal", args);
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    },
+  );
 }
