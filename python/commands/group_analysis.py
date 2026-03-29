@@ -875,7 +875,10 @@ def apply_group_layout(schematic_path, positions, pin_locator, kicad_interface=N
                         )
                         replacements.append((pos, end, new_block))
 
-    # 2. Handle wires: delete internal, stretch external
+    # 2. Handle wires: shift any endpoint that's at a group pin position.
+    # Don't delete wires — just stretch them. rewire_group_orthogonal
+    # will clean up the internal (diagonal/stretched) wires afterward.
+    # This preserves external connections (to non-group components).
     wire_pat = re.compile(r'\(wire\b')
     xy_pat = re.compile(r'\(xy\s+([\d.e+-]+)\s+([\d.e+-]+)\)')
     for wm in wire_pat.finditer(content):
@@ -891,35 +894,30 @@ def apply_group_layout(schematic_path, positions, pin_locator, kicad_interface=N
         match_a = _match_pin(x1, y1)
         match_b = _match_pin(x2, y2)
 
-        if match_a and match_b:
-            # Both endpoints at group pins — delete (rewire will recreate)
-            # Include trailing whitespace
-            trail_end = wend
-            while trail_end < len(content) and content[trail_end] in (" ", "\t", "\n", "\r"):
-                trail_end += 1
-            replacements.append((wpos, trail_end, ""))
-        elif match_a:
-            # First endpoint at a group pin — shift it
-            _, dx, dy = match_a
-            if abs(dx) > 0.01 or abs(dy) > 0.01:
-                new_block = block.replace(
+        if not match_a and not match_b:
+            continue  # Neither endpoint at a group pin — untouched
+
+        new_block = block
+        if match_a:
+            _, dx_a, dy_a = match_a
+            if abs(dx_a) > 0.01 or abs(dy_a) > 0.01:
+                new_block = new_block.replace(
                     f"(xy {xys[0][0]} {xys[0][1]})",
-                    f"(xy {_fmt(x1 + dx)} {_fmt(y1 + dy)})",
+                    f"(xy {_fmt(x1 + dx_a)} {_fmt(y1 + dy_a)})",
                     1
                 )
-                replacements.append((wpos, wend, new_block))
-        elif match_b:
-            # Second endpoint at a group pin — shift it
-            _, dx, dy = match_b
-            if abs(dx) > 0.01 or abs(dy) > 0.01:
-                # Replace last occurrence
-                rev = block[::-1]
+        if match_b:
+            _, dx_b, dy_b = match_b
+            if abs(dx_b) > 0.01 or abs(dy_b) > 0.01:
+                # Replace last occurrence (reverse trick)
+                rev = new_block[::-1]
                 old_xy = f"(xy {xys[-1][0]} {xys[-1][1]})"
-                new_xy = f"(xy {_fmt(x2 + dx)} {_fmt(y2 + dy)})"
-                rev_old = old_xy[::-1]
-                rev_new = new_xy[::-1]
-                new_block = rev.replace(rev_old, rev_new, 1)[::-1]
-                replacements.append((wpos, wend, new_block))
+                new_xy = f"(xy {_fmt(x2 + dx_b)} {_fmt(y2 + dy_b)})"
+                rev = rev.replace(old_xy[::-1], new_xy[::-1], 1)
+                new_block = rev[::-1]
+
+        if new_block != block:
+            replacements.append((wpos, wend, new_block))
 
     # 3. Move labels at old pin positions
     for lt in ["label", "global_label", "hierarchical_label"]:
