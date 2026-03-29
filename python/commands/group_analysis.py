@@ -633,7 +633,7 @@ def rewire_group_orthogonal(schematic_path, components, pin_locator, routing_sty
             added_count += 2
 
     # Step 6: Auto-add T-junction dots at new wire intersections
-    content = auto_add_t_junctions(content, new_endpoints)
+    content, _junc_count = auto_add_t_junctions(content, new_endpoints)
 
     # Step 7: Write
     _write_schematic(sch_path, content)
