@@ -6371,6 +6371,8 @@ class KiCADInterface:
                     replacements.append((wm.start(), block_end, new_block))
 
             # 4c. Move labels at far endpoints of connected wires
+            # Replace the entire label block (shifting ALL (at ...) positions
+            # including Intersheetrefs property) to avoid content.find mismatches
             for lt in ["label", "global_label", "hierarchical_label"]:
                 lp = re.compile(
                     rf'\({lt}\s+"([^"]*)"(?:\s+\(shape\s+[^)]*\))?\s+\(at\s+([\d.e+-]+)\s+([\d.e+-]+)'
@@ -6378,26 +6380,36 @@ class KiCADInterface:
                 for m in lp.finditer(content):
                     lx, ly = float(m.group(2)), float(m.group(3))
                     if any(abs(lx - fp[0]) < eps and abs(ly - fp[1]) < eps for fp in label_junction_move_points):
-                        from commands.sexp_writer import _fmt
-                        old_at = f"(at {m.group(2)} {m.group(3)}"
-                        new_at = f"(at {_fmt(lx + dx)} {_fmt(ly + dy)}"
-                        at_pos = content.find(old_at, m.start())
-                        if at_pos >= 0:
-                            replacements.append((at_pos, at_pos + len(old_at), new_at))
-                            moved_items["labels"] += 1
+                        pos = m.start()
+                        end = _find_block_end_str_aware(content, pos)
+                        block = content[pos:end]
+                        def _shift_label_at(match, _dx=dx, _dy=dy):
+                            ax = float(match.group(1)) + _dx
+                            ay = float(match.group(2)) + _dy
+                            rest = match.group(3)
+                            return f"(at {_fmt(ax)} {_fmt(ay)}{rest}"
+                        new_block = re.sub(
+                            r'\(at\s+([\d.e+-]+)\s+([\d.e+-]+)([\s\d.e+-]*\))',
+                            _shift_label_at, block
+                        )
+                        replacements.append((pos, end, new_block))
+                        moved_items["labels"] += 1
 
             # 4d. Move junctions at far endpoints
             junc_pat = re.compile(r'\(junction\s+\(at\s+([\d.e+-]+)\s+([\d.e+-]+)\)')
             for m in junc_pat.finditer(content):
                 jx, jy = float(m.group(1)), float(m.group(2))
                 if any(abs(jx - fp[0]) < eps and abs(jy - fp[1]) < eps for fp in label_junction_move_points):
-                    from commands.sexp_writer import _fmt
-                    old_at = f"(at {m.group(1)} {m.group(2)})"
-                    new_at = f"(at {_fmt(jx + dx)} {_fmt(jy + dy)})"
-                    at_pos = content.find(old_at, m.start())
-                    if at_pos >= 0:
-                        replacements.append((at_pos, at_pos + len(old_at), new_at))
-                        moved_items["junctions"] += 1
+                    pos = m.start()
+                    end = _find_block_end_str_aware(content, pos)
+                    block = content[pos:end]
+                    new_block = re.sub(
+                        r'\(at\s+([\d.e+-]+)\s+([\d.e+-]+)\)',
+                        lambda match: f"(at {_fmt(float(match.group(1)) + dx)} {_fmt(float(match.group(2)) + dy)})",
+                        block
+                    )
+                    replacements.append((pos, end, new_block))
+                    moved_items["junctions"] += 1
 
             # 4e. Move power symbols (#PWR) at connected points
             # Power symbols sit at pin endpoints or wire far endpoints
