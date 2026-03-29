@@ -675,8 +675,10 @@ def rewire_group_orthogonal(schematic_path, components, pin_locator, routing_sty
         if not pos_a or not pos_b:
             continue
 
-        x1, y1 = _snap_grid(pos_a[0]), _snap_grid(pos_a[1])
-        x2, y2 = _snap_grid(pos_b[0]), _snap_grid(pos_b[1])
+        # Use exact pin coordinates — do NOT snap to grid.
+        # Components may be at off-grid positions from prior moves.
+        x1, y1 = round(pos_a[0], 4), round(pos_a[1], 4)
+        x2, y2 = round(pos_b[0], 4), round(pos_b[1], 4)
 
         if abs(x1 - x2) < 0.01 or abs(y1 - y2) < 0.01:
             # Colinear — single straight wire
