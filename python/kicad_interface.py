@@ -3356,12 +3356,12 @@ class KiCADInterface:
         """Return pin endpoint coordinates for multiple components in one call.
 
         Reads the schematic once and computes pin positions for all requested
-        references using cached pin definitions.
+        references using regex-based parsing and cached pin definitions.
         """
         logger.info("Batch getting schematic pin locations")
         try:
             from pathlib import Path
-            from commands.pin_locator import PinLocator
+            from commands.pin_locator import PinLocator, parse_placed_symbols_from_content
             import math
 
             schematic_path = params.get("schematicPath")
@@ -3373,43 +3373,40 @@ class KiCADInterface:
                 return {"success": False, "message": "references array is required"}
 
             sch_file = Path(schematic_path)
-            schematic = SchematicManager.load_schematic(schematic_path)
-            if not schematic:
-                return {"success": False, "message": "Failed to load schematic"}
+            if not sch_file.exists():
+                return {"success": False, "message": f"Schematic not found: {schematic_path}"}
+
+            # Use regex-based parsing instead of kicad-skip
+            with open(schematic_path, "r", encoding="utf-8") as f:
+                content = f.read()
+            symbols = parse_placed_symbols_from_content(content)
 
             locator = self.pin_locator
             ref_set = set(references)
             results = {}
 
-            for symbol in schematic.symbol:
-                if not hasattr(symbol.property, "Reference"):
-                    continue
-                ref = symbol.property.Reference.value
+            for sym in symbols:
+                ref = sym["reference"]
                 if ref not in ref_set:
                     continue
 
-                lib_id = symbol.lib_id.value if hasattr(symbol, "lib_id") else ""
+                lib_id = sym["lib_id"]
                 if not lib_id:
                     results[ref] = {"error": "no lib_id"}
                     continue
 
-                position = symbol.at.value if hasattr(symbol, "at") else [0, 0, 0]
-                sym_x = float(position[0])
-                sym_y = float(position[1])
-                sym_rot = float(position[2]) if len(position) > 2 else 0.0
+                sym_x = sym["x"]
+                sym_y = sym["y"]
+                sym_rot = sym["rotation"]
 
                 pins_def = locator.get_symbol_pins(sch_file, lib_id)
                 if not pins_def:
                     results[ref] = {"error": "no pin definitions"}
                     continue
 
-                # Extract mirror transforms
-                mirror_x = False
-                mirror_y = False
-                if hasattr(symbol, "mirror"):
-                    mirror_val = str(symbol.mirror.value) if hasattr(symbol.mirror, 'value') else str(symbol.mirror)
-                    mirror_x = "x" in mirror_val
-                    mirror_y = "y" in mirror_val
+                # Mirror transforms from regex-parsed symbol data
+                mirror_x = sym["mirror_x"]
+                mirror_y = sym["mirror_y"]
 
                 pins = {}
                 for pin_num, pin_data in pins_def.items():
