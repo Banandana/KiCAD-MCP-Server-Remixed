@@ -35,8 +35,10 @@ KiCAD files (.kicad_pcb, .kicad_sch, .kicad_pro)
   - `pin_locator.py` — `PinLocator` (pin position discovery via S-expr parsing, handles rotation + mirror)
   - `sexp_writer.py` — Text-based insertion/deletion for .kicad_sch files (wires, labels, junctions, no-connects, wire splitting). All writes use `f.flush()` + `os.fsync()`. Has `_to_content`/`_from_content` variants for all operations including `add_label_to_content`, `add_polyline_wire_to_content`, `split_wire_at_point_in_content`, `delete_no_connect_from_content`. **Wire placement (`add_wire`, `add_polyline_wire`) now auto-detects T-junctions and adds junction dots** via `auto_add_t_junctions()`. Also has `_parse_wire_segments()`, `_parse_existing_junctions()`, and `_point_on_wire_mid()` helpers for T-junction spatial analysis.
   - `net_analysis.py` — Net-level analysis using union-find graph. `build_net_graph()` builds complete pin→net mapping in O(W+L+P) via union-find with spatial-indexed T-junction detection. Query functions: `get_component_nets`, `get_net_components`, `get_pin_net_name`, `export_netlist_summary`, `validate_component_connections`, `find_shorted_nets`, `find_single_pin_nets`.
-  - `component.py` — Board-level component operations (via pcbnew)
-  - `routing.py` — Trace routing, via management, netclass creation (via pcbnew). `resize_vias` batch-resizes vias filtered by old drill/diameter.
+  - `wire_connectivity.py` — Exact IU-based wire connectivity tracing. Converts mm→integer units (10,000 IU/mm) for O(1) dict lookups. BFS flood-fill follows wire adjacency + net labels + power symbols. Used by `get_wire_connections` tool.
+  - `schematic_analysis.py` — Read-only schematic analysis (908 lines). 4 tools: `find_overlapping_elements` (AABB intersection), `get_elements_in_region` (spatial query), `find_wires_crossing_symbols` (routing mistake detection with real symbol graphics), `get_schematic_view_region` (cropped SVG/PNG export).
+  - `component.py` — Board-level component operations (via pcbnew). `move_component` supports optional `layer` param for flipping between F.Cu/B.Cu.
+  - `routing.py` — Trace routing, via management, netclass creation (via pcbnew). `resize_vias` batch-resizes vias filtered by old drill/diameter. `create_netclass` writes to both SWIG board and `.kicad_pro` for KiCad 9 compatibility.
   - `board.py`, `board/*.py` — Board operations (layers, outline, size, 2D view)
   - `project.py` — Project creation/management
   - `library.py`, `library_schematic.py`, `library_symbol.py` — Library operations
@@ -44,10 +46,12 @@ KiCAD files (.kicad_pcb, .kicad_sch, .kicad_pro)
   - `footprint.py` — Footprint operations
   - `export.py` — Export (Gerber, PDF, SVG, BOM, 3D, etc.)
   - `design_rules.py` — DRC rules
-  - `jlcpcb.py`, `jlcpcb_parts.py`, `jlcsearch.py` — JLCPCB integration
+  - `jlcpcb.py`, `jlcpcb_parts.py`, `jlcsearch.py` — JLCPCB integration. FTS search uses prefix wildcards for partial MPN matching.
   - `datasheet_manager.py` — Datasheet URL extraction
   - `symbol_creator.py` — Custom symbol creation
   - `svg_import.py` — SVG logo import
+- `parsers/` — File format parsers
+  - `kicad_mod_parser.py` — Parses `.kicad_mod` footprint files. Extracts name, description, keywords, pads, layers, courtyard bounding box, attributes. Used by `get_footprint_info` to enrich responses.
 - `kicad_api/` — Backend abstraction (SWIG vs IPC)
   - `base.py` — Abstract base class
   - `swig_backend.py` — pcbnew SWIG backend
@@ -57,6 +61,7 @@ KiCAD files (.kicad_pcb, .kicad_sch, .kicad_pro)
 - `resources/` — Resource definitions
 - `utils/` — Platform detection, KiCAD process management
 - `templates/` — Schematic templates (used by `create_schematic`)
+- `download_jlcpcb.py` — Standalone script to download pre-built JLCPCB parts database from yaqwsx/jlcparts (~4 min, replaces broken API-based download)
 
 ## Key Libraries & Dependencies
 
@@ -287,6 +292,9 @@ When adding or modifying a schematic tool, verify:
 22. [ ] Balanced-paren counting loops are string-aware (skip chars inside `"..."`) — pin names like `PA15(JTDI)` contain literal parens
 23. [ ] Tool descriptions for batch tools with nested arrays include explicit JSON examples — AI clients silently flatten nested structures otherwise
 24. [ ] Batch handlers validate that input arrays are non-empty and return helpful errors (not silent 0-count results)
+25. [ ] TS tool registration uses 4-arg form `server.tool(name, description, schema, handler)` — the description string is required for AI clients to understand the tool's purpose
+26. [ ] All coordinate/dimension params include unit in `.describe()` (e.g., "Position (mm)", "Clearance in mm")
+27. [ ] TS param names match Python `params.get("paramName")` keys exactly — mismatches cause silent data loss
 
 ## Code Patterns
 
@@ -315,7 +323,7 @@ The `callKicadScript` command string and the `command_routes` key **must match e
 Both `move_region` (~line 3835) and `move_connected` (~line 6157) are implemented directly in `kicad_interface.py` using the collect-edits-then-apply-in-reverse pattern. Both use string-aware paren counting to skip `lib_symbols`.
 
 - **`move_region`**: Block-select-and-move. Moves all items (components, wires, labels, junctions, no-connects) within a bounding box by (dx, dy). Each element type has its own regex-based collection loop. Component blocks shift ALL `(at ...)` positions (symbol + field positions). Wire blocks shift `(xy ...)` coordinates. All edits are collected as `(start, end, new_text)` tuples, sorted reverse by position, then applied.
-- **`move_connected`**: Move-with-smart-stretching. Moves a single component by reference, translates stub wires (pin→label) fully, stretches longer wires to other components. Single read/write cycle, all text-based (no kicad-skip). Steps: (1) get old pin positions via `PinLocator`, (2) trace wires one hop to find far endpoints and compute `label_junction_move_points`, (3) collect ALL replacements on the same content string: component block (shift all `(at ...)`), wire endpoints, labels, junctions, power symbols, no-connects, (4) apply replacements in reverse position order, (5) write once with flush+fsync. Stub wires (one end at pin, other at label/junction) translate BOTH endpoints; longer wires only stretch the pin-touching endpoint.
+- **`move_connected`**: Move-with-smart-stretching. Moves a single component by reference, translates stub wires (pin→label) fully, stretches longer wires to other components. Single read/write cycle, all text-based (no kicad-skip). **Two-pass replacement**: Pass 1 collects and applies component/wire/junction/power/no-connect replacements. Pass 2 finds and shifts labels on the already-modified content (avoids label block ranges interacting with other block ranges). Labels are matched against `all_connected = old_pin_positions | wire_far_endpoints` — includes both pin positions AND wire stub far ends. Steps: (1) get old pin positions via `PinLocator`, (2) trace wires one hop to find far endpoints, (3) collect component block replacement (text-based `(at ...)` shift), wire endpoint shifts, junctions, power symbols, no-connects — apply in reverse, (4) separate label pass on modified content, (5) write once with flush+fsync.
 - **Both handlers require string-aware paren counting** to correctly skip `(lib_symbols)` — pin names like `PA15(JTDI)` contain literal parens that break naive counters, causing `lib_sym_end` to overshoot and placed symbols to be skipped. The local `_find_block_end_str_aware()` / `find_block_end()` helpers handle this.
 
 ### Board operations
@@ -409,6 +417,7 @@ These are bugs that were actually encountered and fixed. If you see these sympto
 - **Global labels fail to load even with quoted UUIDs**: `sexp_writer.add_label` was adding a stray `(uuid ...)` inside the Intersheetrefs property block. KiCad properties don't have UUIDs — only the parent label element does. Fixed by removing the UUID from the property block.
 - **Pin positions wrong at 90°/270° rotation (Y offset inverted)**: The rotation formula used standard CCW rotation (`rot_y = x*sin + y*cos`) on Y-negated coordinates, but Y-negation and rotation don't commute. The correct formula is `rot_y = -x*sin + y*cos`. At 0°/180° both formulas give the same result (sin=0), so the bug only manifested at 90°/270°. Fixed in `PinLocator.rotate_point()` and all 3 inline sites.
 - **create_netclass fails with "'netclasses_map' has no attribute 'Find'"**: KiCad 9 changed the netclass API. Old code used `net_classes.Find(name)` on a `netclasses_map`. Fixed — now uses `NET_SETTINGS` via `board.GetDesignSettings().m_NetSettings` with `HasNetclass()`, `GetNetClassByName()`, `SetNetclass()`. Also `SetMicroViaDiameter` → `SetuViaDiameter`, net assignment via `SetNetclassPatternAssignment()`.
+- **create_netclass track width silently ignored**: TS schema used `traceWidth` but Python handler expects `trackWidth`. Fixed — TS now uses `trackWidth`. When adding new tool params, always verify the TS param name matches the Python `params.get("...")` key exactly.
 - **add_mounting_hole crashes with "SwigPyObject has no attribute GetReference"**: After board state changes (outline delete, save/reload), `GetFootprints()` can return raw SWIG proxies that lost type info. Fixed — use `pcbnew.Cast_to_FOOTPRINT(item)` before accessing methods. Same pattern applies to any `board.GetDrawings()` / `board.GetFootprints()` iteration.
 - **Rounded rectangle outline has 1-2nm gaps**: `_add_corner_arc` used `int()` truncation on trig results. `int(radius * cos(angle))` truncates toward zero, while straight edges use exact arithmetic. Fixed — use `round()` instead of `int()`.
 - **delete_board_outline removes internal cutouts**: Was removing ALL Edge.Cuts shapes. Fixed — now groups shapes into connected chains, identifies outer outline by largest bounding box, preserves internal cutouts (mounting holes, USB slots). `deleteAll=true` for old behavior.
@@ -543,7 +552,7 @@ These are known issues that haven't been fixed yet. Keep them in mind when worki
 - **`kicad_interface.py` is a 7000+ line god file**: 75+ handler methods plus static helpers and module-level T-junction helpers. Should be decomposed into domain-specific handler modules (schematic_analysis.py, schematic_crud.py, etc.), but all inline pin math sites (10 places) must stay in sync until then.
 - **No TypeScript tests**: Zero tests for tool registration, request queue, JSON parsing, or Python subprocess communication.
 - **Minimal Python tests**: Only 4 test files. No tests for the vast majority of handlers, sexp_writer content variants, pin_locator transforms, or batch operations. Pin math is the #1 bug source and has zero test coverage.
-- **Wire connectivity tracing is O(W × P) per iteration**: `get_net_connectivity` and `validate_wire_connections` still use naive flood-fill (legacy). The newer `net_analysis.py:build_net_graph()` uses union-find O(W+L+P) — prefer it for new tools. Legacy handlers haven't been migrated yet.
+- **Wire connectivity tracing is O(W × P) per iteration**: `get_net_connectivity` and `validate_wire_connections` still use naive flood-fill (legacy). Newer alternatives: `net_analysis.py:build_net_graph()` uses union-find O(W+L+P); `wire_connectivity.py:get_wire_connections()` uses exact IU matching with O(1) lookups. Prefer these for new tools. Legacy handlers haven't been migrated yet.
 - **`connect_to_net` doesn't auto-add T-junctions**: Unlike `add_wire`/`add_polyline_wire`/`batch_add_wire`, `connect_to_net` delegates to `ConnectionManager` which does 2 separate file read/write cycles (wire + label). T-junction auto-detection was added to the sexp_writer file-level functions but `connect_to_net` bypasses them via separate calls. Needs refactoring to batch operations.
 - **ERC coordinate auto-detection heuristic is fragile**: Checks if first coord < 5mm to decide scaling. Can false-positive on schematics with violations near origin.
 - **`batch_connect_to_net` still does N read/write cycles**: Each connection needs fresh pin positions after prior wire/label placements shift content offsets. The other 7 batch handlers have been fixed.
@@ -556,4 +565,6 @@ These are known issues that haven't been fixed yet. Keep them in mind when worki
 - **Synchronous logger**: `logger.ts` uses `appendFileSync` and `existsSync` on every log message, blocking the Node.js event loop. Should use async write stream.
 - **`wire_manager.py` is a zero-value wrapper**: Every method forwards to `sexp_writer` with no added logic. Could be eliminated.
 - **Duplicated utilities across modules**: `_get_project_name` (in sexp_writer.py and dynamic_symbol_loader.py), `_fmt` coordinate formatter (3 slightly different implementations), mirror attribute parser (5+ locations). Should be extracted to shared utils.
-- **~24 handlers still depend on kicad-skip `SchematicManager.load_schematic()`**: kicad-skip fails on some KiCad 9 schematics. `list_schematic_components`, `PinLocator`, and `move_connected` have been migrated to regex-based parsing. Remaining handlers (list_schematic_nets, get_net_connectivity, validate_wire_connections, find_orphan_items, check_schematic_overlaps, get_schematic_layout, annotate_schematic, etc.) should be migrated as they fail. The regex parser is in `pin_locator.py` and can be imported.
+- **~23 handlers still depend on kicad-skip `SchematicManager.load_schematic()`**: kicad-skip fails on some KiCad 9 schematics. `list_schematic_components`, `PinLocator`, `move_connected`, and `get_wire_connections` have been migrated away from kicad-skip. Remaining handlers (list_schematic_nets, get_net_connectivity, validate_wire_connections, find_orphan_items, check_schematic_overlaps, get_schematic_layout, annotate_schematic, etc.) should be migrated as they fail. The regex parser is in `pin_locator.py` and can be imported.
+- **`get_wire_connections` requires kicad-skip for initial load**: `wire_connectivity.py` uses exact IU matching internally but its entry point still receives a `schematic` object loaded via `SchematicManager.load_schematic()`. Should be migrated to direct file parsing.
+- **`schematic_analysis.py` uses sexpdata**: The upstream schematic analysis module uses `sexpdata` for S-expression parsing. This works but may have edge cases with KiCad 9+ files. The module handles symbol bounding boxes via real graphics parsing which is architecturally superior to pin-only estimation.
