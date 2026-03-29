@@ -6159,8 +6159,9 @@ class KiCADInterface:
 
         Moves the component by (dx, dy), then for each pin:
         - Moves wire endpoints that touch the OLD pin position to the NEW pin position
-        - Moves labels/junctions at those wire endpoints by the same offset
-        - Leaves the "far end" of wires anchored (stretching them)
+        - For stub wires (pin→label), translates BOTH endpoints (whole wire moves)
+        - Moves labels/junctions/power symbols/no-connects at connected points
+        - For longer wires to other components, stretches (only pin end moves)
         """
         logger.info("Moving component with connected items")
         try:
@@ -6311,26 +6312,60 @@ class KiCADInterface:
                 content = f.read()
 
             # 4b. Move wire endpoints touching old pin positions
-            # Collect replacements in reverse order
+            # For stub wires (one end at pin, other end at label/junction),
+            # translate BOTH endpoints so the whole stub moves with the component.
+            # For longer wires to other components, only move the pin-touching end (stretch).
             replacements = []
+            from commands.sexp_writer import _fmt
             for wm in wire_pat.finditer(content):
                 block_end = _find_block_end_str_aware(content, wm.start())
                 block = content[wm.start():block_end]
+                xys = xy_pat.findall(block)
+                if len(xys) < 2:
+                    continue
+
+                wp1 = (float(xys[0][0]), float(xys[0][1]))
+                wp2 = (float(xys[-1][0]), float(xys[-1][1]))
+                p1_at_pin = any(abs(wp1[0] - px) < eps and abs(wp1[1] - py) < eps for px, py in old_pin_positions)
+                p2_at_pin = any(abs(wp2[0] - px) < eps and abs(wp2[1] - py) < eps for px, py in old_pin_positions)
+                p1_at_label = any(abs(wp1[0] - fp[0]) < eps and abs(wp1[1] - fp[1]) < eps for fp in label_junction_move_points)
+                p2_at_label = any(abs(wp2[0] - fp[0]) < eps and abs(wp2[1] - fp[1]) < eps for fp in label_junction_move_points)
 
                 new_block = block
                 modified = False
+
+                # Move pin-touching endpoints (stretch or translate)
                 for ox, oy, nx, ny in pin_moves:
-                    # Replace (xy ox oy) with (xy nx ny) if it matches a pin position
                     for m in xy_pat.finditer(new_block):
                         mx, my = float(m.group(1)), float(m.group(2))
                         if abs(mx - ox) < eps and abs(my - oy) < eps:
-                            from commands.sexp_writer import _fmt
                             old_xy = m.group(0)
                             new_xy = f"(xy {_fmt(nx)} {_fmt(ny)})"
                             new_block = new_block[:m.start()] + new_xy + new_block[m.end():]
                             modified = True
                             moved_items["wire_endpoints"] += 1
                             break  # one replacement per pin per wire
+
+                # Also move the far endpoint if it's at a label/junction move point
+                # (translates the whole stub wire instead of stretching it)
+                if p1_at_pin and p2_at_label:
+                    for m in xy_pat.finditer(new_block):
+                        mx, my = float(m.group(1)), float(m.group(2))
+                        if abs(mx - wp2[0]) < eps and abs(my - wp2[1]) < eps:
+                            new_xy = f"(xy {_fmt(wp2[0] + dx)} {_fmt(wp2[1] + dy)})"
+                            new_block = new_block[:m.start()] + new_xy + new_block[m.end():]
+                            modified = True
+                            moved_items["wire_endpoints"] += 1
+                            break
+                elif p2_at_pin and p1_at_label:
+                    for m in xy_pat.finditer(new_block):
+                        mx, my = float(m.group(1)), float(m.group(2))
+                        if abs(mx - wp1[0]) < eps and abs(my - wp1[1]) < eps:
+                            new_xy = f"(xy {_fmt(wp1[0] + dx)} {_fmt(wp1[1] + dy)})"
+                            new_block = new_block[:m.start()] + new_xy + new_block[m.end():]
+                            modified = True
+                            moved_items["wire_endpoints"] += 1
+                            break
 
                 if modified:
                     replacements.append((wm.start(), block_end, new_block))
