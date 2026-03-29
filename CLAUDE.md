@@ -40,7 +40,7 @@ KiCAD files (.kicad_pcb, .kicad_sch, .kicad_pro)
   - `board.py`, `board/*.py` — Board operations (layers, outline, size, 2D view)
   - `project.py` — Project creation/management
   - `library.py`, `library_schematic.py`, `library_symbol.py` — Library operations
-  - `dynamic_symbol_loader.py` — Loads symbols from KiCAD libraries at runtime. `_extract_symbol_block` handles both multi-line and single-line `.kicad_sym` files via balanced-paren traversal.
+  - `dynamic_symbol_loader.py` — Loads symbols from KiCAD libraries at runtime. `_extract_symbol_block` handles both multi-line and single-line `.kicad_sym` files via balanced-paren traversal. `_get_instances_path()` builds correct hierarchical `(instances)` paths for sub-schematics by reading `.kicad_pro` and the root schematic's `(sheet ...)` blocks.
   - `footprint.py` — Footprint operations
   - `export.py` — Export (Gerber, PDF, SVG, BOM, 3D, etc.)
   - `design_rules.py` — DRC rules
@@ -195,7 +195,10 @@ And always iterate `["label", "global_label", "hierarchical_label"]`, not just `
 
 ### (instances) blocks
 - KiCad 9 requires `(instances (project "name" (path "/uuid" (reference "R1") (unit 1))))` inside every placed symbol for annotation to work.
-- `DynamicSymbolLoader.create_component_instance` already includes this in the template.
+- **The path must match KiCad's hierarchical structure:**
+  - Root schematic: `(path "/{root_sheet_uuid}" ...)`
+  - Sub-sheet: `(path "/{root_sheet_uuid}/{sheet_instance_uuid}" ...)` where `{sheet_instance_uuid}` is the UUID from the `(sheet ...)` block in the parent schematic, NOT the sub-sheet file's own UUID.
+- `DynamicSymbolLoader.create_component_instance` uses `_get_instances_path()` to build the correct path automatically — reads `.kicad_pro` to find the root schematic, then searches for the `(sheet ...)` block referencing the target file.
 - Never add a second one. When checking if a symbol already has `(instances)`, use balanced-paren search to find the symbol block, not newline-based heuristics (single-line files have no newlines).
 
 ### (hide yes) placement
@@ -299,7 +302,8 @@ The `callKicadScript` command string and the `command_routes` key **must match e
 - **Connectivity repair** (`fix_connectivity` tool): Runs kicad-cli ERC as ground truth, parses JSON violations, auto-fixes T-junctions by adding junction dots. Use as final verification — kicad-cli's connectivity engine is independent of MCP's pin math.
 - **kicad-skip** (`from skip import Schematic`): Used by ~26 handlers for reading/querying existing schematic elements (symbols, properties, wires). **WARNING: kicad-skip fails on some KiCad 9 schematics** with `AttributeError: 'ParsedValue' object has no attribute 'symbol'`. The `PinLocator` and `list_schematic_components` handler have been migrated to regex-based parsing (see `parse_placed_symbols_from_content()`). Other handlers using `SchematicManager.load_schematic()` are still vulnerable — migrate them to regex parsing when they fail. Avoid for writes that go through `sexpdata.dumps()`.
 - **parse_placed_symbols_from_content** (`python/commands/pin_locator.py`): Regex-based parser for placed `(symbol ...)` blocks in raw `.kicad_sch` text. Returns list of dicts with reference, lib_id, position, rotation, mirror, value, footprint, uuid. Excludes `(lib_symbols)` section and `_TEMPLATE` symbols. **Preferred over kicad-skip** for reading placed symbol data — works on all schematic files including those that trip up kicad-skip. Import: `from commands.pin_locator import parse_placed_symbols_from_content`.
-- **DynamicSymbolLoader** (`python/commands/dynamic_symbol_loader.py`): Text-based symbol injection from KiCad libraries. Handles `(instances)` blocks, rotation-aware field positions. Uses text manipulation, not sexpdata.
+- **DynamicSymbolLoader** (`python/commands/dynamic_symbol_loader.py`): Text-based symbol injection from KiCad libraries. Handles `(instances)` blocks with correct hierarchical paths for sub-schematics via `_get_instances_path()`, rotation-aware field positions. Uses text manipulation, not sexpdata.
+- **update_symbols_from_library** (`kicad_interface.py`): Refreshes cached symbol definitions in `lib_symbols` from source `.kicad_sym` library files. Enumerates top-level `(symbol "Lib:Name" ...)` blocks, loads fresh definitions via `extract_symbol_from_library()`, replaces in-place with reverse-order splicing. Invalidates `PinLocator.pin_definition_cache` for updated symbols. Optional `libIds` filter for selective updates.
 - **PinLocator** (`python/commands/pin_locator.py`): Returns pin **endpoints** (connectable tip), not body positions. Handles rotation (via KiCad schematic transform, not standard rotation) AND mirror transforms. `rotate_point()` applies the Y-down-aware transform `[[cos,-sin],[-sin,cos]]`. `get_all_symbol_pins()` reads the file once and computes all pins inline using regex-based parsing (no kicad-skip dependency). Pin definition cache is per lib_id and safe to keep. A shared `PinLocator` instance lives on `KiCADInterface` as `self.pin_locator` — handlers use this instead of creating fresh instances, preserving the cache across calls.
 - **swap_schematic_symbol** (`kicad_interface.py`): Changes a component's `(lib_id)` in-place, uses `DynamicSymbolLoader.inject_symbol_into_schematic()` to add the new symbol definition to `lib_symbols`, and removes the old definition if no other instances reference it. Warns if pin counts differ between old and new symbols.
 - **auto_assign_footprints** (`kicad_interface.py`): Scans all placed symbols, matches their `lib_id` against prefix patterns, and updates their Footprint property via `_edit_component_in_content()`. Single read/write cycle.
@@ -377,7 +381,9 @@ These are bugs that were actually encountered and fixed. If you see these sympto
 - **New global labels missing Intersheetrefs property**: `sexp_writer.add_label` now includes Intersheetrefs for global/hierarchical labels. Without it, KiCad shows no inter-sheet references.
 - **Wire-through-label false positives/negatives**: Suppression uses `wire_len <= flag_width * 0.5` threshold. Standard 2.54mm pin stubs are suppressed; longer wires that visibly exit the flag are reported. The old fixed 5mm threshold missed wide labels.
 - **Pin positions wrong on mirrored symbols in some tools**: Was missing mirror transforms in 4 of 7 inline pin math sites. Fixed — all 10 pin math sites now include mirror handling. If you see this again, grep for `pin_rel_y = -` and verify all sites have mirror blocks.
-- **delete_label_from_content silently fails on global labels**: The regex was missing `(?:\s+\(shape\s+[^)]*\))?`. Fixed.
+- **delete_label_from_content silently fails on global labels**: The regex was missing `(?:\s+\(shape\s+[^)]*\))?`. Fixed. Paren counter is now string-aware (fixed same class of bug as 8 other sites).
+- **Sub-schematic labels not found by batch_delete/list_schematic_labels**: `run_erc` reports violations from ALL sheets in the project, but `batch_delete`, `list_schematic_labels`, and other single-file tools operate on the file specified by `schematicPath` only. Labels in sub-sheets (e.g., `power.kicad_sch`) won't be found when targeting the root schematic (`chai-poc.kicad_sch`). Always pass the correct sub-sheet path.
+- **Components in sub-schematics appear at root sheet level**: Was using the sub-sheet file's own UUID in `(instances)` path instead of `/{root_uuid}/{sheet_instance_uuid}`. Fixed — `_get_instances_path()` now reads `.kicad_pro` and root schematic to build correct hierarchical path.
 - **print() in component_schematic.py corrupts MCP protocol**: Was using bare `print()` in CRUD methods. Fixed — now uses `logger.debug()` / `logger.error()`.
 - **component_schematic.py CRUD methods find nothing**: Was using `symbol.reference` (nonexistent) instead of `symbol.property.Reference.value`. `remove_component` was using private `_elements` API. Fixed — `remove_component` now uses text-based balanced-paren deletion.
 - **PinLocator cache wasted**: Was creating `PinLocator()` fresh per handler call. Fixed — `self.pin_locator` is shared across all handlers.
