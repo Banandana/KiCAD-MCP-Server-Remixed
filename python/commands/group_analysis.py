@@ -602,15 +602,13 @@ def rewire_group_orthogonal(schematic_path, components, pin_locator, routing_sty
 
         if abs(x1 - x2) < 0.01 or abs(y1 - y2) < 0.01:
             # Colinear — single straight wire
-            content = add_wire_to_content(content, x1, y1, x2, y2)
+            content = add_wire_to_content(content, [x1, y1], [x2, y2])
             new_endpoints.extend([(x1, y1), (x2, y2)])
             added_count += 1
         else:
             # L-shaped route: choose style
             style = routing_style
             if style == "auto":
-                # Try horizontal-first, check if corner segment crosses a component
-                mid_x, mid_y = x2, y1  # horizontal first corner
                 h_first_crosses = any(
                     _segment_crosses_bbox(x2, y1, x2, y2, *bb)
                     for ref, bb in comp_bboxes.items()
@@ -625,14 +623,12 @@ def rewire_group_orthogonal(schematic_path, components, pin_locator, routing_sty
                     style = "horizontal_first"
 
             if style == "horizontal_first":
-                # Seg 1: horizontal (x1,y1) → (x2,y1), Seg 2: vertical (x2,y1) → (x2,y2)
-                content = add_wire_to_content(content, x1, y1, x2, y1)
-                content = add_wire_to_content(content, x2, y1, x2, y2)
+                content = add_wire_to_content(content, [x1, y1], [x2, y1])
+                content = add_wire_to_content(content, [x2, y1], [x2, y2])
                 new_endpoints.extend([(x1, y1), (x2, y1), (x2, y2)])
             else:
-                # Seg 1: vertical (x1,y1) → (x1,y2), Seg 2: horizontal (x1,y2) → (x2,y2)
-                content = add_wire_to_content(content, x1, y1, x1, y2)
-                content = add_wire_to_content(content, x1, y2, x2, y2)
+                content = add_wire_to_content(content, [x1, y1], [x1, y2])
+                content = add_wire_to_content(content, [x1, y2], [x2, y2])
                 new_endpoints.extend([(x1, y1), (x1, y2), (x2, y2)])
             added_count += 2
 
