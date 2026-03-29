@@ -285,6 +285,8 @@ When adding or modifying a schematic tool, verify:
 20. [ ] Board footprint/drawing iteration uses `Cast_to_FOOTPRINT` / `Cast_to_PCB_SHAPE` for SWIG safety
 21. [ ] Board outline arc endpoints use `round()` not `int()` for trig
 22. [ ] Balanced-paren counting loops are string-aware (skip chars inside `"..."`) — pin names like `PA15(JTDI)` contain literal parens
+23. [ ] Tool descriptions for batch tools with nested arrays include explicit JSON examples — AI clients silently flatten nested structures otherwise
+24. [ ] Batch handlers validate that input arrays are non-empty and return helpful errors (not silent 0-count results)
 
 ## Code Patterns
 
@@ -384,6 +386,7 @@ These are bugs that were actually encountered and fixed. If you see these sympto
 - **delete_label_from_content silently fails on global labels**: The regex was missing `(?:\s+\(shape\s+[^)]*\))?`. Fixed. Paren counter is now string-aware (fixed same class of bug as 8 other sites).
 - **Sub-schematic labels not found by batch_delete/list_schematic_labels**: `run_erc` reports violations from ALL sheets in the project, but `batch_delete`, `list_schematic_labels`, and other single-file tools operate on the file specified by `schematicPath` only. Labels in sub-sheets (e.g., `power.kicad_sch`) won't be found when targeting the root schematic (`chai-poc.kicad_sch`). Always pass the correct sub-sheet path.
 - **Components in sub-schematics appear at root sheet level**: Was using the sub-sheet file's own UUID in `(instances)` path instead of `/{root_uuid}/{sheet_instance_uuid}`. Fixed — `_get_instances_path()` now reads `.kicad_pro` and root schematic to build correct hierarchical path.
+- **batch_delete returns 0 deletions silently**: AI client was passing `netName`/`position`/`type` as top-level parameters instead of inside the `labels` array. Zod silently strips unknown top-level fields, leaving `labels: []`. Fixed — handler now detects empty arrays and returns a helpful error with usage hint. Tool description updated with explicit JSON example. **This is a general pattern: any batch tool with nested arrays can fail silently if the AI client flattens the structure.** Ensure tool descriptions include examples for nested schemas.
 - **print() in component_schematic.py corrupts MCP protocol**: Was using bare `print()` in CRUD methods. Fixed — now uses `logger.debug()` / `logger.error()`.
 - **component_schematic.py CRUD methods find nothing**: Was using `symbol.reference` (nonexistent) instead of `symbol.property.Reference.value`. `remove_component` was using private `_elements` API. Fixed — `remove_component` now uses text-based balanced-paren deletion.
 - **PinLocator cache wasted**: Was creating `PinLocator()` fresh per handler call. Fixed — `self.pin_locator` is shared across all handlers.
