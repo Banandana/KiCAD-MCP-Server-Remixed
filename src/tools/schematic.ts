@@ -2047,6 +2047,57 @@ circuit topology before layout or documentation.`,
   );
 
   server.tool(
+    "compute_group_layout",
+    `Compute optimal positions for a group of components around a primary IC. Analyzes component
+roles (decoupling caps, series elements, feedback dividers, etc.) and positions them following
+standard schematic conventions: IC at anchor, decoupling caps in a row below, series elements
+on the side of their connected IC pins, feedback dividers vertically stacked, test points at
+group edges. Returns computed positions WITHOUT applying them — use apply_group_layout to apply.`,
+    {
+      schematicPath: z.string().describe("Path to the schematic file"),
+      components: z.array(z.string()).describe(
+        'List of component references in the group (e.g., ["U1", "C1", "C2", "R1", "L1"])'
+      ),
+      anchor: z.object({
+        x: z.number().describe("X position for primary IC center (mm)"),
+        y: z.number().describe("Y position for primary IC center (mm)"),
+      }).optional().describe("Anchor position for the primary IC. If omitted, IC stays at current position."),
+      constraints: z.object({
+        spacing: z.number().optional().describe("Minimum component spacing in mm (default: 6.35)"),
+        capRowGap: z.number().optional().describe("Gap between IC body and decoupling cap row in mm (default: 3.81)"),
+        capSpacing: z.number().optional().describe("Spacing between caps in the row in mm (default: 5.08)"),
+        seriesOffset: z.number().optional().describe("Distance from IC body for series elements in mm (default: 10.16)"),
+        dividerSpacing: z.number().optional().describe("Vertical spacing for feedback divider pair in mm (default: 5.08)"),
+      }).optional().describe("Override default spacing constraints"),
+    },
+    async (args) => {
+      const result = await callKicadScript("compute_group_layout", args);
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    },
+  );
+
+  server.tool(
+    "apply_group_layout",
+    `Apply computed layout positions from compute_group_layout. Moves components to new positions
+via text-based replacement (no kicad-skip). Optionally calls rewire_group_orthogonal after
+positioning to clean up wires. Use the positions output from compute_group_layout directly,
+or modify positions before applying.`,
+    {
+      schematicPath: z.string().describe("Path to the schematic file"),
+      positions: z.record(z.string(), z.object({
+        x: z.number().describe("New X position (mm)"),
+        y: z.number().describe("New Y position (mm)"),
+      })).describe('Map of reference designator to new position (e.g., {"U1": {"x": 100, "y": 50}})'),
+      rewire: z.boolean().optional().describe("Run rewire_group_orthogonal after positioning (default: true)"),
+      routingStyle: z.enum(["horizontal_first", "vertical_first", "auto"]).optional().describe("Routing style for rewiring (default: auto)"),
+    },
+    async (args) => {
+      const result = await callKicadScript("apply_group_layout", args);
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    },
+  );
+
+  server.tool(
     "rewire_group_orthogonal",
     `Delete wires between listed components and redraw with clean orthogonal routes that avoid
 crossing component bodies. Tries L-shaped routes first; if both L-options cross a component,

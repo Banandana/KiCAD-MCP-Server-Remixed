@@ -494,6 +494,8 @@ class KiCADInterface:
             "get_elements_in_region": self._handle_get_elements_in_region,
             "find_wires_crossing_symbols": self._handle_find_wires_crossing_symbols,
             "analyze_schematic_group": self._handle_analyze_schematic_group,
+            "compute_group_layout": self._handle_compute_group_layout,
+            "apply_group_layout": self._handle_apply_group_layout,
             "rewire_group_orthogonal": self._handle_rewire_group_orthogonal,
             # New batch/power tools
             "add_power_symbol": self._handle_add_power_symbol,
@@ -7946,6 +7948,50 @@ class KiCADInterface:
             return analyze_schematic_group(schematic_path, components, self.pin_locator)
         except Exception as e:
             logger.error(f"Error analyzing schematic group: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e)}
+
+    def _handle_compute_group_layout(self, params):
+        """Compute optimal positions for a group of components."""
+        logger.info("Computing group layout")
+        try:
+            from commands.group_analysis import compute_group_layout
+
+            schematic_path = params.get("schematicPath")
+            components = params.get("components", [])
+            anchor = params.get("anchor")
+            constraints = params.get("constraints")
+            if not schematic_path:
+                return {"success": False, "message": "schematicPath is required"}
+            if not components or not isinstance(components, list):
+                return {"success": False, "message": "components must be a non-empty array of reference designators"}
+
+            return compute_group_layout(schematic_path, components, self.pin_locator, anchor, constraints)
+        except Exception as e:
+            logger.error(f"Error computing group layout: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e)}
+
+    def _handle_apply_group_layout(self, params):
+        """Apply computed layout positions and optionally rewire."""
+        logger.info("Applying group layout")
+        try:
+            from commands.group_analysis import apply_group_layout
+
+            schematic_path = params.get("schematicPath")
+            positions = params.get("positions", {})
+            rewire = params.get("rewire", True)
+            routing_style = params.get("routingStyle", "auto")
+            if not schematic_path:
+                return {"success": False, "message": "schematicPath is required"}
+            if not positions:
+                return {"success": False, "message": "positions dict is required"}
+
+            return apply_group_layout(schematic_path, positions, self.pin_locator, rewire, routing_style)
+        except Exception as e:
+            logger.error(f"Error applying group layout: {e}")
             import traceback
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}

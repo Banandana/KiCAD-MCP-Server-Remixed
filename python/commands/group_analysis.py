@@ -1,9 +1,10 @@
 """
-Schematic group analysis and orthogonal rewiring.
+Schematic group analysis, layout computation, and orthogonal rewiring.
 
-Two tools:
+Three tools:
 1. analyze_schematic_group — classify component roles in a circuit group
-2. rewire_group_orthogonal — delete diagonal wires, redraw as L-shaped routes
+2. compute_group_layout — position passives around IC following conventions
+3. rewire_group_orthogonal — delete diagonal wires, redraw as L-shaped routes
 """
 
 import re
@@ -423,7 +424,447 @@ def analyze_schematic_group(schematic_path, components, pin_locator):
     }
 
 
-# ── Tool 2: rewire_group_orthogonal ─────────────────────────────────
+# ── Tool 2: compute_group_layout ────────────────────────────────────
+
+
+def _get_ic_pin_sides(all_pins, ic_ref):
+    """Classify IC pins by side (left/right/top/bottom) based on position relative to IC center.
+
+    Returns dict: pin_num -> {"side": "left"|"right"|"top"|"bottom", "x": float, "y": float, "name": str}
+    """
+    ic_pins = [(pn, name, px, py) for ref, pn, name, px, py, _v, _l in all_pins if ref == ic_ref]
+    if not ic_pins:
+        return {}
+
+    # Compute IC center from pin positions
+    cx = sum(p[2] for p in ic_pins) / len(ic_pins)
+    cy = sum(p[3] for p in ic_pins) / len(ic_pins)
+
+    result = {}
+    for pn, name, px, py in ic_pins:
+        dx = px - cx
+        dy = py - cy
+        # Classify by which offset is dominant
+        if abs(dx) > abs(dy):
+            side = "right" if dx > 0 else "left"
+        else:
+            side = "bottom" if dy > 0 else "top"
+        result[pn] = {"side": side, "x": px, "y": py, "name": name}
+
+    return result
+
+
+def _get_component_current_pos(all_pins, ref):
+    """Get a component's approximate center from its pin positions."""
+    pins = [(px, py) for r, _pn, _name, px, py, _v, _l in all_pins if r == ref]
+    if not pins:
+        return None
+    return (sum(p[0] for p in pins) / len(pins), sum(p[1] for p in pins) / len(pins))
+
+
+def compute_group_layout(schematic_path, components, pin_locator, anchor=None, constraints=None):
+    """Compute positions for group components following schematic conventions.
+
+    Places the primary IC at anchor, then positions passives around it:
+    - Decoupling caps in a row below the IC
+    - Series elements on the side of their connected IC pins
+    - Feedback dividers vertically stacked
+    - Test points at group edges
+    - Power symbols and GND placed after component positioning
+
+    Returns computed positions without applying them. Use apply_group_layout to apply.
+    """
+    content = _read_schematic(Path(schematic_path))
+    component_set = set(components)
+
+    # Parse and analyze
+    all_pins = _compute_pin_endpoints_from_content(
+        content, component_set, pin_locator, schematic_path
+    )
+    if not all_pins:
+        return {"success": False, "message": "No pins found for listed components"}
+
+    # Run analysis to get roles
+    analysis = analyze_schematic_group(schematic_path, components, pin_locator)
+    if not analysis.get("success"):
+        return analysis
+
+    roles = analysis.get("roles", {})
+    primary_ic = analysis.get("primaryIC")
+    if not primary_ic:
+        return {"success": False, "message": "No primary IC identified in group"}
+
+    # Default constraints
+    c = {
+        "spacing": 6.35,          # min component spacing (mm)
+        "capRowGap": 3.81,        # gap between IC body and cap row
+        "capSpacing": 5.08,       # spacing between caps in row
+        "seriesOffset": 10.16,    # distance from IC body for series elements
+        "dividerSpacing": 5.08,   # vertical spacing for feedback divider
+        "testPointOffset": 15.24, # distance for test points from IC
+    }
+    if constraints:
+        c.update(constraints)
+
+    # Get IC geometry
+    ic_pin_sides = _get_ic_pin_sides(all_pins, primary_ic)
+    ic_pins_list = [(px, py) for ref, _pn, _name, px, py, _v, _l in all_pins if ref == primary_ic]
+    if not ic_pins_list:
+        return {"success": False, "message": f"No pins found for primary IC {primary_ic}"}
+
+    ic_cx = sum(p[0] for p in ic_pins_list) / len(ic_pins_list)
+    ic_cy = sum(p[1] for p in ic_pins_list) / len(ic_pins_list)
+    ic_x1 = min(p[0] for p in ic_pins_list) - 2.54
+    ic_y1 = min(p[1] for p in ic_pins_list) - 2.54
+    ic_x2 = max(p[0] for p in ic_pins_list) + 2.54
+    ic_y2 = max(p[1] for p in ic_pins_list) + 2.54
+
+    # If anchor provided, compute delta to move IC there; otherwise IC stays
+    if anchor:
+        ic_dx = anchor.get("x", ic_cx) - ic_cx
+        ic_dy = anchor.get("y", ic_cy) - ic_cy
+    else:
+        ic_dx = 0
+        ic_dy = 0
+
+    # Get current positions for all components
+    current_positions = {}
+    symbols = parse_placed_symbols_from_content(content)
+    for sym in symbols:
+        ref = sym.get("reference", "")
+        if ref in component_set:
+            current_positions[ref] = {"x": sym.get("x", 0), "y": sym.get("y", 0), "rotation": sym.get("rotation", 0)}
+
+    # Compute new positions
+    new_positions = {}
+
+    # IC at anchor (or unchanged)
+    if primary_ic in current_positions:
+        ic_pos = current_positions[primary_ic]
+        new_positions[primary_ic] = {
+            "x": round(ic_pos["x"] + ic_dx, 4),
+            "y": round(ic_pos["y"] + ic_dy, 4),
+        }
+
+    # Classify passives by placement zone
+    decoupling_caps = []
+    left_side = []
+    right_side = []
+    top_side = []
+    bottom_side = []
+    feedback_top = None
+    feedback_bottom = None
+    test_points = []
+    unplaced = []
+
+    for ref in components:
+        if ref == primary_ic:
+            continue
+        role_info = roles.get(ref, {})
+        role = role_info.get("role", "unknown")
+
+        if role in ("decoupling_cap", "bypass_cap", "bypass_element"):
+            decoupling_caps.append(ref)
+        elif role == "feedback_top":
+            feedback_top = ref
+        elif role == "feedback_bottom":
+            feedback_bottom = ref
+        elif role in ("series_element", "bootstrap_cap"):
+            # Place on the side of the connected IC pin
+            connected = role_info.get("connectedBetween", [])
+            connected_pin = role_info.get("connectedPin", "")
+            # Find which side the connected pin is on
+            placed = False
+            for pin_id in ([connected_pin] if connected_pin else connected):
+                # pin_id might be "U10/VIN" or just a net name
+                if "/" in str(pin_id):
+                    pin_name = str(pin_id).split("/", 1)[1]
+                    for pn, pdata in ic_pin_sides.items():
+                        if pdata["name"] == pin_name:
+                            side = pdata["side"]
+                            if side == "left":
+                                left_side.append(ref)
+                            elif side == "right":
+                                right_side.append(ref)
+                            elif side == "top":
+                                top_side.append(ref)
+                            else:
+                                bottom_side.append(ref)
+                            placed = True
+                            break
+                if placed:
+                    break
+            if not placed:
+                right_side.append(ref)  # default to right
+        elif role in ("pullup", "pulldown"):
+            # Place on the side of the connected IC pin
+            connected_pin = role_info.get("connectedPin", "")
+            placed = False
+            if "/" in str(connected_pin):
+                pin_name = str(connected_pin).split("/", 1)[1]
+                for pn, pdata in ic_pin_sides.items():
+                    if pdata["name"] == pin_name:
+                        side = pdata["side"]
+                        if side == "left":
+                            left_side.append(ref)
+                        elif side == "right":
+                            right_side.append(ref)
+                        elif side == "top":
+                            top_side.append(ref)
+                        else:
+                            bottom_side.append(ref)
+                        placed = True
+                        break
+            if not placed:
+                right_side.append(ref)
+        elif role == "test_point":
+            test_points.append(ref)
+        elif role in ("power_symbol",):
+            # Power symbols will be placed after components
+            pass
+        else:
+            unplaced.append(ref)
+
+    # Apply IC offset to all IC-relative coordinates
+    new_ic_x1 = ic_x1 + ic_dx
+    new_ic_y1 = ic_y1 + ic_dy
+    new_ic_x2 = ic_x2 + ic_dx
+    new_ic_y2 = ic_y2 + ic_dy
+    new_ic_cx = ic_cx + ic_dx
+    new_ic_cy = ic_cy + ic_dy
+
+    # Place decoupling caps in a horizontal row below IC
+    cap_y = new_ic_y2 + c["capRowGap"]
+    cap_start_x = new_ic_cx - (len(decoupling_caps) - 1) * c["capSpacing"] / 2
+    for i, ref in enumerate(decoupling_caps):
+        new_positions[ref] = {
+            "x": round(cap_start_x + i * c["capSpacing"], 4),
+            "y": round(cap_y, 4),
+        }
+
+    # Place left-side components
+    left_x = new_ic_x1 - c["seriesOffset"]
+    for i, ref in enumerate(left_side):
+        # Align Y with the connected IC pin if possible
+        target_y = new_ic_cy + (i - len(left_side) / 2) * c["spacing"]
+        new_positions[ref] = {
+            "x": round(left_x, 4),
+            "y": round(target_y, 4),
+        }
+
+    # Place right-side components
+    right_x = new_ic_x2 + c["seriesOffset"]
+    for i, ref in enumerate(right_side):
+        target_y = new_ic_cy + (i - len(right_side) / 2) * c["spacing"]
+        new_positions[ref] = {
+            "x": round(right_x, 4),
+            "y": round(target_y, 4),
+        }
+
+    # Place feedback divider on right side, vertically stacked
+    if feedback_top or feedback_bottom:
+        fb_x = new_ic_x2 + c["seriesOffset"]
+        fb_y = new_ic_cy
+        if feedback_top:
+            new_positions[feedback_top] = {"x": round(fb_x, 4), "y": round(fb_y - c["dividerSpacing"] / 2, 4)}
+        if feedback_bottom:
+            new_positions[feedback_bottom] = {"x": round(fb_x, 4), "y": round(fb_y + c["dividerSpacing"] / 2, 4)}
+
+    # Place top-side components
+    top_y = new_ic_y1 - c["seriesOffset"]
+    for i, ref in enumerate(top_side):
+        target_x = new_ic_cx + (i - len(top_side) / 2) * c["spacing"]
+        new_positions[ref] = {"x": round(target_x, 4), "y": round(top_y, 4)}
+
+    # Place bottom-side (non-cap) components
+    bot_y = new_ic_y2 + c["seriesOffset"]
+    for i, ref in enumerate(bottom_side):
+        target_x = new_ic_cx + (i - len(bottom_side) / 2) * c["spacing"]
+        new_positions[ref] = {"x": round(target_x, 4), "y": round(bot_y, 4)}
+
+    # Place test points at group edges
+    tp_x = new_ic_x2 + c["testPointOffset"]
+    for i, ref in enumerate(test_points):
+        new_positions[ref] = {
+            "x": round(tp_x, 4),
+            "y": round(new_ic_cy + (i - len(test_points) / 2) * c["spacing"], 4),
+        }
+
+    # Unplaced components go to the right in a column
+    for i, ref in enumerate(unplaced):
+        new_positions[ref] = {
+            "x": round(new_ic_x2 + c["seriesOffset"] + c["spacing"], 4),
+            "y": round(new_ic_y1 + i * c["spacing"], 4),
+        }
+
+    # Compute bounding box of the layout
+    all_x = [p["x"] for p in new_positions.values()]
+    all_y = [p["y"] for p in new_positions.values()]
+    bbox = {
+        "x1": round(min(all_x) - 5, 2),
+        "y1": round(min(all_y) - 5, 2),
+        "x2": round(max(all_x) + 5, 2),
+        "y2": round(max(all_y) + 5, 2),
+    }
+
+    return {
+        "success": True,
+        "positions": new_positions,
+        "roles": roles,
+        "primaryIC": primary_ic,
+        "boundingBox": bbox,
+        "placementSummary": {
+            "decouplingCaps": decoupling_caps,
+            "leftSide": left_side,
+            "rightSide": right_side,
+            "topSide": top_side,
+            "bottomSide": bottom_side,
+            "feedbackTop": feedback_top,
+            "feedbackBottom": feedback_bottom,
+            "testPoints": test_points,
+            "unplaced": unplaced,
+        },
+        "message": f"Computed positions for {len(new_positions)}/{len(components)} components",
+    }
+
+
+def apply_group_layout(schematic_path, positions, pin_locator, rewire=True, routing_style="auto"):
+    """Apply computed layout positions and optionally rewire.
+
+    Moves components to new positions via text-based replacement,
+    then optionally calls rewire_group_orthogonal.
+    """
+    sch_path = Path(schematic_path)
+    content = _read_schematic(sch_path)
+
+    # Find and move each component's (at ...) block
+    symbols = parse_placed_symbols_from_content(content)
+    lib_sym_start = content.find("(lib_symbols")
+    if lib_sym_start >= 0:
+        # Find end of lib_symbols to skip it
+        depth = 0
+        i = lib_sym_start
+        in_str = False
+        while i < len(content):
+            ch = content[i]
+            if in_str:
+                if ch == '\\':
+                    i += 2
+                    continue
+                elif ch == '"':
+                    in_str = False
+            else:
+                if ch == '"':
+                    in_str = True
+                elif ch == '(':
+                    depth += 1
+                elif ch == ')':
+                    depth -= 1
+                    if depth == 0:
+                        break
+            i += 1
+        lib_sym_end = i + 1
+    else:
+        lib_sym_end = -1
+
+    sym_pat = re.compile(r'\(symbol\s+\(lib_id\s+"([^"]*)"')
+    replacements = []
+    moved = []
+
+    for sm in sym_pat.finditer(content):
+        pos = sm.start()
+        if lib_sym_start >= 0 and lib_sym_start <= pos < lib_sym_end:
+            continue
+
+        # Find block end (string-aware)
+        depth = 0
+        i = pos
+        in_str = False
+        while i < len(content):
+            ch = content[i]
+            if in_str:
+                if ch == '\\':
+                    i += 2
+                    continue
+                elif ch == '"':
+                    in_str = False
+            else:
+                if ch == '"':
+                    in_str = True
+                elif ch == '(':
+                    depth += 1
+                elif ch == ')':
+                    depth -= 1
+                    if depth == 0:
+                        break
+            i += 1
+        end = i + 1
+        block = content[pos:end]
+
+        # Get reference
+        ref_m = re.search(r'\(property\s+"Reference"\s+"([^"]*)"', block)
+        if not ref_m:
+            continue
+        ref = ref_m.group(1)
+        if ref not in positions:
+            continue
+
+        new_pos = positions[ref]
+        new_x = new_pos["x"]
+        new_y = new_pos["y"]
+
+        # Get current position to compute delta for field shifts
+        at_m = re.search(r'\(at\s+([\d.e+-]+)\s+([\d.e+-]+)', block)
+        if not at_m:
+            continue
+        old_x = float(at_m.group(1))
+        old_y = float(at_m.group(2))
+        dx = new_x - old_x
+        dy = new_y - old_y
+
+        if abs(dx) < 0.01 and abs(dy) < 0.01:
+            continue  # Already in position
+
+        # Shift all (at ...) in this symbol block by (dx, dy)
+        def _shift_at(match, _dx=dx, _dy=dy):
+            ax = float(match.group(1)) + _dx
+            ay = float(match.group(2)) + _dy
+            rest = match.group(3)
+            return f"(at {_fmt(ax)} {_fmt(ay)}{rest}"
+
+        new_block = re.sub(
+            r'\(at\s+([\d.e+-]+)\s+([\d.e+-]+)([\s\d.e+-]*\))',
+            _shift_at, block
+        )
+        replacements.append((pos, end, new_block))
+        moved.append(ref)
+
+    # Apply in reverse order
+    replacements.sort(key=lambda r: r[0], reverse=True)
+    for start, end, new_text in replacements:
+        content = content[:start] + new_text + content[end:]
+
+    _write_schematic(sch_path, content)
+
+    result = {
+        "success": True,
+        "movedComponents": moved,
+        "movedCount": len(moved),
+        "message": f"Moved {len(moved)} components to new positions",
+    }
+
+    # Optionally rewire
+    if rewire and moved:
+        all_refs = list(positions.keys())
+        rewire_result = rewire_group_orthogonal(
+            schematic_path, all_refs, pin_locator, routing_style
+        )
+        result["rewireResult"] = rewire_result
+
+    return result
+
+
+# ── Tool 3: rewire_group_orthogonal ─────────────────────────────────
 
 
 def _parse_wire_blocks(content):
