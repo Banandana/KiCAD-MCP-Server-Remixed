@@ -596,6 +596,23 @@ all resistors, "Device:C" to "Capacitor_SMD:C_0603_1608Metric" for all capacitor
     },
   );
 
+  // Get wire connections from a schematic point
+  server.tool(
+    "get_wire_connections",
+    `Find all component pins reachable from a schematic point via connected wires, net labels, and power symbols.
+The query point must be at a wire endpoint or junction — midpoints of wire segments are not matched.
+Use get_schematic_pin_locations or list_schematic_wires to obtain exact endpoint coordinates first.`,
+    {
+      schematicPath: z.string().describe("Path to the schematic file"),
+      x: z.number().describe("X coordinate in mm"),
+      y: z.number().describe("Y coordinate in mm"),
+    },
+    async (args) => {
+      const result = await callKicadScript("get_wire_connections", args);
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    },
+  );
+
   // Get pin locations for a schematic component
   server.tool(
     "get_schematic_pin_locations",
