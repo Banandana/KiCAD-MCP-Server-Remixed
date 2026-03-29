@@ -1547,7 +1547,7 @@ class KiCADInterface:
             # Invalidate pin locator cache for updated symbols
             if updated and hasattr(self, 'pin_locator'):
                 for lib_id in updated:
-                    self.pin_locator.pin_cache.pop(lib_id, None)
+                    self.pin_locator.pin_definition_cache.pop(lib_id, None)
 
             total = len(updated) + len(not_found) + len(unchanged)
             msg = f"Processed {total} symbols: {len(updated)} updated, {len(unchanged)} unchanged, {len(not_found)} not found"
