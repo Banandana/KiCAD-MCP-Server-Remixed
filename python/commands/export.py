@@ -631,8 +631,10 @@ class ExportCommands:
 
         if system == "Windows":
             possible_paths = [
+                r"C:\Program Files\KiCad\10.0\bin\kicad-cli.exe",
                 r"C:\Program Files\KiCad\9.0\bin\kicad-cli.exe",
                 r"C:\Program Files\KiCad\8.0\bin\kicad-cli.exe",
+                r"C:\Program Files (x86)\KiCad\10.0\bin\kicad-cli.exe",
                 r"C:\Program Files (x86)\KiCad\9.0\bin\kicad-cli.exe",
                 r"C:\Program Files (x86)\KiCad\8.0\bin\kicad-cli.exe",
             ]

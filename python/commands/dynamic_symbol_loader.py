@@ -38,13 +38,16 @@ class DynamicSymbolLoader:
         possible_paths = [
             Path("/usr/share/kicad/symbols"),
             Path("/usr/local/share/kicad/symbols"),
+            Path("C:/Program Files/KiCad/10.0/share/kicad/symbols"),
             Path("C:/Program Files/KiCad/9.0/share/kicad/symbols"),
             Path("C:/Program Files/KiCad/8.0/share/kicad/symbols"),
             Path("/Applications/KiCad/KiCad.app/Contents/SharedSupport/symbols"),
+            Path.home() / ".local" / "share" / "kicad" / "10.0" / "symbols",
             Path.home() / ".local" / "share" / "kicad" / "9.0" / "symbols",
+            Path.home() / "Documents" / "KiCad" / "10.0" / "3rdparty" / "symbols",
             Path.home() / "Documents" / "KiCad" / "9.0" / "3rdparty" / "symbols",
         ]
-        for env_var in ["KICAD9_SYMBOL_DIR", "KICAD8_SYMBOL_DIR", "KICAD_SYMBOL_DIR"]:
+        for env_var in ["KICAD10_SYMBOL_DIR", "KICAD9_SYMBOL_DIR", "KICAD8_SYMBOL_DIR", "KICAD_SYMBOL_DIR"]:
             if env_var in os.environ:
                 possible_paths.insert(0, Path(os.environ[env_var]))
 
@@ -58,13 +61,16 @@ class DynamicSymbolLoader:
         if sys.platform == "win32":
             appdata = os.environ.get("APPDATA", "")
             if appdata:
+                candidates.append(Path(appdata) / "kicad" / "10.0" / "sym-lib-table")
                 candidates.append(Path(appdata) / "kicad" / "9.0" / "sym-lib-table")
                 candidates.append(Path(appdata) / "kicad" / "8.0" / "sym-lib-table")
         elif sys.platform == "darwin":
+            candidates.append(Path.home() / "Library" / "Preferences" / "kicad" / "10.0" / "sym-lib-table")
             candidates.append(Path.home() / "Library" / "Preferences" / "kicad" / "9.0" / "sym-lib-table")
             candidates.append(Path.home() / "Library" / "Preferences" / "kicad" / "8.0" / "sym-lib-table")
         else:  # Linux
             xdg_config = os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))
+            candidates.append(Path(xdg_config) / "kicad" / "10.0" / "sym-lib-table")
             candidates.append(Path(xdg_config) / "kicad" / "9.0" / "sym-lib-table")
             candidates.append(Path(xdg_config) / "kicad" / "8.0" / "sym-lib-table")
 
@@ -126,6 +132,12 @@ class DynamicSymbolLoader:
         """Resolve environment variables in a sym-lib-table URI."""
         import sys
         env_map = {
+            "KICAD10_SYMBOL_DIR": [
+                "/usr/share/kicad/symbols",
+                "/usr/local/share/kicad/symbols",
+                "C:/Program Files/KiCad/10.0/share/kicad/symbols",
+                "/Applications/KiCad/KiCad.app/Contents/SharedSupport/symbols",
+            ],
             "KICAD9_SYMBOL_DIR": [
                 "/usr/share/kicad/symbols",
                 "/usr/local/share/kicad/symbols",
@@ -141,7 +153,12 @@ class DynamicSymbolLoader:
             "KICAD_SYMBOL_DIR": [
                 "/usr/share/kicad/symbols",
                 "/usr/local/share/kicad/symbols",
+                "C:/Program Files/KiCad/10.0/share/kicad/symbols",
                 "C:/Program Files/KiCad/9.0/share/kicad/symbols",
+            ],
+            "KICAD10_3RDPARTY_DIR": [
+                str(Path.home() / "Documents" / "KiCad" / "10.0" / "3rdparty"),
+                str(Path.home() / ".local" / "share" / "kicad" / "10.0" / "3rdparty"),
             ],
             "KICAD9_3RDPARTY_DIR": [
                 str(Path.home() / "Documents" / "KiCad" / "9.0" / "3rdparty"),

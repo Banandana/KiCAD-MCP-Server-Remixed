@@ -77,13 +77,16 @@ class SymbolLibraryManager:
         """Get path to global sym-lib-table file"""
         # Try different possible locations (same as fp-lib-table but for symbols)
         kicad_config_paths = [
+            Path.home() / ".config" / "kicad" / "10.0" / "sym-lib-table",
             Path.home() / ".config" / "kicad" / "9.0" / "sym-lib-table",
             Path.home() / ".config" / "kicad" / "8.0" / "sym-lib-table",
             Path.home() / ".config" / "kicad" / "sym-lib-table",
             # Windows paths
+            Path.home() / "AppData" / "Roaming" / "kicad" / "10.0" / "sym-lib-table",
             Path.home() / "AppData" / "Roaming" / "kicad" / "9.0" / "sym-lib-table",
             Path.home() / "AppData" / "Roaming" / "kicad" / "8.0" / "sym-lib-table",
             # macOS paths
+            Path.home() / "Library" / "Preferences" / "kicad" / "10.0" / "sym-lib-table",
             Path.home() / "Library" / "Preferences" / "kicad" / "9.0" / "sym-lib-table",
             Path.home() / "Library" / "Preferences" / "kicad" / "8.0" / "sym-lib-table",
         ]
@@ -142,9 +145,11 @@ class SymbolLibraryManager:
 
         # Common KiCAD environment variables
         env_vars = {
+            'KICAD10_SYMBOL_DIR': self._find_kicad_symbol_dir(),
             'KICAD9_SYMBOL_DIR': self._find_kicad_symbol_dir(),
             'KICAD8_SYMBOL_DIR': self._find_kicad_symbol_dir(),
             'KICAD_SYMBOL_DIR': self._find_kicad_symbol_dir(),
+            'KICAD10_3RD_PARTY': self._find_3rd_party_dir(),
             'KICAD9_3RD_PARTY': self._find_3rd_party_dir(),
             'KICAD8_3RD_PARTY': self._find_3rd_party_dir(),
             'KISYSSYM': self._find_kicad_symbol_dir(),
@@ -178,12 +183,15 @@ class SymbolLibraryManager:
         possible_paths = [
             "/usr/share/kicad/symbols",
             "/usr/local/share/kicad/symbols",
+            "C:/Program Files/KiCad/10.0/share/kicad/symbols",
             "C:/Program Files/KiCad/9.0/share/kicad/symbols",
             "C:/Program Files/KiCad/8.0/share/kicad/symbols",
             "/Applications/KiCad/KiCad.app/Contents/SharedSupport/symbols",
         ]
 
         # Check environment variable
+        if 'KICAD10_SYMBOL_DIR' in os.environ:
+            possible_paths.insert(0, os.environ['KICAD10_SYMBOL_DIR'])
         if 'KICAD9_SYMBOL_DIR' in os.environ:
             possible_paths.insert(0, os.environ['KICAD9_SYMBOL_DIR'])
         if 'KICAD8_SYMBOL_DIR' in os.environ:
@@ -198,11 +206,14 @@ class SymbolLibraryManager:
     def _find_3rd_party_dir(self) -> Optional[str]:
         """Find KiCAD 3rd party library directory (PCM installed libs)"""
         possible_paths = [
+            str(Path.home() / "Documents" / "KiCad" / "10.0" / "3rdparty"),
             str(Path.home() / "Documents" / "KiCad" / "9.0" / "3rdparty"),
             str(Path.home() / "Documents" / "KiCad" / "8.0" / "3rdparty"),
         ]
 
         # Check environment variable
+        if 'KICAD10_3RD_PARTY' in os.environ:
+            possible_paths.insert(0, os.environ['KICAD10_3RD_PARTY'])
         if 'KICAD9_3RD_PARTY' in os.environ:
             possible_paths.insert(0, os.environ['KICAD9_3RD_PARTY'])
         if 'KICAD8_3RD_PARTY' in os.environ:

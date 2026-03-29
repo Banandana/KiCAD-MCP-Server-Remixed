@@ -296,10 +296,12 @@ class FootprintCreator:
     def list_footprint_libraries(self, search_paths: Optional[List[str]] = None) -> Dict[str, Any]:
         """List all .pretty libraries and their footprints."""
         default_paths = [
+            r"C:\Program Files\KiCad\10.0\share\kicad\footprints",
             r"C:\Program Files\KiCad\9.0\share\kicad\footprints",
             r"C:\Program Files\KiCad\8.0\share\kicad\footprints",
             "/usr/share/kicad/footprints",
             "/usr/local/share/kicad/footprints",
+            os.path.expanduser("~/Documents/KiCad/10.0/footprints"),
             os.path.expanduser("~/Documents/KiCad/9.0/footprints"),
         ]
         paths = search_paths or default_paths
@@ -361,8 +363,11 @@ class FootprintCreator:
             table_path = table_dir / "fp-lib-table"
         else:  # global
             cfg_dirs = [
+                Path(os.environ.get("APPDATA", "")) / "kicad" / "10.0",
                 Path(os.environ.get("APPDATA", "")) / "kicad" / "9.0",
+                Path.home() / ".config" / "kicad" / "10.0",
                 Path.home() / ".config" / "kicad" / "9.0",
+                Path.home() / ".local" / "share" / "kicad" / "10.0",
                 Path.home() / ".local" / "share" / "kicad" / "9.0",
             ]
             table_path = None

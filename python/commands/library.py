@@ -58,13 +58,16 @@ class LibraryManager:
         """Get path to global fp-lib-table file"""
         # Try different possible locations
         kicad_config_paths = [
+            Path.home() / ".config" / "kicad" / "10.0" / "fp-lib-table",
             Path.home() / ".config" / "kicad" / "9.0" / "fp-lib-table",
             Path.home() / ".config" / "kicad" / "8.0" / "fp-lib-table",
             Path.home() / ".config" / "kicad" / "fp-lib-table",
             # Windows paths
+            Path.home() / "AppData" / "Roaming" / "kicad" / "10.0" / "fp-lib-table",
             Path.home() / "AppData" / "Roaming" / "kicad" / "9.0" / "fp-lib-table",
             Path.home() / "AppData" / "Roaming" / "kicad" / "8.0" / "fp-lib-table",
             # macOS paths
+            Path.home() / "Library" / "Preferences" / "kicad" / "10.0" / "fp-lib-table",
             Path.home() / "Library" / "Preferences" / "kicad" / "9.0" / "fp-lib-table",
             Path.home() / "Library" / "Preferences" / "kicad" / "8.0" / "fp-lib-table",
         ]
@@ -126,10 +129,12 @@ class LibraryManager:
 
         # Common KiCAD environment variables
         env_vars = {
+            "KICAD10_FOOTPRINT_DIR": self._find_kicad_footprint_dir(),
             "KICAD9_FOOTPRINT_DIR": self._find_kicad_footprint_dir(),
             "KICAD8_FOOTPRINT_DIR": self._find_kicad_footprint_dir(),
             "KICAD_FOOTPRINT_DIR": self._find_kicad_footprint_dir(),
             "KISYSMOD": self._find_kicad_footprint_dir(),
+            "KICAD10_3RD_PARTY": self._find_kicad_3rdparty_dir(),
             "KICAD9_3RD_PARTY": self._find_kicad_3rdparty_dir(),
             "KICAD8_3RD_PARTY": self._find_kicad_3rdparty_dir(),
         }
@@ -163,12 +168,15 @@ class LibraryManager:
         possible_paths = [
             "/usr/share/kicad/footprints",
             "/usr/local/share/kicad/footprints",
+            "C:/Program Files/KiCad/10.0/share/kicad/footprints",
             "C:/Program Files/KiCad/9.0/share/kicad/footprints",
             "C:/Program Files/KiCad/8.0/share/kicad/footprints",
             "/Applications/KiCad/KiCad.app/Contents/SharedSupport/footprints",
         ]
 
         # Also check environment variable
+        if "KICAD10_FOOTPRINT_DIR" in os.environ:
+            possible_paths.insert(0, os.environ["KICAD10_FOOTPRINT_DIR"])
         if "KICAD9_FOOTPRINT_DIR" in os.environ:
             possible_paths.insert(0, os.environ["KICAD9_FOOTPRINT_DIR"])
         if "KICAD8_FOOTPRINT_DIR" in os.environ:
@@ -191,11 +199,12 @@ class LibraryManager:
         """
         import json
 
-        # 1. Check shell environment variable first
-        if "KICAD9_3RD_PARTY" in os.environ:
-            path = os.environ["KICAD9_3RD_PARTY"]
-            if os.path.isdir(path):
-                return path
+        # 1. Check shell environment variables first (newest version first)
+        for env_key in ["KICAD10_3RD_PARTY", "KICAD9_3RD_PARTY"]:
+            if env_key in os.environ:
+                path = os.environ[env_key]
+                if os.path.isdir(path):
+                    return path
 
         # 2. Check kicad_common.json for user-defined variables
         kicad_common_paths = [
@@ -203,9 +212,22 @@ class LibraryManager:
             / "Library"
             / "Preferences"
             / "kicad"
+            / "10.0"
+            / "kicad_common.json",  # macOS
+            Path.home()
+            / "Library"
+            / "Preferences"
+            / "kicad"
             / "9.0"
             / "kicad_common.json",  # macOS
+            Path.home() / ".config" / "kicad" / "10.0" / "kicad_common.json",  # Linux
             Path.home() / ".config" / "kicad" / "9.0" / "kicad_common.json",  # Linux
+            Path.home()
+            / "AppData"
+            / "Roaming"
+            / "kicad"
+            / "10.0"
+            / "kicad_common.json",  # Windows
             Path.home()
             / "AppData"
             / "Roaming"
@@ -220,18 +242,19 @@ class LibraryManager:
                     with open(config_path, "r") as f:
                         config = json.load(f)
                     env_vars = config.get("environment", {}).get("vars", {})
-                    if env_vars and "KICAD9_3RD_PARTY" in env_vars:
-                        path = env_vars["KICAD9_3RD_PARTY"]
-                        if os.path.isdir(path):
-                            return path
+                    for env_key in ["KICAD10_3RD_PARTY", "KICAD9_3RD_PARTY"]:
+                        if env_vars and env_key in env_vars:
+                            path = env_vars[env_key]
+                            if os.path.isdir(path):
+                                return path
                 except (json.JSONDecodeError, KeyError, TypeError):
                     pass
 
                 # Derive version from config path location
-                version = config_path.parent.name  # e.g., "9.0"
+                version = config_path.parent.name  # e.g., "10.0"
                 break
         else:
-            version = "9.0"  # Default
+            version = "10.0"  # Default
 
         # 3. Use platform-specific defaults
         possible_paths = [
@@ -493,8 +516,16 @@ class LibraryCommands:
         """Get information about a specific footprint"""
         try:
             footprint_spec = params.get("footprint")
+
+            # Also accept split params from TypeScript (library_name + footprint_name)
             if not footprint_spec:
-                return {"success": False, "message": "Missing footprint parameter"}
+                lib_name = params.get("library_name")
+                fp_name = params.get("footprint_name")
+                if lib_name and fp_name:
+                    footprint_spec = f"{lib_name}:{fp_name}"
+
+            if not footprint_spec:
+                return {"success": False, "message": "Provide 'footprint' as 'Library:Name', or 'library_name' + 'footprint_name' separately"}
 
             # Try to find the footprint
             result = self.library_manager.find_footprint(footprint_spec)

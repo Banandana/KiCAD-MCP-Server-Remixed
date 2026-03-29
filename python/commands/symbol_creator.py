@@ -252,7 +252,9 @@ class SymbolCreator:
             table_path = table_dir / "sym-lib-table"
         else:
             cfg_dirs = [
+                Path(os.environ.get("APPDATA", "")) / "kicad" / "10.0",
                 Path(os.environ.get("APPDATA", "")) / "kicad" / "9.0",
+                Path.home() / ".config" / "kicad" / "10.0",
                 Path.home() / ".config" / "kicad" / "9.0",
             ]
             table_path = None

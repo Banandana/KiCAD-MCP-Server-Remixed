@@ -243,6 +243,47 @@ connect correctly. The tool warns when pin counts differ.`,
   );
 
   // ------------------------------------------------------
+  // Edit Symbol Pin Types Tool
+  // ------------------------------------------------------
+  server.tool(
+    "edit_symbol_pins",
+    `Edit pin electrical types in a schematic's lib_symbols section.
+Changes pin types (input, output, passive, etc.) for a symbol definition,
+affecting all placed instances of that symbol. Use this to fix ERC pin type
+mismatch warnings on placeholder or custom symbols.
+
+Valid pin types: input, output, bidirectional, tri_state, passive, free,
+unspecified, power_in, power_out, open_collector, open_emitter, no_connect`,
+    {
+      schematicPath: z.string().describe("Path to the .kicad_sch file"),
+      libId: z.string().describe("Symbol lib_id in 'Library:Symbol' format (e.g. 'Device:R')"),
+      modifications: z.array(z.object({
+        pinNumber: z.string().describe("Pin number to modify"),
+        pinType: z.string().describe("New electrical type (e.g. 'passive', 'power_in')"),
+      })).describe("Array of pin modifications"),
+    },
+    async (args: {
+      schematicPath: string;
+      libId: string;
+      modifications: Array<{ pinNumber: string; pinType: string }>;
+    }) => {
+      const result = await callKicadScript("edit_symbol_pins", args);
+      if (result.success) {
+        let msg = result.message;
+        if (result.changes && result.changes.length > 0) {
+          msg += "\n" + result.changes.map(
+            (c: { pin: string; from: string; to: string }) => `  Pin ${c.pin}: ${c.from} → ${c.to}`
+          ).join("\n");
+        }
+        return { content: [{ type: "text" as const, text: msg }] };
+      }
+      return {
+        content: [{ type: "text" as const, text: `Failed: ${result.message}` }],
+      };
+    },
+  );
+
+  // ------------------------------------------------------
   // Auto Assign Footprints Tool
   // ------------------------------------------------------
   server.tool(
@@ -1537,6 +1578,19 @@ all resistors, "Device:C" to "Capacitor_SMD:C_0603_1608Metric" for all capacitor
     },
     async (args) => {
       const result = await callKicadScript("add_no_connect", args);
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    }
+  );
+
+  server.tool(
+    "batch_add_no_connect",
+    "Add multiple no-connect (X) flags in one call. Efficient for suppressing ERC warnings on many unused pins at once.",
+    {
+      schematicPath: z.string().describe("Path to the schematic file"),
+      positions: z.array(z.object({ x: z.number(), y: z.number() })).describe("Array of positions for no-connect flags (each at a pin endpoint)"),
+    },
+    async (args) => {
+      const result = await callKicadScript("batch_add_no_connect", args);
       return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
     }
   );

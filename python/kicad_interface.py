@@ -456,6 +456,7 @@ class KiCADInterface:
             "delete_schematic_component": self._handle_delete_schematic_component,
             "edit_schematic_component": self._handle_edit_schematic_component,
             "swap_schematic_symbol": self._handle_swap_schematic_symbol,
+            "edit_symbol_pins": self._handle_edit_symbol_pins,
             "auto_assign_footprints": self._handle_auto_assign_footprints,
             "get_schematic_component": self._handle_get_schematic_component,
             "add_schematic_wire": self._handle_add_schematic_wire,
@@ -1215,6 +1216,161 @@ class KiCADInterface:
             logger.error(f"Error editing schematic component: {e}")
 
 
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e)}
+
+    def _handle_edit_symbol_pins(self, params):
+        """Edit pin electrical types in a schematic's lib_symbols section.
+
+        Changes pin types (input, output, passive, etc.) for a symbol definition,
+        affecting all placed instances of that symbol.
+        """
+        logger.info("Editing symbol pin types")
+        try:
+            import re
+
+            schematic_path = params.get("schematicPath")
+            lib_id = params.get("libId")
+            modifications = params.get("modifications", [])
+
+            if not schematic_path:
+                return {"success": False, "message": "schematicPath is required"}
+            if not lib_id:
+                return {"success": False, "message": "libId is required"}
+            if not modifications:
+                return {"success": False, "message": "modifications array is required"}
+
+            valid_types = {
+                "input", "output", "bidirectional", "tri_state", "passive",
+                "free", "unspecified", "power_in", "power_out",
+                "open_collector", "open_emitter", "no_connect",
+            }
+            for mod in modifications:
+                if mod.get("pinType") not in valid_types:
+                    return {
+                        "success": False,
+                        "message": f"Invalid pin type '{mod.get('pinType')}'. "
+                        f"Valid types: {', '.join(sorted(valid_types))}",
+                    }
+
+            with open(schematic_path, "r", encoding="utf-8") as f:
+                content = f.read()
+
+            # Build pin number -> new type map
+            pin_map = {str(m["pinNumber"]): m["pinType"] for m in modifications}
+
+            # Find the symbol in lib_symbols by lib_id
+            # Pin definitions live in sub-symbols like "SymbolName_1_1"
+            # Pattern: (pin <type> <style> ... (number "<num>" ...))
+            pin_pattern = re.compile(
+                r'(\(pin\s+)'           # group 1: "(pin "
+                r'(\w+)'               # group 2: current type (input, output, etc.)
+                r'(\s+\w+\s+'          # group 3: style + whitespace
+                r'.*?'                 # rest of pin attributes
+                r'\(number\s+")'       # start of number field
+                r'([^"]*)'            # group 4: pin number
+                r'"',                  # closing quote
+                re.DOTALL,
+            )
+
+            # Find lib_symbols section
+            lib_sym_start = content.find("(lib_symbols")
+            if lib_sym_start < 0:
+                return {"success": False, "message": "No lib_symbols section found"}
+
+            # Find the specific symbol block within lib_symbols
+            sym_search = f'(symbol "{lib_id}"'
+            sym_pos = content.find(sym_search, lib_sym_start)
+            if sym_pos < 0:
+                return {
+                    "success": False,
+                    "message": f"Symbol '{lib_id}' not found in lib_symbols",
+                }
+
+            # Find end of this symbol block using string-aware paren matching
+            depth = 0
+            in_string = False
+            sym_end = sym_pos
+            for i in range(sym_pos, len(content)):
+                ch = content[i]
+                if in_string:
+                    if ch == '"':
+                        in_string = False
+                elif ch == '"':
+                    in_string = True
+                elif ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth == 0:
+                        sym_end = i + 1
+                        break
+
+            sym_block = content[sym_pos:sym_end]
+
+            # Collect all replacements: (offset_in_block, old_type, new_type)
+            replacements = []
+            for m in pin_pattern.finditer(sym_block):
+                pin_num = m.group(4)
+                if pin_num in pin_map:
+                    old_type = m.group(2)
+                    new_type = pin_map[pin_num]
+                    if old_type != new_type:
+                        # Offset of the type word within the block
+                        type_start = m.start(2)
+                        type_end = m.end(2)
+                        replacements.append((type_start, type_end, old_type, new_type))
+
+            if not replacements:
+                found_pins = set()
+                for m in pin_pattern.finditer(sym_block):
+                    found_pins.add(m.group(4))
+                missing = set(pin_map.keys()) - found_pins
+                if missing:
+                    return {
+                        "success": False,
+                        "message": f"Pin(s) {', '.join(sorted(missing))} not found in {lib_id}. "
+                        f"Available pins: {', '.join(sorted(found_pins))}",
+                    }
+                return {"success": True, "message": "No changes needed (types already match)", "modified": 0}
+
+            # Apply replacements in reverse order to preserve offsets
+            new_block = sym_block
+            for type_start, type_end, old_type, new_type in sorted(replacements, reverse=True):
+                new_block = new_block[:type_start] + new_type + new_block[type_end:]
+
+            # Replace the symbol block in the full content
+            content = content[:sym_pos] + new_block + content[sym_end:]
+
+            with open(schematic_path, "w", encoding="utf-8") as f:
+                f.write(content)
+                f.flush()
+                import os
+                os.fsync(f.fileno())
+
+            changes = [
+                {"pin": r[2], "from": r[2], "to": r[3]}
+                for r in replacements
+            ]
+            # Fix: use actual pin numbers from the replacements
+            change_details = []
+            for m in pin_pattern.finditer(sym_block):
+                pin_num = m.group(4)
+                if pin_num in pin_map:
+                    old_type = m.group(2)
+                    new_type = pin_map[pin_num]
+                    if old_type != new_type:
+                        change_details.append({"pin": pin_num, "from": old_type, "to": new_type})
+
+            return {
+                "success": True,
+                "message": f"Modified {len(replacements)} pin(s) on {lib_id}",
+                "modified": len(replacements),
+                "changes": change_details,
+            }
+
+        except Exception as e:
+            logger.error(f"Error editing symbol pins: {e}")
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
 

@@ -84,6 +84,11 @@ function findPythonExecutable(scriptPath: string): string {
   // Platform-specific KiCAD bundled Python detection
   if (isWindows) {
     // Windows: Always prefer KiCAD's bundled Python (pcbnew.pyd is compiled for it)
+    const kicadPython10 = "C:\\Program Files\\KiCad\\10.0\\bin\\python.exe";
+    if (existsSync(kicadPython10)) {
+      logger.info(`Found KiCAD bundled Python at: ${kicadPython10}`);
+      return kicadPython10;
+    }
     const kicadPython = "C:\\Program Files\\KiCad\\9.0\\bin\\python.exe";
     if (existsSync(kicadPython)) {
       logger.info(`Found KiCAD bundled Python at: ${kicadPython}`);
